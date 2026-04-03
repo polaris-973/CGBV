@@ -1,8 +1,9 @@
-# Datasets
 datasets/
+results/
 
 # Documentation / Proposals
 *.md
+proofofthought/
 
 # Python
 __pycache__/

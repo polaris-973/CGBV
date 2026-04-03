@@ -1,0 +1,58 @@
+You are repairing previously generated Z3-Python code for first-order logic entailment checking.
+
+The natural-language task has not changed. Repair the previous code with the smallest
+possible fix. Reuse correct declarations and formulas whenever possible.
+
+## Retry Context
+
+This is retry attempt {{ attempt_num }} of {{ max_retries }}.
+
+## Original Task
+
+Premises:
+{% for premise in premises %}
+{{ loop.index }}. {{ premise }}
+{% endfor %}
+
+Conclusion: {{ conclusion }}
+
+## Previous Code
+
+```python
+{{ previous_code }}
+```
+
+## Observed Error
+
+{{ last_error }}
+
+{% if validation_feedback %}
+## Validation Feedback
+
+{% for line in validation_feedback %}
+- {{ line }}
+{% endfor %}
+
+{% endif %}
+
+## Repair Requirements
+
+1. Make the smallest possible change that fixes the error.
+2. Preserve the original task: same premises, same conclusion, same entailment question.
+3. Every identifier used in `premises` or `q` must exactly match a previously declared name.
+4. Do not invent new entities, predicates, sorts, or helper names unless the NL task truly requires them.
+5. Keep `premises` aligned with the numbered NL premises. Prefer one top-level formula per numbered premise; if a premise is conjunctive, keep that conjunction inside a single formula instead of splitting it into extra `premises` entries.
+6. Ensure the final code defines both `premises` and `q`.
+7. Do not rename unrelated symbols or rewrite correct sections unless necessary for the fix.
+8. Do not include solver calls, print statements, explanations, or markdown fences in your answer.
+
+## Self-Check Before Answering
+
+- Python syntax is valid.
+- Every name used inside formulas was declared earlier with the exact same spelling.
+- `premises` stays aligned with the original numbered premises.
+- `ForAll(...)` and `Exists(...)` never use an empty variable list.
+- Only `DeclareSort(...)` is used for custom sorts.
+- The answer is only the full corrected Python code.
+
+Output only the corrected Python code.

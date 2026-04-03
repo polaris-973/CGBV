@@ -1,0 +1,79 @@
+# Few-shot examples for FOLIO dataset (Phase 1 formalization)
+# Format: premises (list), conclusion (str), code (str)
+
+- premises:
+    - "All students study hard."
+    - "All students who study hard pass their exams."
+    - "Mary is a student."
+  conclusion: "Mary passes her exams."
+  code: |
+    from z3 import *
+
+    Person = DeclareSort('Person')
+
+    mary = Const('mary', Person)
+    p    = Const('p',    Person)
+
+    is_student   = Function('is_student',   Person, BoolSort())
+    studies_hard = Function('studies_hard', Person, BoolSort())
+    passes_exams = Function('passes_exams', Person, BoolSort())
+
+    f1 = ForAll([p], Implies(is_student(p), studies_hard(p)))
+    f2 = ForAll([p], Implies(studies_hard(p), passes_exams(p)))
+    f3 = is_student(mary)
+    premises = [f1, f2, f3]
+
+    q = passes_exams(mary)
+
+- premises:
+    - "Every lawyer represents some client."
+    - "No client is a judge."
+    - "Alice is a lawyer."
+  conclusion: "Alice represents someone who is not a judge."
+  code: |
+    from z3 import *
+
+    Person = DeclareSort('Person')
+
+    alice = Const('alice', Person)
+    x     = Const('x',     Person)
+    y     = Const('y',     Person)
+
+    is_lawyer     = Function('is_lawyer',     Person, BoolSort())
+    is_client     = Function('is_client',     Person, BoolSort())
+    is_judge      = Function('is_judge',      Person, BoolSort())
+    represents    = Function('represents',    Person, Person, BoolSort())
+
+    f1 = ForAll([x], Implies(is_lawyer(x), Exists([y], And(is_client(y), represents(x, y)))))
+    f2 = ForAll([x], Implies(is_client(x), Not(is_judge(x))))
+    f3 = is_lawyer(alice)
+    premises = [f1, f2, f3]
+
+    q = Exists([y], And(represents(alice, y), Not(is_judge(y))))
+
+- premises:
+    - "All mammals are warm-blooded."
+    - "Whales are mammals."
+    - "Dolphins are mammals."
+    - "No fish is warm-blooded."
+  conclusion: "Whales are not fish."
+  code: |
+    from z3 import *
+
+    Animal = DeclareSort('Animal')
+
+    whale   = Const('whale',   Animal)
+    dolphin = Const('dolphin', Animal)
+    a       = Const('a',       Animal)
+
+    is_mammal       = Function('is_mammal',       Animal, BoolSort())
+    is_warm_blooded = Function('is_warm_blooded', Animal, BoolSort())
+    is_fish         = Function('is_fish',         Animal, BoolSort())
+
+    f1 = ForAll([a], Implies(is_mammal(a), is_warm_blooded(a)))
+    f2 = is_mammal(whale)
+    f3 = is_mammal(dolphin)
+    f4 = ForAll([a], Implies(is_fish(a), Not(is_warm_blooded(a))))
+    premises = [f1, f2, f3, f4]
+
+    q = Not(is_fish(whale))

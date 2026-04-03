@@ -1,0 +1,39 @@
+experiment:
+  id: folio_modelscope_qwen_debug
+  description: "Debug run: FOLIO validation, 1 sample, ModelScope Qwen"
+
+dataset:
+  name: folio
+  split: validation
+  path: ./datasets
+  limit: 2
+
+llm:
+  provider: openai
+  model: Qwen/Qwen3-32B
+  api_key_env: MODELSCOPE_API_KEY
+  base_url: https://api-inference.modelscope.cn/v1/
+  extra_body:
+    enable_thinking: false
+  max_parallel_requests: 1
+  min_request_interval: 1.5
+  temperature: 0.0
+  max_tokens: 8192
+  api_retry_count: 5
+  api_retry_delay: 4.0
+
+pipeline:
+  num_witnesses: 1
+  r_max: 3
+  formalize_retries: 3
+  grounding_retries: 3
+  solver_timeout: 60
+
+runner:
+  max_concurrency: 1
+  checkpoint: true
+  results_dir: ./results
+
+prompts:
+  templates_dir: ./cgbv/prompts
+  few_shot_dir: ./cgbv/prompts/few_shot

@@ -1,0 +1,92 @@
+You are a logic translator working with a specific finite domain.
+
+You are given:
+1. A **domain description** listing entities grouped by sort, predicate signatures, and the truth value of every ground atom in a specific world.
+2. A **natural language sentence**.
+
+Your task: write a Python boolean expression that evaluates to True if the sentence holds in this world, and False otherwise.
+
+---
+
+## Output Format
+
+Write a **single Python boolean expression**. Use:
+- `truth["PredName(entity)"]` — look up a ground atom's truth value
+- `and`, `or`, `not` — boolean connectives
+- `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
+- `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
+
+**Critical rules:**
+1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate name and entity IDs).
+2. Iterate each `for e in [...]` loop over ONLY the entity list for the CORRECT sort of that predicate's argument. **Never mix entities from different sorts in the same loop.**
+3. If a sentence's quantifier ("all", "some", "no") ranges over a type already determined by the sort (e.g., all entities in the `Stock` sort ARE stocks), do **NOT** add a redundant `if truth["is_stock(e)"]` guard—it creates a semantic gap with the FOL formula. Only add an `if truth[...]` guard if the NL sentence explicitly conditions on an additional predicate.
+4. Do **NOT** invent entity names. Use only the canonical IDs listed in "Canonical entity IDs".
+5. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+6. Output ONLY the expression — no imports, no assignments, no prose.
+
+---
+
+## Translation Patterns
+
+Given sort `Person` with entities `['alice', 'bob', 'carol']`:
+
+| Natural language | Grounded expression |
+|---|---|
+| "Alice is happy." | `truth["happy(alice)"]` |
+| "All persons are happy." | `all(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
+| "Some person is happy." | `any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
+| "No person is happy." | `not any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
+| "Alice likes Bob." | `truth["likes(alice, bob)"]` |
+| "Alice likes someone." | `any(truth[f"likes(alice, {e})"] for e in ["alice","bob","carol"])` |
+| "Everyone who studies passes." | `all(truth[f"passes({e})"] for e in ["alice","bob","carol"] if truth[f"studies({e})"])` |
+
+**Multi-sort example** — sort `Person: ['alice']`, sort `Book: ['walden']`:
+| Natural language | Grounded expression |
+|---|---|
+| "Alice reads Walden." | `truth["reads(alice, walden)"]` |
+| "Alice reads some book." | `any(truth[f"reads(alice, {b})"] for b in ["walden"])` |
+| "Every person reads some book." | `all(any(truth[f"reads({p}, {b})"] for b in ["walden"]) for p in ["alice"])` |
+
+Notice: the `for p in [...]` loop uses **only Person entities**, and the `for b in [...]` loop uses **only Book entities**. They are never mixed.
+
+---
+
+## Worked Example
+
+**Domain:**
+```
+Entities by sort:
+  Animal: ['tweety', 'sam', 'Animal!val!0']
+
+Predicate signatures:
+  is_bird(Animal) → bool
+  can_fly(Animal) → bool
+
+Canonical entity IDs: tweety, sam, Animal!val!0
+
+Ground atoms:
+  is_bird(tweety) = True
+  is_bird(sam) = False
+  is_bird(Animal!val!0) = False
+  can_fly(tweety) = True
+  can_fly(sam) = False
+  can_fly(Animal!val!0) = False
+```
+
+| Sentence | Output |
+|---|---|
+| "Tweety can fly." | `truth["can_fly(tweety)"]` |
+| "All birds can fly." | `all(truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
+| "Some bird cannot fly." | `any(not truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
+| "Tweety is a bird that can fly." | `truth["is_bird(tweety)"] and truth["can_fly(tweety)"]` |
+
+---
+
+## Your Task
+
+**Domain:**
+{{ domain_desc }}
+
+**Sentence:** "{{ sentence }}"
+
+Write the grounded boolean expression:

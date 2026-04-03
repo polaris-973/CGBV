@@ -1,0 +1,33 @@
+experiment:
+  id: folio_deepseek_debug
+  description: "Debug run: FOLIO validation, 10 samples, DeepSeek"
+
+dataset:
+  name: folio
+  split: validation
+  path: ./datasets
+  limit: 50
+
+llm:
+  provider: deepseek
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  temperature: 0.0
+  max_tokens: 8192
+
+pipeline:
+  num_witnesses: 5
+  r_max: 3
+  formalize_retries: 3
+  grounding_retries: 3
+  solver_timeout: 60
+
+runner:
+  max_concurrency: 5
+  checkpoint: true
+  results_dir: ./results
+
+prompts:
+  templates_dir: ./cgbv/prompts
+  few_shot_dir: ./cgbv/prompts/few_shot

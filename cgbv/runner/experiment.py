@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+
+import cgbv.logging as cgbv_log
+from cgbv.config.settings import ExperimentConfig
+from cgbv.core.pipeline import CGBVPipeline, PipelineResult
+from cgbv.data.base import DataSample
+from cgbv.data.loader import load_dataset
+from cgbv.eval.metrics import compute_metrics
+from cgbv.eval.report import write_report
+from cgbv.runner.checkpoint import CheckpointManager
+from cgbv.runner.concurrency import run_concurrent
+
+logger = logging.getLogger(__name__)
+
+
+class ExperimentRunner:
+    """
+    Top-level experiment orchestrator.
+
+    Loads dataset → filters already-done samples → runs pipeline concurrently
+    → computes metrics → writes report.
+    """
+
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        self.checkpoint = CheckpointManager(
+            results_dir=config.runner.results_dir,
+            run_id=config.run_id,
+        )
+
+    async def run(self) -> dict:
+        """Run the full experiment. Returns the final metrics dict."""
+        cfg = self.config
+
+        logger.info(
+            "Experiment [%s] run [%s] starting: dataset=%s split=%s llm=%s",
+            cfg.experiment_id, cfg.run_id, cfg.dataset.name, cfg.dataset.split, cfg.llm.model,
+        )
+
+        # Load dataset
+        all_samples = load_dataset(
+            name=cfg.dataset.name,
+            split=cfg.dataset.split,
+            path=cfg.dataset.path,
+            limit=cfg.dataset.limit,
+        )
+        logger.info("Loaded %d samples from %s/%s", len(all_samples), cfg.dataset.name, cfg.dataset.split)
+
+        # Warn explicitly if this is a multi-choice dataset
+        if all_samples and all_samples[0].task_type == "multi_choice":
+            logger.warning(
+                "Dataset '%s' is a multi-choice task (labels are A/B/C/D). "
+                "The CGBV pipeline only supports binary entailment tasks. "
+                "Pipeline will run but accuracy metrics will be meaningless — "
+                "Entailed/Not Entailed verdicts cannot be compared against A/B/C/D labels.",
+                cfg.dataset.name,
+            )
+
+        # Filter already-done samples (checkpoint)
+        pending: list[DataSample]
+        if cfg.runner.checkpoint:
+            pending = self.checkpoint.filter_pending(all_samples)
+        else:
+            pending = all_samples
+
+        if not pending:
+            logger.info("All samples already completed. Computing metrics from existing results.")
+        else:
+            logger.info(
+                "Running pipeline on [bold]%d[/] samples (concurrency=%d)",
+                len(pending), cfg.runner.max_concurrency,
+            )
+            pipeline = CGBVPipeline(cfg)
+            results_base = cfg.output_dir
+
+            # Progress display — wraps the entire batch run
+            with cgbv_log.ExperimentProgress(
+                total=len(pending),
+                console=_get_console(),
+            ) as prog:
+                cgbv_log.register_progress(prog)
+                tasks = [
+                    (s.id, _run_tracked(s, pipeline, results_base, prog))
+                    for s in pending
+                ]
+                results = await run_concurrent(
+                    tasks, max_concurrency=cfg.runner.max_concurrency
+                )
+                cgbv_log.register_progress(None)
+
+            # Log summary of this batch
+            successes = sum(1 for r in results if isinstance(r, PipelineResult))
+            errors = len(results) - successes
+            logger.info(
+                "Batch complete: [green]%d succeeded[/], [red]%d errored[/]",
+                successes, errors,
+            )
+
+        # Load all results (including previously completed ones)
+        all_results = self.checkpoint.load_all_results(dataset=cfg.dataset.name)
+        logger.info("Computing metrics over %d completed samples", len(all_results))
+
+        metrics = compute_metrics(all_results, all_samples)
+        write_report(
+            metrics=metrics,
+            results=all_results,
+            config=cfg,
+            output_dir=cfg.output_dir,
+        )
+
+        logger.info(
+            "Experiment [bold]%s[/] run [bold]%s[/] complete. Metrics: %s",
+            cfg.experiment_id, cfg.run_id, metrics,
+        )
+        return metrics
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_console():
+    """Return the shared Rich Console if logging has been set up, else None."""
+    import logging as _logging
+    for h in _logging.getLogger().handlers:
+        if hasattr(h, "console"):
+            return h.console
+    return None
+
+
+async def _run_tracked(
+    sample: DataSample,
+    pipeline: CGBVPipeline,
+    results_base: Path,
+    prog: "cgbv_log.ExperimentProgress",
+) -> PipelineResult:
+    """
+    Wrapper that sets the sample context ContextVar, manages progress updates,
+    and ensures complete_sample() is always called.
+    """
+    log_dir = results_base / sample.dataset / sample.id
+    cgbv_log.set_sample(sample.id, log_dir, display_id=sample.display_id)
+    prog.start_sample(sample.id, sample.display_id)
+    try:
+        result = await pipeline.run(sample)
+        cgbv_log.complete_sample(success=(result.error is None))
+        return result
+    except Exception:
+        cgbv_log.complete_sample(success=False)
+        raise

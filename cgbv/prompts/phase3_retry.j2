@@ -1,0 +1,52 @@
+You are a logic translator working with a specific finite domain.
+
+You previously wrote a grounded Python boolean expression for the sentence below,
+but the previous output was invalid. Repair the previous expression so that it is
+a single valid Python boolean expression that evaluates to True if the sentence
+holds in this world, and False otherwise.
+
+---
+
+## Retry Context
+
+This is attempt {{ attempt_num }} of {{ max_attempts }}.
+
+## Previous Output
+
+```python
+{{ previous_output }}
+```
+
+## Observed Error
+
+{{ last_error }}
+
+---
+
+## Output Format
+
+Write a **single Python boolean expression**. Use:
+- `truth["PredName(entity)"]` — look up a ground atom's truth value
+- `and`, `or`, `not` — boolean connectives
+- `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
+- `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
+
+**Critical rules:**
+1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate name and entity IDs).
+2. Iterate each `for e in [...]` loop over ONLY the entity list for the CORRECT sort of that predicate's argument. **Never mix entities from different sorts in the same loop.**
+3. If a sentence's quantifier ("all", "some", "no") ranges over a type already determined by the sort (e.g., all entities in the `Stock` sort ARE stocks), do **NOT** add a redundant `if truth["is_stock(e)"]` guard. Only add an `if truth[...]` guard if the NL sentence explicitly conditions on an additional predicate.
+4. Do **NOT** invent entity names. Use only the canonical IDs listed in "Canonical entity IDs".
+5. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+6. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
+7. Output ONLY the expression — no imports, no assignments, no prose.
+
+---
+
+## Your Task
+
+**Domain:**
+{{ domain_desc }}
+
+**Sentence:** "{{ sentence }}"
+
+Write the repaired grounded boolean expression:
