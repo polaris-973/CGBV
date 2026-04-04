@@ -26,6 +26,12 @@ Conclusion: {{ conclusion }}
 
 {{ last_error }}
 
+{% if name_error_hint %}
+## Specific Diagnosis
+
+{{ name_error_hint }}
+
+{% endif %}
 {% if validation_feedback %}
 ## Validation Feedback
 

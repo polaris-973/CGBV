@@ -10,8 +10,134 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
 class CodeExecutionError(Exception):
     pass
+
+
+# ---------------------------------------------------------------------------
+# NameError auto-correction helpers
+# ---------------------------------------------------------------------------
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein edit distance between two strings."""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            prev, dp[j] = dp[j], (
+                prev if a[i - 1] == b[j - 1]
+                else 1 + min(prev, dp[j], dp[j - 1])
+            )
+    return dp[n]
+
+
+def _extract_declared_names(code: str) -> list[str]:
+    """
+    Return all top-level assignment target names from *code*.
+
+    These are the variable names the LLM declared (sorts, constants,
+    predicates, bound variables).  Used to find the closest match when a
+    NameError occurs.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    names: list[str] = []
+    for node in ast.iter_child_nodes(tree):   # top-level statements only
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.append(target.id)
+    return names
+
+
+def build_name_error_hint(code: str, error_msg: str) -> str | None:
+    """
+    When a NameError occurs, try to identify the exact spelling error and
+    return a human-readable diagnosis string suitable for injection into the
+    retry prompt.
+
+    Returns None if the error is not a NameError or no close match is found.
+    """
+    m = re.search(r"name '(\w+)' is not defined", str(error_msg))
+    if not m:
+        return None
+    undefined = m.group(1)
+    declared = _extract_declared_names(code)
+    if not declared:
+        return None
+
+    close = [(name, _edit_distance(undefined, name)) for name in declared]
+    close_enough = [(name, dist) for name, dist in close if 0 < dist <= 2]
+    if not close_enough:
+        return None
+
+    best, dist = min(close_enough, key=lambda x: x[1])
+
+    # Locate declaration and usage line numbers for context
+    lines = code.split("\n")
+    decl_linenos = [
+        i + 1 for i, line in enumerate(lines)
+        if re.search(r"\b" + re.escape(best) + r"\b", line)
+    ]
+    use_linenos = [
+        i + 1 for i, line in enumerate(lines)
+        if re.search(r"\b" + re.escape(undefined) + r"\b", line)
+    ]
+
+    char_desc = "1 character" if dist == 1 else f"{dist} characters"
+    parts = [
+        f"Spelling error: you used `{undefined}` but the declared name is `{best}` (differ by {char_desc}).",
+    ]
+    if decl_linenos:
+        parts.append(f"`{best}` is declared on line {decl_linenos[0]}.")
+    if use_linenos:
+        parts.append(f"`{undefined}` is used on line(s) {', '.join(str(l) for l in use_linenos)}.")
+    parts.append(f"Fix: replace every occurrence of `{undefined}` with `{best}`.")
+    return " ".join(parts)
+
+
+def attempt_name_error_autocorrect(code: str, error_msg: str) -> tuple[str, str] | None:
+    """
+    Attempt to auto-correct a NameError caused by a trivial spelling typo.
+
+    Strategy: if exactly ONE declared name is within Levenshtein distance ≤ 2
+    of the undefined name, replace all word-boundary occurrences of the
+    undefined name with the declared name and return the corrected code.
+
+    Returns ``(corrected_code, description)`` on success, ``None`` otherwise.
+    The caller should log the description and re-execute the corrected code.
+
+    Safety invariant: only applies when there is exactly one close match, so
+    the correction is unambiguous.  Multiple close matches → return None and
+    let the LLM retry with the hint message instead.
+    """
+    m = re.search(r"name '(\w+)' is not defined", str(error_msg))
+    if not m:
+        return None
+    undefined = m.group(1)
+    declared = _extract_declared_names(code)
+    if not declared:
+        return None
+
+    close_enough = [
+        (name, _edit_distance(undefined, name))
+        for name in declared
+        if 0 < _edit_distance(undefined, name) <= 2
+    ]
+    if len(close_enough) != 1:
+        return None   # ambiguous or no match — do not auto-correct
+
+    best, dist = close_enough[0]
+    corrected = re.sub(r"\b" + re.escape(undefined) + r"\b", best, code)
+    description = (
+        f"NameError auto-correction: `{undefined}` → `{best}` "
+        f"(edit distance {dist})"
+    )
+    return corrected, description
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +283,48 @@ def execute_z3_code(code: str, timeout_seconds: int = 30) -> dict[str, Any]:
         exc = val
         if isinstance(exc, SyntaxError):
             raise CodeExecutionError(f"Syntax error in generated code: {exc}") from exc
-        raise CodeExecutionError(f"Runtime error in generated code: {exc}") from exc
+
+        error_msg = str(exc)
+        # Attempt to auto-correct trivial NameError typos (e.g. 'brandford_college'
+        # used where 'branford_college' was declared — edit distance 1).
+        # Only fires when exactly one declared name is within edit distance ≤ 2,
+        # so the correction is unambiguous.  This avoids burning an LLM call for
+        # a pure spelling inconsistency that the model keeps reproducing.
+        if isinstance(exc, NameError) or "is not defined" in error_msg:
+            correction = attempt_name_error_autocorrect(code, error_msg)
+            if correction is not None:
+                corrected_code, description = correction
+                logger.info("execute_z3_code: %s — retrying", description)
+                # Re-execute the corrected code (one extra attempt, no LLM call)
+                corrected_result_queue: queue.Queue[tuple] = queue.Queue()
+                corrected_worker = threading.Thread(
+                    target=_exec_in_daemon_thread,
+                    args=(corrected_code, corrected_result_queue),
+                    daemon=True,
+                )
+                try:
+                    _register_worker(corrected_worker)
+                    corrected_worker.start()
+                    corrected_worker.join(timeout=timeout_seconds)
+                    if not corrected_worker.is_alive():
+                        _unregister_worker(corrected_worker)
+                        c_tag, c_val = corrected_result_queue.get_nowait()
+                        if c_tag == "ok":
+                            # Correction succeeded — substitute the corrected code
+                            code = corrected_code
+                            val = c_val
+                            tag = "ok"
+                            logger.debug(
+                                "execute_z3_code: auto-correction succeeded (%s)", description
+                            )
+                        # else: corrected code still errors — fall through to original error
+                    else:
+                        _unregister_worker(corrected_worker)
+                except CodeExecutionError:
+                    pass  # worker cap exceeded; fall through to original error
+
+        if tag == "error":
+            raise CodeExecutionError(f"Runtime error in generated code: {exc}") from exc
     namespace = val
 
     if "premises" not in namespace:

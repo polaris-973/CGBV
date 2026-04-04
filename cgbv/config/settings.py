@@ -50,6 +50,7 @@ class PipelineConfig:
     formalize_retries: int = 3
     grounding_retries: int = 2
     repair_retries: int = 2       # Phase 5 LLM repair retries per mismatch
+    world_assumption: str = "owa"  # "owa" (open world) | "cwa" (closed world)
 
 
 @dataclass

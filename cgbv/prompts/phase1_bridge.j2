@@ -1,0 +1,67 @@
+You are fixing a predicate vocabulary connectivity issue in a Z3-Python logical formalization.
+
+## Full Original Formalization
+
+```python
+{{ raw_code }}
+```
+
+---
+
+## Problem: Premise {{ premise_index }} is Structurally Disconnected
+
+**Premise {{ premise_index }}** uses predicate(s) `{{ orphaned_preds | join(", ") }}` that do not
+appear in any universal rule or the conclusion.  This means the premise can **never** contribute
+to deriving the conclusion — the proof chain is broken.
+
+- NL text:       "{{ nl_text }}"
+- Current formula: `{{ current_formula }}`
+- Orphaned predicate(s): {{ orphaned_preds }}
+
+---
+
+## Connected Predicate Vocabulary
+
+The following predicates **do** appear in the proof chain (other premises and conclusion):
+
+**Connected predicates:** {{ connected_preds | join(", ") }}
+
+### Other premises (for context):
+{% for i, nl, fol in other_premises %}
+Premise {{ i }}: "{{ nl }}"
+  → `{{ fol }}`
+{% endfor %}
+
+Conclusion: "{{ conclusion_nl }}"
+  → `{{ conclusion_formula }}`
+
+---
+
+## Your Task
+
+Write a **linking axiom** — a universal rule that connects the orphaned predicate(s) to
+the connected predicate vocabulary, thereby bridging the proof chain.
+
+**Guiding question:** What general semantic relationship exists between the orphaned
+predicate(s) `{{ orphaned_preds | join(", ") }}` and the connected predicates
+`{{ connected_preds | join(", ") }}` that would allow Premise {{ premise_index }} to
+participate in deriving the conclusion?
+
+**Examples of linking axioms:**
+- If orphaned `is_cat(x)` and connected `is_pet(x)`:
+  → `ForAll([x], Implies(is_cat(x), is_pet(x)))`
+- If orphaned `applying_to_take(x, y)` and connected `gre_applicant(x)`:
+  → `ForAll([x], Implies(Exists([y], applying_to_take(x, y)), gre_applicant(x)))`
+- If orphaned `is_mature_stock(x)` and connected `is_stock(x)`:
+  → `ForAll([x], Implies(is_mature_stock(x), is_stock(x)))`
+
+**Rules:**
+- The axiom MUST be a **universally quantified rule** (ForAll/Exists form).
+  Do NOT output a ground fact (e.g. `is_stock(ko)`) — ground facts replace individual
+  premises rather than bridging the proof chain.
+- Use **ONLY** identifiers (predicates, constants, sorts, bound variables) already declared
+  in the code above.  Do NOT introduce new names.
+- Output **ONLY** the Python expression for the linking axiom.
+- No imports, no assignments, no comments, no prose.
+- The output must be a Z3 boolean expression (BoolRef) that can be evaluated in the same
+  namespace as the original code.

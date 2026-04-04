@@ -53,6 +53,7 @@ async def run_multi_witness(
     background_constraints: list | None = None,
     num_witnesses: int = 1,
     grounding_retries: int = 2,
+    world_assumption: str = "owa",
 ) -> MultiWitnessResult:
     """
     Multi-Witness coordinator: Phase 2 + Phase 3 + Phase 4 across K witnesses.
@@ -159,10 +160,12 @@ async def run_multi_witness(
             p2=witnesses[k],
             sentences=sentences,
             fol_formulas=fol_formulas,
+            namespace=namespace,
             solver=solver,
             llm=llm,
             prompt_engine=prompt_engine,
             grounding_retries=grounding_retries,
+            world_assumption=world_assumption,
         )
         for k in range(len(witnesses))
     ]
@@ -194,10 +197,12 @@ async def _run_phase3_and_4(
     p2: Phase2Result,
     sentences: list[str],
     fol_formulas: list,
+    namespace: dict,
     solver: Z3Solver,
     llm: LLMClient,
     prompt_engine: PromptEngine,
     grounding_retries: int,
+    world_assumption: str = "owa",
 ) -> WitnessCheckResult:
     """Run Phase 3 + Phase 4 for a single witness."""
     cgbv_log.update_phase("phase3")
@@ -208,6 +213,7 @@ async def _run_phase3_and_4(
         llm=llm,
         prompt_engine=prompt_engine,
         max_retries=grounding_retries,
+        world_assumption=world_assumption,
     )
 
     cgbv_log.update_phase("phase4")
@@ -218,6 +224,7 @@ async def _run_phase3_and_4(
         domain=p2.domain,
         grounded_formulas=p3.grounded,
         solver=solver,
+        namespace=namespace,
         witness_index=witness_index,
         witness_side=p2.witness_side,
     )

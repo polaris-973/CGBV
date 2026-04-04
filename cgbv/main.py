@@ -76,14 +76,16 @@ def main() -> None:
     print(f"LLM:        {config.llm.model}")
     print("=" * 50)
     for key in [
-        "general_accuracy",
+        "end_to_end_accuracy",
+        "conditional_accuracy",
+        "completion_rate",
         "binary_accuracy",
         "uncertain_recall",
         "verification_precision",
         "verification_coverage",
         "mismatch_detection_precision",
         "mismatch_detection_recall",
-        "repair_parse_success_rate",
+        "repair_round_commit_rate",
         "repair_local_fix_rate",
         "repair_verdict_recovery_rate",
         "repair_regression_rate",

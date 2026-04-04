@@ -17,11 +17,12 @@ llm:
   max_tokens: 8192
 
 pipeline:
-  num_witnesses: 5
+  num_witnesses: 1
   r_max: 3
   formalize_retries: 3
   grounding_retries: 3
   solver_timeout: 60
+  world_assumption: owa
 
 runner:
   max_concurrency: 5

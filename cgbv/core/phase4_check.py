@@ -7,6 +7,7 @@ from typing import Any
 import z3
 
 from cgbv.core.phase3_grounded import GroundedFormula
+from cgbv.solver.finite_evaluator import FiniteModelEvaluator
 from cgbv.solver.z3_solver import Z3Solver
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,28 @@ logger = logging.getLogger(__name__)
 # Mismatch types (from Proposal-v2 Definition 3)
 MISMATCH_WEAKENING = "weakening"        # M ⊨ f_i = ⊤  AND  M ⊨ φ_i^M = ⊥  (FOL too weak)
 MISMATCH_STRENGTHENING = "strengthening"  # M ⊨ f_i = ⊥  AND  M ⊨ φ_i^M = ⊤  (FOL too strong)
+
+_evaluator = FiniteModelEvaluator()
+
+
+def _quantifier_layout(formula: z3.ExprRef) -> str:
+    """
+    Return the quantifier layout of a Z3 formula:
+      "none"   — no ForAll/Exists anywhere in the AST
+      "top"    — the outermost node is a quantifier
+      "buried" — quantifier exists but is not the outermost node
+    """
+    if z3.is_quantifier(formula):
+        return "top"
+    # Walk the AST to detect any nested quantifier.
+    stack = list(formula.children()) if z3.is_app(formula) else []
+    while stack:
+        node = stack.pop()
+        if z3.is_quantifier(node):
+            return "buried"
+        if z3.is_app(node):
+            stack.extend(node.children())
+    return "none"
 
 
 @dataclass
@@ -27,6 +50,17 @@ class Mismatch:
     grounded_formula: str    # the truth-table expression (for repair prompt)
     witness_index: int = 0   # which witness produced this mismatch
     witness_side: str = "not_q"
+    # Structural Phase 3 error: strengthening on the conclusion from a ¬q witness.
+    # By construction, FOL(conclusion)=False on every ¬q witness; if grounded=True
+    # it is definitively a Phase 3 grounding error — Phase 5 cannot fix it by
+    # tweaking the FOL formula (making FOL=True would contradict Z3's model).
+    is_phase3_error: bool = False
+    # Quantifier layout of the original FOL formula, computed once from the Z3
+    # object at Mismatch creation time so Phase 5 can avoid string heuristics.
+    #   "none"   — no quantifiers anywhere
+    #   "top"    — outermost constructor is ForAll/Exists
+    #   "buried" — quantifier exists but is not the outermost constructor
+    fol_quantifier_layout: str = "none"
 
 
 @dataclass
@@ -34,14 +68,14 @@ class SentenceEval:
     """Per-sentence evaluation record (for debugging / result logging)."""
     sentence_index: int
     nl_sentence: str
-    fol_truth: bool | None
+    fol_truth: bool | None           # None = unverifiable (quantifier universe unavailable)
     grounded_truth: bool | None
     mismatch: bool
     mismatch_type: str | None
     grounding_failed: bool
     fol_formula_str: str | None = None
     grounded_formula: str | None = None
-    fol_eval_repr: str | None = None
+    fol_eval_repr: str | None = None  # raw z3 repr before tri-state reduction
     witness_index: int = 0
     witness_side: str = "not_q"
     error: str | None = None
@@ -50,7 +84,7 @@ class SentenceEval:
 @dataclass
 class Phase4Result:
     mismatches: list[Mismatch]
-    all_passed: bool                      # True if no mismatches found
+    all_passed: bool                      # True if no mismatches and no unverifiable sentences
     evaluations: list[SentenceEval]       # per-sentence debug info
     witness_index: int = 0
     witness_side: str = "not_q"
@@ -65,6 +99,7 @@ def run_phase4(
     domain: dict,                    # structured domain (from Phase 2)
     grounded_formulas: list[GroundedFormula],  # Phase 3 output
     solver: Z3Solver,
+    namespace: dict | None = None,   # Phase 1 exec namespace (for evaluator fallback)
     witness_index: int = 0,
     witness_side: str = "not_q",
 ) -> Phase4Result:
@@ -72,15 +107,15 @@ def run_phase4(
     Phase 4: Cross-Granularity Check.
 
     For each sentence S_j (premises + conclusion):
-      - Compute M ⊨ f_j  via z3 model.evaluate()          (FOL side, Phase 1)
-      - Compute M ⊨ φ_j^M via truth-table eval()           (propositional side, Phase 3)
-      - If they differ → record mismatch
+      - Compute M ⊨ f_j via FiniteModelEvaluator (tri-state: True/False/None)
+      - Compute M ⊨ φ_j^M via truth-table eval()  (propositional side, Phase 3)
+      - Both must be concrete booleans (not None) for a comparison to occur
+      - If both are concrete and differ → record mismatch
+      - If fol_truth is None → unverifiable (counted but not a mismatch)
 
     Mismatch types (Proposal-v2 Definition 3):
-      - weakening:     fol_truth=True,  grounded_truth=False  (FOL accepts world NL rejects)
-      - strengthening: fol_truth=False, grounded_truth=True   (FOL rejects world NL accepts)
-
-    All comparison logic runs through the solver (zero LLM involvement).
+      - weakening:     fol_truth=True,  grounded_truth=False
+      - strengthening: fol_truth=False, grounded_truth=True
     """
     if len(fol_formulas) != len(sentences) or len(grounded_formulas) != len(sentences):
         return Phase4Result(
@@ -102,13 +137,12 @@ def run_phase4(
     for idx, (sentence, fol_formula, grounded) in enumerate(
         zip(sentences, fol_formulas, grounded_formulas)
     ):
-        # Evaluate FOL formula on z3 model (Phase 1 side)
         fol_truth: bool | None = None
         grounded_truth: bool | None = None
         eval_error: str | None = None
+        fol_eval_repr: str | None = None
 
         if grounded.failed:
-            # Phase 3 failed for this sentence — skip comparison
             evaluations.append(SentenceEval(
                 sentence_index=idx,
                 nl_sentence=sentence,
@@ -126,19 +160,23 @@ def run_phase4(
             logger.debug("Phase 4 idx=%d: grounding failed, skipping", idx)
             continue
 
+        # --- FOL side: tri-state evaluation via FiniteModelEvaluator ---
         try:
-            fol_eval_val = model.evaluate(fol_formula, model_completion=True)
-            fol_truth = z3.is_true(fol_eval_val)
-            fol_eval_repr = str(fol_eval_val)
+            # Capture raw repr before reduction (for debugging)
+            raw_val = model.evaluate(fol_formula, model_completion=True)
+            fol_eval_repr = str(raw_val)
+            fol_truth = _evaluator.evaluate(model, fol_formula, namespace=namespace)
         except Exception as e:
             eval_error = f"FOL evaluation error: {e}"
-            fol_eval_repr = None
             logger.warning("Phase 4 idx=%d: %s", idx, eval_error)
 
+        # --- Grounded side: propositional truth-table eval ---
         if eval_error is None:
             grounded_truth = solver.evaluate_grounded_formula(domain, grounded.formula_code)
             if grounded_truth is None:
-                eval_error = f"Grounded formula evaluation error for: {grounded.formula_code!r}"
+                eval_error = (
+                    f"Grounded formula evaluation error for: {grounded.formula_code!r}"
+                )
                 logger.warning("Phase 4 idx=%d: %s", idx, eval_error)
 
         if eval_error:
@@ -159,16 +197,57 @@ def run_phase4(
             ))
             continue
 
-        # Compare truth values
+        # --- If fol_truth is None, record as unverifiable (not a mismatch) ---
+        if fol_truth is None:
+            logger.debug(
+                "Phase 4 idx=%d: fol_truth=None (unverifiable) — skipping mismatch check",
+                idx,
+            )
+            evaluations.append(SentenceEval(
+                sentence_index=idx,
+                nl_sentence=sentence,
+                fol_truth=None,
+                grounded_truth=grounded_truth,
+                mismatch=False,
+                mismatch_type=None,
+                grounding_failed=False,
+                fol_formula_str=str(fol_formula),
+                grounded_formula=grounded.formula_code,
+                fol_eval_repr=fol_eval_repr,
+                witness_index=witness_index,
+                witness_side=witness_side,
+                error="fol_truth=None: quantifier universe unavailable for finite instantiation",
+            ))
+            continue
+
+        # --- Compare concrete truth values ---
         is_mismatch = (fol_truth != grounded_truth)
         mismatch_type: str | None = None
 
         if is_mismatch:
-            if fol_truth and not grounded_truth:
-                mismatch_type = MISMATCH_WEAKENING
-            else:
-                mismatch_type = MISMATCH_STRENGTHENING
-
+            mismatch_type = (
+                MISMATCH_WEAKENING if fol_truth else MISMATCH_STRENGTHENING
+            )
+            # Detect structural Phase 3 errors on the conclusion.
+            # The witness is constructed so that the conclusion has a specific
+            # expected truth value: False on a ¬q witness, True on a q witness.
+            # When the FOL side matches that expected value (i.e. it is correct
+            # by Z3 construction) but the grounded side disagrees, the error is
+            # definitively in Phase 3 grounding — Phase 5 cannot fix it by
+            # tweaking the FOL formula.
+            #
+            #   ¬q witness: expected conclusion = False
+            #     → FOL=False (correct) + grounded=True = strengthening → Phase 3
+            #   q  witness: expected conclusion = True
+            #     → FOL=True  (correct) + grounded=False = weakening    → Phase 3
+            n_sentences = len(sentences)
+            is_p3_error = (
+                idx == n_sentences - 1  # conclusion is the last sentence
+                and (
+                    (witness_side == "not_q" and mismatch_type == MISMATCH_STRENGTHENING)
+                    or (witness_side == "q"     and mismatch_type == MISMATCH_WEAKENING)
+                )
+            )
             mismatches.append(Mismatch(
                 sentence_index=idx,
                 nl_sentence=sentence,
@@ -179,13 +258,17 @@ def run_phase4(
                 grounded_formula=grounded.formula_code,
                 witness_index=witness_index,
                 witness_side=witness_side,
+                is_phase3_error=is_p3_error,
+                fol_quantifier_layout=_quantifier_layout(fol_formula),
             ))
             logger.info(
                 "Phase 4 idx=%d MISMATCH (%s): FOL=%s, grounded=%s | %r",
                 idx, mismatch_type, fol_truth, grounded_truth, sentence[:60],
             )
         else:
-            logger.debug("Phase 4 idx=%d OK: FOL=%s, grounded=%s", idx, fol_truth, grounded_truth)
+            logger.debug(
+                "Phase 4 idx=%d OK: FOL=%s, grounded=%s", idx, fol_truth, grounded_truth
+            )
 
         evaluations.append(SentenceEval(
             sentence_index=idx,
@@ -200,14 +283,15 @@ def run_phase4(
             fol_eval_repr=fol_eval_repr,
             witness_index=witness_index,
             witness_side=witness_side,
-            error=eval_error,
         ))
 
-    # A sentence that failed grounding or evaluation cannot be verified.
-    # Treat it the same as a mismatch for the purposes of all_passed so that
-    # the pipeline doesn't claim "verified" when some sentences were skipped.
+    # Sentences that could not be fully verified (grounding failed, eval error,
+    # or fol_truth=None) are tracked separately.  They do NOT count as mismatches
+    # but DO prevent the result from being "all_passed" (we can't claim verified
+    # when some sentences were unevaluable).
     num_unverifiable = sum(
-        1 for e in evaluations if e.grounding_failed or e.error is not None
+        1 for e in evaluations
+        if e.grounding_failed or e.error is not None or e.fol_truth is None
     )
     return Phase4Result(
         mismatches=mismatches,

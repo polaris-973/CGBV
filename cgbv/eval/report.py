@@ -5,27 +5,34 @@ import logging
 from pathlib import Path
 
 from cgbv.config.settings import ExperimentConfig
+from cgbv.data.base import DataSample
+from cgbv.eval.metrics import compute_cgbv_repair_audit
 
 logger = logging.getLogger(__name__)
 
 _METRIC_LABELS = {
-    "general_accuracy": "General Accuracy",
+    "end_to_end_accuracy": "End-to-End Accuracy (correct / all samples)",
+    "conditional_accuracy": "Conditional Accuracy  (correct / successful runs)",
+    "completion_rate": "Completion Rate        (successful / all samples)",
     "binary_accuracy": "Binary Accuracy (True/False only)",
     "uncertain_recall": "Uncertain Recall",
     "verification_precision": "Verification Precision",
     "verification_coverage": "Verification Coverage",
     "mismatch_detection_precision": "Mismatch Detection Precision",
     "mismatch_detection_recall": "Mismatch Detection Recall",
-    "repair_parse_success_rate": "Repair Parse Success Rate",
+    "repair_round_commit_rate": "Repair Round Commit Rate",
     "repair_local_fix_rate": "Repair Local Fix Rate",
     "repair_verdict_recovery_rate": "Repair Verdict Recovery Rate",
     "repair_regression_rate": "Repair Regression Rate",
+    "cgbv_repair_recovery_rate": "CGBV Repair Recovery Rate",
+    "phase3_reground_rate": "Phase 3 Re-grounding Resolution Rate",
 }
 
 
 def write_report(
     metrics: dict,
     results: list[dict],
+    samples: list[DataSample],
     config: ExperimentConfig,
     output_dir: Path,
 ) -> None:
@@ -37,6 +44,7 @@ def write_report(
       {output_dir}/report.md      — human-readable Markdown table
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    cgbv_repair_audit = compute_cgbv_repair_audit(results, samples)
 
     report = {
         "experiment_id": config.experiment_id,
@@ -54,8 +62,10 @@ def write_report(
             "formalize_retries": config.pipeline.formalize_retries,
             "grounding_retries": config.pipeline.grounding_retries,
             "repair_retries": config.pipeline.repair_retries,
+            "world_assumption": config.pipeline.world_assumption,
         },
         "metrics": metrics,
+        "cgbv_repair_audit": cgbv_repair_audit,
     }
 
     # JSON report
@@ -74,7 +84,7 @@ def write_report(
         f.write(f"**LLM:** {config.llm.model}  \n")
         f.write(f"**Witnesses (K):** {config.pipeline.num_witnesses}  \n")
         f.write(f"**Max repair rounds (R_max):** {config.pipeline.r_max}  \n\n")
-        f.write(f"Completed: {metrics.get('completed_samples', 0)} / {metrics.get('total_samples', 0)} samples\n\n")
+        f.write(f"Completed: {metrics.get('successful_samples', 0)} / {metrics.get('total_samples', 0)} samples\n\n")
         f.write("## Metrics\n\n")
         f.write("| Metric | Value |\n")
         f.write("|--------|-------|\n")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 import cgbv.logging as cgbv_log
@@ -92,8 +94,11 @@ class ExperimentRunner:
                 )
                 cgbv_log.register_progress(None)
 
-            # Log summary of this batch
-            successes = sum(1 for r in results if isinstance(r, PipelineResult))
+            # Log summary of this batch (only count results without execution errors)
+            successes = sum(
+                1 for r in results
+                if isinstance(r, PipelineResult) and r.error is None
+            )
             errors = len(results) - successes
             logger.info(
                 "Batch complete: [green]%d succeeded[/], [red]%d errored[/]",
@@ -102,12 +107,18 @@ class ExperimentRunner:
 
         # Load all results (including previously completed ones)
         all_results = self.checkpoint.load_all_results(dataset=cfg.dataset.name)
-        logger.info("Computing metrics over %d completed samples", len(all_results))
+        # all_results includes errored runs; compute_metrics handles them correctly
+        # by checking execution_status (or legacy error field) per result.
+        logger.info(
+            "Computing metrics over %d result files (%d total samples)",
+            len(all_results), len(all_samples),
+        )
 
         metrics = compute_metrics(all_results, all_samples)
         write_report(
             metrics=metrics,
             results=all_results,
+            samples=all_samples,
             config=cfg,
             output_dir=cfg.output_dir,
         )
@@ -141,6 +152,11 @@ async def _run_tracked(
     """
     Wrapper that sets the sample context ContextVar, manages progress updates,
     and ensures complete_sample() is always called.
+
+    Unhandled exceptions from the pipeline are caught here and materialised as
+    a PipelineResult with execution_status="pipeline_error".  Writing result.json
+    ensures the checkpoint and metrics layers can account for the failure on
+    subsequent runs rather than silently ignoring it.
     """
     log_dir = results_base / sample.dataset / sample.id
     cgbv_log.set_sample(sample.id, log_dir, display_id=sample.display_id)
@@ -149,6 +165,31 @@ async def _run_tracked(
         result = await pipeline.run(sample)
         cgbv_log.complete_sample(success=(result.error is None))
         return result
-    except Exception:
+    except Exception as exc:
         cgbv_log.complete_sample(success=False)
-        raise
+        error_msg = f"Unhandled pipeline exception: {type(exc).__name__}: {exc}"
+        logger.error("Sample %s: %s", sample.id, error_msg, exc_info=True)
+        result = PipelineResult(
+            sample_id=sample.id,
+            dataset=sample.dataset,
+            label=sample.label,
+            verdict=None,
+            verdict_pre_bridge=None,
+            verdict_post_bridge=None,
+            verified=False,
+            num_rounds=0,
+            execution_status="pipeline_error",
+            verification_status="not_run",
+            error=error_msg,
+        )
+        out_dir = results_base / sample.dataset / sample.id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(out_dir / "result.json", "w", encoding="utf-8") as f:
+                json.dump(asdict(result), f, indent=2, ensure_ascii=False)
+        except Exception as write_exc:
+            logger.warning(
+                "Could not write pipeline_error result.json for %s: %s",
+                sample.id, write_exc,
+            )
+        return result

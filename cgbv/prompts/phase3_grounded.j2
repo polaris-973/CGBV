@@ -12,6 +12,7 @@ Your task: write a Python boolean expression that evaluates to True if the sente
 
 Write a **single Python boolean expression**. Use:
 - `truth["PredName(entity)"]` — look up a ground atom's truth value
+- `value["fname(entity)"]` — look up a function's numeric value (for comparisons, e.g. `value["score(alice)"] < value["score(bob)"]`)
 - `and`, `or`, `not` — boolean connectives
 - `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
@@ -79,6 +80,42 @@ Ground atoms:
 | "All birds can fly." | `all(truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
 | "Some bird cannot fly." | `any(not truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
 | "Tweety is a bird that can fly." | `truth["is_bird(tweety)"] and truth["can_fly(tweety)"]` |
+
+---
+
+## Numeric Comparison (Function-value predicates)
+
+When the domain lists `Function values` entries like `value["score(alice)"] = 42`, use
+the `value[...]` lookup directly — do **not** iterate over booleanized `_is` predicates.
+
+| Natural language | Grounded expression |
+|---|---|
+| "Alice's score is less than Bob's." | `value["score(alice)"] < value["score(bob)"]` |
+| "Bob has the highest score." | `all(value[f"score({e})"] < value["score(bob)"] for e in SORT_LIST if e != "bob")` |
+| "Alice and Bob have equal scores." | `value["score(alice)"] == value["score(bob)"]` |
+| "Alice's score is at most 100." | `value["score(alice)"] <= 100` |
+
+For f-string access over a sort, write `value[f"score({e})"]` where `e` iterates over
+the correct sort list from the domain.
+
+**Critical**: the comparison operator must **exactly match** the NL meaning.
+- "less / smaller / lower" → `<`
+- "greater / larger / higher" → `>`
+- "X has the highest/largest" → all others are strictly below X: `value[f"f({e})"] < value["f(x)"]`
+- "at most" → `<=`; "at least" → `>=`; "equal / same" → `==`
+
+---
+
+{% if world_assumption == "cwa" %}
+---
+
+## Closed-World Assumption
+
+Under the Closed-World Assumption: if a property is not explicitly asserted for an entity in the
+witness domain, treat it as **False**. For "either A or B" patterns, model as **exclusive** (exactly
+one is true). Do not assume unmentioned relationships hold — only use facts explicitly listed in the
+ground atoms section.
+{% endif %}
 
 ---
 

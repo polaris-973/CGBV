@@ -289,9 +289,14 @@ class Z3Solver:
                 key = f"{pred_name}({', '.join(args)})"
                 truth_table[key] = bool(val)
 
+        # value["fname(entity)"] → actual Python value (int/float/str).
+        # Enables direct comparisons: value["score(alice)"] < value["score(bob)"].
+        value_table: dict[str, Any] = dict(domain.get("function_values", {}))
+
         safe_globals: dict[str, Any] = {
             "__builtins__": {},
             "truth": truth_table,
+            "value": value_table,
             "all": all,
             "any": any,
             "True": True,

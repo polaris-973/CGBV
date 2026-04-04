@@ -27,6 +27,7 @@ This is attempt {{ attempt_num }} of {{ max_attempts }}.
 
 Write a **single Python boolean expression**. Use:
 - `truth["PredName(entity)"]` — look up a ground atom's truth value
+- `value["fname(entity)"]` — look up a function's numeric value (for comparisons, e.g. `value["score(alice)"] < value["score(bob)"]`)
 - `and`, `or`, `not` — boolean connectives
 - `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
@@ -37,8 +38,22 @@ Write a **single Python boolean expression**. Use:
 3. If a sentence's quantifier ("all", "some", "no") ranges over a type already determined by the sort (e.g., all entities in the `Stock` sort ARE stocks), do **NOT** add a redundant `if truth["is_stock(e)"]` guard. Only add an `if truth[...]` guard if the NL sentence explicitly conditions on an additional predicate.
 4. Do **NOT** invent entity names. Use only the canonical IDs listed in "Canonical entity IDs".
 5. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
-6. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
-7. Output ONLY the expression — no imports, no assignments, no prose.
+6. Do **NOT** call predicates directly — access them via `truth[...]` subscripts. For example, `moved_to(u, x)` is **wrong**; `truth[f"moved_to({u}, x)"]` is **correct**.
+7. When the domain lists `Function values` entries (`value["fname(entity)"] = N`), use `value[...]` directly for comparisons — do **not** iterate over `_is` predicates. E.g. "Y has the highest score" → `all(value[f"score({e})"] < value["score(y)"] for e in SORT_LIST if e != "y")`. Operator must match NL exactly: `<` for "less/smaller", `>` for "greater/larger", `==` for "same/equal", `<=`/`>=` for "at most/least". "X has the largest" → all others are strictly below X → `value[f"f({e})"] < value["f(x)"]`.
+8. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
+9. Output ONLY the expression — no imports, no assignments, no prose.
+
+---
+
+{% if world_assumption == "cwa" %}
+---
+
+## Closed-World Assumption
+
+Under the Closed-World Assumption: if a property is not explicitly asserted for an entity in the
+witness domain, treat it as **False**. For "either A or B" patterns, model as **exclusive** (exactly
+one is true). Do not assume unmentioned relationships hold.
+{% endif %}
 
 ---
 

@@ -249,6 +249,63 @@ Conclusion: {{ ex.conclusion }}
 {% endfor %}
 ---
 {% endif %}
+{% if world_assumption == "cwa" %}
+
+---
+
+## Closed-World Assumption (CWA) Rules
+
+The following additional rules apply under the Closed-World Assumption. What is not stated or
+derivable from the premises is assumed to be **false**.
+
+### RULE 10 — Exclusive Disjunction (XOR)
+
+When the NL says "either A or B" for category membership or properties, model as **exclusive or**
+(exactly one holds):
+
+```python
+# "A bee is either a honey bee or a bumble bee"
+v = Const('v', Bee)
+f = ForAll([v], And(Or(is_honey_bee(v), is_bumble_bee(v)),
+                    Not(And(is_honey_bee(v), is_bumble_bee(v)))))
+```
+
+Under CWA, "either...or" means exactly one category applies, not possibly both.
+
+### RULE 11 — Type Subsumption Axioms
+
+When a type hierarchy is implied (e.g., "bees are insects", "insects are animals"), add **explicit
+upward-closure axioms** so that membership propagates through the chain:
+
+```python
+# "Bees are insects" + "Insects are animals" → need BOTH rules:
+v = Const('v', Entity)
+f_sub1 = ForAll([v], Implies(is_bee(v), is_insect(v)))
+f_sub2 = ForAll([v], Implies(is_insect(v), is_animal(v)))
+```
+
+Under CWA, an entity stated to be a "bee" is NOT independently recognized as an "animal" unless
+the complete chain of subsumption axioms is present.
+
+### RULE 12 — Comparison Predicates as Concrete Relations
+
+Predicates like `equal_to`, `more_than`, `no_more_than` must be **explicitly asserted** for all
+needed entity pairs. Under CWA, unasserted comparisons evaluate to false.
+
+When arithmetic ordering is implied, add **transitivity and antisymmetry axioms**:
+
+```python
+# If more_than(a, b) and more_than(b, c), then more_than(a, c)
+x = Const('x', Amount)
+y = Const('y', Amount)
+z = Const('z', Amount)
+f_trans = ForAll([x, y, z], Implies(And(more_than(x, y), more_than(y, z)), more_than(x, z)))
+# If more_than(a, b), then not equal_to(a, b) and not no_more_than(a, b)
+f_antisym = ForAll([x, y], Implies(more_than(x, y), And(Not(equal_to(x, y)), Not(no_more_than(x, y)))))
+```
+
+Also: `equal_to(a, b)` implies `no_more_than(a, b)` and `no_more_than(b, a)`.
+{% endif %}
 
 ## Your Task
 

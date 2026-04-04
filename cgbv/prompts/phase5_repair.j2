@@ -52,6 +52,24 @@ Use the exact predicate names, sort names, constant names, and bound variable na
 
 ---
 
+{% if world_assumption == "cwa" %}
+---
+
+## CWA Repair Guidance
+
+Under the Closed-World Assumption, modify the **existing formula's logical structure**
+(do NOT introduce new axioms or change a premise into a different kind of statement):
+
+- **Weakening** (formula too loose): add the missing predicate condition, strengthen
+  the antecedent/consequent, or change inclusive `Or` to XOR
+  `And(Or(A(x),B(x)), Not(And(A(x),B(x))))` when the NL says "either...or".
+- **Strengthening** (formula too strict): remove a spurious extra condition, relax
+  a conjunct, or correct a predicate direction — the formula should not constrain
+  more than the NL sentence states.
+{% endif %}
+
+---
+
 ## Repair Instructions
 
 1. Output a **Z3-Python expression** — no full code block, no imports, no assignments.
@@ -68,7 +86,7 @@ Use the exact predicate names, sort names, constant names, and bound variable na
 {% endif %}
 5. If the grounded formula uses `all(...)` → the FOL repair should use `ForAll`.
    If the grounded formula uses `any(...)` → the FOL repair should use `Exists`.
-   If the grounded formula is a conjunction of ground atoms → the FOL repair should use `And(...)` or `ForAll([v], Implies(...))`.
+   If the grounded formula is a conjunction of ground atoms → the FOL repair should use `And(...)` with ground predicates only. Do **not** introduce `ForAll` or `Exists` in this case.
 6. The repaired formula **must** evaluate to `{{ grounded_truth }}` on the boundary world shown above.
 
 Output ONLY the corrected Z3-Python **expression**.

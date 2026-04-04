@@ -47,6 +47,7 @@ async def run_phase3(
     llm: LLMClient,
     prompt_engine: PromptEngine,
     max_retries: int = 2,
+    world_assumption: str = "owa",
 ) -> Phase3Result:
     """
     Phase 3: Grounded Re-Formalization.
@@ -57,7 +58,7 @@ async def run_phase3(
     All sentences are processed in parallel via asyncio.gather.
     """
     tasks = [
-        _formalize_one(idx, sentence, domain_desc_str, domain, llm, prompt_engine, max_retries)
+        _formalize_one(idx, sentence, domain_desc_str, domain, llm, prompt_engine, max_retries, world_assumption)
         for idx, sentence in enumerate(sentences)
     ]
     results: list[GroundedFormula] = await asyncio.gather(*tasks)
@@ -72,8 +73,9 @@ async def _formalize_one(
     llm: LLMClient,
     prompt_engine: PromptEngine,
     max_retries: int,
+    world_assumption: str = "owa",
 ) -> GroundedFormula:
-    messages = _build_messages(sentence, domain_desc_str, prompt_engine)
+    messages = _build_messages(sentence, domain_desc_str, prompt_engine, world_assumption)
     last_error: str | None = None
     raw_output = ""
     attempts: list[GroundingAttempt] = []
@@ -91,6 +93,7 @@ async def _formalize_one(
                     attempt_num=attempt + 1,
                     max_attempts=max_attempts,
                     prompt_engine=prompt_engine,
+                    world_assumption=world_assumption,
                 ),
             ]
         attempt_record = GroundingAttempt(
@@ -129,11 +132,122 @@ async def _formalize_one(
     )
 
 
-def _build_messages(sentence: str, domain_desc_str: str, prompt_engine: PromptEngine) -> list[dict]:
+async def reground_with_hint(
+    idx: int,
+    sentence: str,
+    domain_desc_str: str,
+    domain: dict,
+    current_formula: str,
+    expected_truth: bool,
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int = 2,
+    world_assumption: str = "owa",
+) -> GroundedFormula:
+    """
+    Re-ground a sentence when Phase 4 detected a structural Phase 3 semantic error.
+
+    Unlike _formalize_one (which starts blind), this function pre-seeds the LLM
+    conversation with the wrong formula and a semantic error explaining what the
+    formula should evaluate to.  This gives the LLM direct signal about the
+    comparison direction or quantifier structure error without consuming an extra
+    "blind" generation.
+
+    Args:
+        current_formula: The Phase 3 formula that Phase 4 found to be incorrect.
+        expected_truth:  What the formula should evaluate to on this witness
+                         (False for ¬q witness, True for q witness).
+    """
+    semantic_hint = (
+        f"Your formula evaluated to {not expected_truth} but must evaluate to "
+        f"{expected_truth} on this domain. "
+        f"The most likely cause is an incorrect comparison direction (e.g. < vs >) "
+        f"or an inverted quantifier. "
+        f"Rewrite the formula so it evaluates to {expected_truth}."
+    )
+
+    # Seed the conversation: initial prompt → current (wrong) formula → semantic error.
+    # This is structurally identical to a Phase 3 retry but with a Phase 4-sourced hint.
+    base_messages = _build_messages(sentence, domain_desc_str, prompt_engine, world_assumption)
+    messages = base_messages + [
+        {"role": "assistant", "content": current_formula},
+        _build_retry_message(
+            sentence=sentence,
+            domain_desc_str=domain_desc_str,
+            previous_output=current_formula,
+            last_error=semantic_hint,
+            attempt_num=1,
+            max_attempts=max_retries + 1,
+            prompt_engine=prompt_engine,
+            world_assumption=world_assumption,
+        ),
+    ]
+
+    last_error: str | None = semantic_hint
+    raw_output: str = ""
+    attempts: list[GroundingAttempt] = []
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                _build_retry_message(
+                    sentence=sentence,
+                    domain_desc_str=domain_desc_str,
+                    previous_output=_normalise_output_for_prompt(raw_output),
+                    last_error=last_error or "Unknown error",
+                    attempt_num=attempt + 1,
+                    max_attempts=max_retries + 1,
+                    prompt_engine=prompt_engine,
+                    world_assumption=world_assumption,
+                ),
+            ]
+
+        attempt_record = GroundingAttempt(
+            attempt_num=attempt + 1,
+            messages=_snapshot_messages(messages),
+        )
+        raw_output = await llm.complete_with_retry(messages)
+        attempt_record.raw_output = raw_output
+        formula_code = _extract_formula(raw_output)
+        attempt_record.extracted_formula = formula_code
+
+        err = _validate_formula(formula_code, domain)
+        if err:
+            last_error = err
+            attempt_record.validation_error = err
+            attempts.append(attempt_record)
+            logger.debug(
+                "reground_with_hint idx=%d attempt %d: validation error: %s",
+                idx, attempt + 1, err,
+            )
+            continue
+
+        attempt_record.accepted = True
+        attempts.append(attempt_record)
+        return GroundedFormula(
+            sentence_index=idx,
+            nl_sentence=sentence,
+            formula_code=formula_code,
+            attempts=attempts,
+        )
+
+    return GroundedFormula(
+        sentence_index=idx,
+        nl_sentence=sentence,
+        formula_code="",
+        failed=True,
+        attempts=attempts,
+        error=f"Phase 3 re-grounding failed after {max_retries + 1} attempts. Last error: {last_error}",
+    )
+
+
+def _build_messages(sentence: str, domain_desc_str: str, prompt_engine: PromptEngine, world_assumption: str = "owa") -> list[dict]:
     user_content = prompt_engine.render(
         "phase3_grounded.j2",
         sentence=sentence,
         domain_desc=domain_desc_str,
+        world_assumption=world_assumption,
     )
     return [{"role": "user", "content": user_content}]
 
@@ -146,6 +260,7 @@ def _build_retry_message(
     attempt_num: int,
     max_attempts: int,
     prompt_engine: PromptEngine,
+    world_assumption: str = "owa",
 ) -> dict[str, str]:
     user_content = prompt_engine.render(
         "phase3_retry.j2",
@@ -155,6 +270,7 @@ def _build_retry_message(
         last_error=last_error,
         attempt_num=attempt_num,
         max_attempts=max_attempts,
+        world_assumption=world_assumption,
     )
     return {"role": "user", "content": user_content}
 
@@ -189,7 +305,7 @@ def _normalise_output_for_prompt(raw: str) -> str:
 
 
 def _build_valid_keys(domain: dict) -> set[str]:
-    """Build the set of valid truth table keys from the domain dict."""
+    """Build the set of valid truth[] keys from the domain predicates dict."""
     valid: set[str] = set()
     for pred_name, interp in domain.get("predicates", {}).items():
         for args in interp.keys():
@@ -198,17 +314,24 @@ def _build_valid_keys(domain: dict) -> set[str]:
     return valid
 
 
+def _build_valid_value_keys(domain: dict) -> set[str]:
+    """Build the set of valid value[] keys from the domain function_values dict."""
+    return set(domain.get("function_values", {}).keys())
+
+
 def _validate_formula(formula_code: str, domain: dict) -> str | None:
     """
-    Validate a grounded formula (truth-table expression).
+    Validate a grounded formula (truth-table or value-comparison expression).
 
     Checks (in order):
     1. Not empty.
-    2. AST structural check: must parse as a pure expression (no imports, assignments).
-    3. All static truth["..."] keys reference valid domain atoms.
-    4. f-string entity iterators only use entities present in the domain.
-    5. Sort-aware check: entity loops use entities from the correct predicate argument sort.
-    6. At least one truth reference exists (unless formula is True/False).
+    2. AST structural check: must parse as a pure expression (no imports, assignments,
+       no direct predicate calls other than all/any).
+    3. Static truth["..."] key validation against known domain atoms.
+    4. Static value["..."] key validation against known function values.
+    5. f-string entity iterators only use entities present in the domain.
+    6. Sort-aware check: entity loops use entities from the correct sort.
+    7. At least one truth["..."] or value["..."] reference exists (unless True/False).
     """
     if not formula_code:
         return "Empty formula"
@@ -218,16 +341,10 @@ def _validate_formula(formula_code: str, domain: dict) -> str | None:
     if ast_err:
         return ast_err
 
-    # --- Check 3: Static key validation ---
+    # --- Check 3: Static truth["..."] key validation ---
     used_keys = re.findall(r'truth\["([^"]+)"\]', formula_code)
     used_keys += re.findall(r"truth\['([^']+)'\]", formula_code)
-    has_fstring = bool(re.search(r'truth\[f["\']', formula_code))
-
-    if not used_keys and not has_fstring and formula_code not in ("True", "False"):
-        return (
-            'Formula must use truth["PredName(entity)"] references. '
-            f'Got: {formula_code[:80]!r}'
-        )
+    has_truth_fstring = bool(re.search(r'truth\[f["\']', formula_code))
 
     if used_keys:
         valid_keys = _build_valid_keys(domain)
@@ -239,8 +356,31 @@ def _validate_formula(formula_code: str, domain: dict) -> str | None:
                 f"Valid keys include: {valid_sample}"
             )
 
-    # --- Check 4+5: f-string entity and sort validation ---
-    if has_fstring:
+    # --- Check 4: Static value["..."] key validation ---
+    used_value_keys = re.findall(r'value\["([^"]+)"\]', formula_code)
+    used_value_keys += re.findall(r"value\['([^']+)'\]", formula_code)
+    has_value_fstring = bool(re.search(r'value\[f["\']', formula_code))
+
+    if used_value_keys:
+        valid_value_keys = _build_valid_value_keys(domain)
+        unknown_v = [k for k in used_value_keys if k not in valid_value_keys]
+        if unknown_v:
+            valid_v_sample = sorted(valid_value_keys)[:5]
+            return (
+                f"Unknown value[] keys: {unknown_v[:3]}. "
+                f"Valid keys include: {valid_v_sample}"
+            )
+
+    # --- Check 7: At least one reference required ---
+    has_any_ref = used_keys or has_truth_fstring or used_value_keys or has_value_fstring
+    if not has_any_ref and formula_code not in ("True", "False"):
+        return (
+            'Formula must use truth["PredName(entity)"] or value["fname(entity)"] '
+            f'references. Got: {formula_code[:80]!r}'
+        )
+
+    # --- Check 5+6: f-string entity and sort validation ---
+    if has_truth_fstring or has_value_fstring:
         fstring_err = _check_fstring_entities(formula_code, domain)
         if fstring_err:
             return fstring_err
@@ -284,6 +424,25 @@ def _check_ast_structure(formula_code: str) -> str | None:
                 "Only boolean expressions using truth[...] / all() / any() are allowed."
             )
 
+    # Disallow every function call except all() and any().
+    # truth["..."] / truth[f"..."] are subscripts, not calls — unaffected.
+    # The check rejects all non-whitelisted forms: predicate calls like
+    # moved_to(u, x), method calls like obj.method(), and call-expression
+    # forms like (lambda: ...)() — anything whose callee isn't Name('all')
+    # or Name('any') is refused.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            is_allowed = isinstance(func, ast.Name) and func.id in {"all", "any"}
+            if not is_allowed:
+                call_repr = func.id if isinstance(func, ast.Name) else type(func).__name__
+                return (
+                    f"Formula contains a disallowed call ({call_repr!r}). "
+                    "Only 'all(...)' and 'any(...)' are permitted as function calls. "
+                    "Access predicates via truth[\"PredName(entity)\"] subscripts; "
+                    "access function values via value[\"fname(entity)\"] subscripts."
+                )
+
     return None
 
 
@@ -291,12 +450,15 @@ def _check_fstring_entities(formula_code: str, domain: dict) -> str | None:
     """
     AST-level validation for f-string grounded formulas.
 
+    Handles both truth[f"pred(...)"] and value[f"fname(...)"] subscripts.
+
     Checks:
     1. Every entity string literal inside a `for var in [...]` generator loop is a
        known domain entity.
-    2. Each {var} argument of a `truth[f"pred(...)"]` call iterates over entities
-       of the correct sort, matched by argument position via predicate_signatures.
-       Works for unary, binary, and higher-arity predicates without false positives.
+    2. For truth[f"pred({var})"]: {var} iterates over entities of the correct sort,
+       matched by argument position via predicate_signatures.
+    3. For value[f"fname({var})"]: {var} iterates over entities of the correct sort,
+       matched by argument position via raw_function_signatures.
     """
     all_entities: set[str] = set(domain.get("entities", []))
     for sort_ents in domain.get("sorts", {}).values():
@@ -307,6 +469,7 @@ def _check_fstring_entities(formula_code: str, domain: dict) -> str | None:
         for ent in ents
     }
     pred_sigs: dict[str, list[str]] = domain.get("predicate_signatures", {})
+    raw_func_sigs: dict[str, list[str]] = domain.get("raw_function_signatures", {})
 
     try:
         tree = ast.parse(formula_code, mode='eval')
@@ -341,14 +504,17 @@ def _check_fstring_entities(formula_code: str, domain: dict) -> str | None:
                 )
 
     # --- Pass 2: sort-aware check via AST Subscript → JoinedStr nodes ---
-    if not pred_sigs or not entity_to_sort:
+    # Handles both truth[f"..."] (uses pred_sigs) and value[f"..."] (uses raw_func_sigs).
+    if not entity_to_sort:
         return None
 
     for node in ast.walk(tree):
-        # Match: truth[f"..."]  → Subscript(Name('truth'), JoinedStr(...))
         if not isinstance(node, ast.Subscript):
             continue
-        if not (isinstance(node.value, ast.Name) and node.value.id == 'truth'):
+        if not isinstance(node.value, ast.Name):
+            continue
+        lookup_name = node.value.id   # 'truth' or 'value'
+        if lookup_name not in ("truth", "value"):
             continue
         joined = node.slice
         if not isinstance(joined, ast.JoinedStr):
@@ -357,17 +523,23 @@ def _check_fstring_entities(formula_code: str, domain: dict) -> str | None:
         parsed = _parse_fstring_pred_args(joined)
         if parsed is None:
             continue
-        pred_name, arg_vars = parsed
+        func_name, arg_vars = parsed
 
-        if pred_name not in pred_sigs:
+        # Select signature source based on lookup type
+        if lookup_name == "truth":
+            sigs = pred_sigs
+        else:  # "value"
+            sigs = raw_func_sigs
+
+        if func_name not in sigs:
             continue
-        expected_sorts = pred_sigs[pred_name]
+        expected_sorts = sigs[func_name]
         if len(arg_vars) != len(expected_sorts):
             continue  # arity mismatch — skip
 
         for var, expected_sort in zip(arg_vars, expected_sorts):
             if var is None:
-                continue  # complex expression in this argument — skip
+                continue  # complex expression — skip
             loop_ents = var_entities.get(var)
             if not loop_ents:
                 continue
@@ -379,7 +551,7 @@ def _check_fstring_entities(formula_code: str, domain: dict) -> str | None:
                 if ent_sort and ent_sort != expected_sort:
                     return (
                         f"Entity {ent!r} (sort: {ent_sort}) in loop for variable "
-                        f"'{var}' of predicate '{pred_name}' but expected sort "
+                        f"'{var}' of {lookup_name}[f\"{func_name}(...)\"] but expected sort "
                         f"'{expected_sort}'. Use entities: {sorted(expected_ents)}"
                     )
 
