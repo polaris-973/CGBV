@@ -8,17 +8,19 @@ from typing import Any
 
 import cgbv.logging as cgbv_log
 from cgbv.config.settings import ExperimentConfig
+from cgbv.core.gap_analysis import compute_gap_analysis
 from cgbv.core.multi_witness import MultiWitnessResult, run_multi_witness
-from cgbv.core.phase1_formalize import Phase1Result, run_phase1
+from cgbv.core.phase1_formalize import Phase1Result, run_phase1, run_phase1_targeted
 from cgbv.core.phase3_grounded import Phase3Result, reground_with_hint
 from cgbv.solver.model_extractor import format_domain_desc
+from cgbv.solver.code_executor import configure_max_workers
 from cgbv.core.phase4_check import Mismatch, Phase4Result
 from cgbv.core.phase5_repair import Phase5Result, run_phase5
 from cgbv.data.base import DataSample
 from cgbv.llm.base import LLMClient
 from cgbv.llm.factory import create_llm_client
 from cgbv.prompts.prompt_engine import PromptEngine
-from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNKNOWN, VERDICT_REFUTED, VERDICT_UNCERTAIN
+from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNKNOWN, VERDICT_UNCERTAIN
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +108,12 @@ class PipelineResult:
     #   "not_run"          — verification never started (execution failed before it)
     execution_status: str = "success"
     verification_status: str = "not_run"
+    # P6: Verification confidence grading
+    #   "high"   — verified with ≥1 witness, no mismatches, no open issues
+    #   "medium" — all repairs committed, no regressions, but unverified
+    #   "low"    — some repairs failed or reverted, or open issues remain
+    #   "none"   — no verification attempted (execution failed or no witnesses)
+    verification_confidence: str = "none"
     error: str | None = None
 
 
@@ -125,6 +133,7 @@ class CGBVPipeline:
             few_shot_dir=config.prompts.few_shot_dir,
         )
         self._results_base = config.output_dir
+        configure_max_workers(config.pipeline.max_exec_workers)
 
     async def run(self, sample: DataSample) -> PipelineResult:
         """
@@ -157,6 +166,8 @@ class CGBVPipeline:
             task_type=sample.task_type,
             code_exec_timeout=self.config.pipeline.code_exec_timeout,
             world_assumption=self.config.pipeline.world_assumption,
+            bridge_retries=self.config.pipeline.bridge_retries,
+            enable_bridge=self.config.pipeline.enable_phase1_bridge,
         )
         self._write_json(out_dir / "phase1.json", _phase1_to_dict(p1, sample))
 
@@ -219,16 +230,6 @@ class CGBVPipeline:
         sentences = sample.premises + [sample.conclusion]
         rounds: list[RoundRecord] = []
 
-        label_norm = _normalise_verdict(sample.label)
-        # Regression guard baseline = verdict_post_bridge.
-        # Bridge has already happened; Phase 5 must not revert a bridge fix.
-        initial_correct = (_normalise_verdict(verdict_post_bridge) == label_norm)
-        # Dynamic guard: starts same as initial_correct, but gets set to True
-        # whenever any round produces the correct verdict.  This prevents
-        # "round 1 fixes it, round 2 breaks it again" regressions that the
-        # static initial_correct alone cannot catch.
-        best_correct = initial_correct
-
         # Tracks the verification chain outcome for the final round.
         # Overwritten each round; the last value is used in the final PipelineResult.
         _final_verification_status = "exhausted_rounds"
@@ -268,6 +269,13 @@ class CGBVPipeline:
 
             # Phase 2+3+4: Multi-Witness
             cgbv_log.update_phase("phase2", f"round {round_num}/{self.config.pipeline.r_max}")
+            # P5: For Uncertain verdicts, use at least 2 witnesses to improve
+            # verification coverage (both P∧q and P∧¬q sides need checking).
+            effective_k = (
+                max(self.config.pipeline.num_witnesses, self.config.pipeline.min_uncertain_witnesses)
+                if verdict == VERDICT_UNCERTAIN
+                else self.config.pipeline.num_witnesses
+            )
             mw = await run_multi_witness(
                 verdict=verdict,
                 model_info=model_info,
@@ -281,7 +289,7 @@ class CGBVPipeline:
                 prompt_engine=self.prompt_engine,
                 background_constraints=background_constraints,
                 bound_var_names=bound_var_names,
-                num_witnesses=self.config.pipeline.num_witnesses,
+                num_witnesses=effective_k,
                 grounding_retries=self.config.pipeline.grounding_retries,
                 world_assumption=self.config.pipeline.world_assumption,
             )
@@ -309,6 +317,15 @@ class CGBVPipeline:
                 issue[0] for idx, issue in open_issues.items()
                 if idx not in current_mismatch_indices
             ]
+
+            # 9.5: Track persistence rounds for re-detected mismatches.
+            # When the current witness re-detects a mismatch that's already in
+            # open_issues (formula unchanged), record the round count so Phase 5
+            # can report "this mismatch has persisted for N rounds".
+            for m in mw.mismatches:
+                if m.sentence_index in open_issues:
+                    prev = open_issues[m.sentence_index]
+                    m.persist_rounds = prev[0].persist_rounds + 1
 
             # Build per-witness model/domain maps for this round.
             # Placed here (not inside the repair branch) so they're available
@@ -363,25 +380,139 @@ class CGBVPipeline:
             # not surface, even though the formulas are unchanged).
             # This includes Phase 3 errors persisted in open_issues — they must
             # be resolved via re-grounding before verification can succeed.
+            #
+            # Gap analysis routing: even with 0 mismatches, if the theory has
+            # structural gaps (ungrounded rule antecedents with missing links),
+            # we defer verification and enter Phase 5 bridge-only mode.  This
+            # catches cases like "bee → animal" where the FOL is structurally
+            # incomplete but Phase 3-4 can't detect it (correlated LLM bias).
             if mw.all_passed and not carried and not open_issues:
-                rounds.append(round_record)
-                result = PipelineResult(
-                    sample_id=sample.id,
-                    dataset=sample.dataset,
-                    label=sample.label,
-                    verdict=verdict,
-                    verdict_pre_bridge=verdict_pre_bridge,
-                    verdict_post_bridge=verdict_post_bridge,
-                    verified=True,
-                    num_rounds=round_num,
-                    rounds=rounds,
-                    phase1_raw_code=p1.raw_code,
-                    execution_status="success",
-                    verification_status="verified",
+                # Gap analysis only needed for Uncertain: guards against correlated
+                # LLM bias on incomplete theories.  For Refuted/Entailed the solver
+                # already has a definitive proof — no structural gap check required.
+                gap = (
+                    compute_gap_analysis(premises, q, [], background_constraints)
+                    if verdict == VERDICT_UNCERTAIN
+                    else None
                 )
-                self._write_json(out_dir / "result.json", asdict(result))
-                logger.info("Pipeline sample=%s VERIFIED at round %d", sample.id, round_num)
-                return result
+                if gap is None or not gap.missing_links:
+                    rounds.append(round_record)
+                    result = PipelineResult(
+                        sample_id=sample.id,
+                        dataset=sample.dataset,
+                        label=sample.label,
+                        verdict=verdict,
+                        verdict_pre_bridge=verdict_pre_bridge,
+                        verdict_post_bridge=verdict_post_bridge,
+                        verified=True,
+                        num_rounds=round_num,
+                        rounds=rounds,
+                        phase1_raw_code=p1.raw_code,
+                        execution_status="success",
+                        verification_status="verified",
+                        verification_confidence="high",
+                    )
+                    self._write_json(out_dir / "result.json", asdict(result))
+                    logger.info("Pipeline sample=%s VERIFIED at round %d", sample.id, round_num)
+                    return result
+
+                # Gap analysis found structural gaps — enter bridge-only Phase 5
+                logger.info(
+                    "Pipeline sample=%s round=%d: 0 mismatches but gap analysis "
+                    "found %d missing link(s): %s — entering bridge-only Phase 5",
+                    sample.id, round_num, len(gap.missing_links), gap.missing_links,
+                )
+                first_wr = mw.witness_results[0] if mw.witness_results else None
+                first_witness_domain = first_wr.phase2.domain if first_wr else {}
+
+                cgbv_log.update_phase("phase5", f"bridge-only round {round_num}")
+                p5_gap = await run_phase5(
+                    mismatches=[],
+                    premises=premises,
+                    q=q,
+                    namespace=namespace,
+                    raw_code=p1.raw_code,
+                    domain=first_witness_domain,
+                    llm=self.llm,
+                    prompt_engine=self.prompt_engine,
+                    max_retries=self.config.pipeline.repair_retries,
+                    models=witness_models,
+                    domains=witness_domains,
+                    solver=self.solver,
+                    world_assumption=self.config.pipeline.world_assumption,
+                    gap_analysis=gap,
+                )
+
+                # Process bridge axioms from gap-triggered Phase 5
+                _gap_committed: list = []
+                if p5_gap.bridge_axioms:
+                    # Accept all proposed bridges (no mismatch witnesses to filter
+                    # against — gap-triggered bridges are accepted if they parse
+                    # and are quantified, then validated via re-solve + next round).
+                    accepted_gap_bridges = list(p5_gap.bridge_axioms)
+                    background_constraints.extend(accepted_gap_bridges)
+
+                    solver_premises = list(premises) + background_constraints
+                    if sample.task_type == "three_class":
+                        new_verdict, new_model_info, new_model_info_q = (
+                            self.solver.check_entailment_three_class(solver_premises, q)
+                        )
+                    else:
+                        new_verdict, new_model_info = self.solver.check_entailment(
+                            solver_premises, q
+                        )
+                        new_model_info_q = None
+
+                    # Unknown guard
+                    new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                    old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                    if new_is_unknown and not old_is_unknown:
+                        for _ in accepted_gap_bridges:
+                            if background_constraints:
+                                background_constraints.pop()
+                        logger.warning(
+                            "Pipeline sample=%s round=%d: gap bridge degraded "
+                            "solver to Unknown; reverted",
+                            sample.id, round_num,
+                        )
+                    else:
+                        _gap_committed = accepted_gap_bridges
+                        old_verdict_for_log = verdict
+                        verdict = new_verdict
+                        model_info = new_model_info
+                        model_info_q = new_model_info_q
+                        round_record.verdict_after = new_verdict
+                        round_record.repair_success = True
+
+                        bridge_notes = [
+                            f"# Gap bridge axiom: {str(b)}"
+                            for b in accepted_gap_bridges
+                        ]
+                        updated_code = (
+                            p1.raw_code.rstrip()
+                            + "\n\n# ---- Gap analysis bridges (round "
+                            + str(round_num) + ") ----\n"
+                            + "\n".join(bridge_notes)
+                        )
+                        p1 = _patched_p1(
+                            p1, premises, q, new_verdict, new_model_info,
+                            new_model_info_q, raw_code=updated_code,
+                            background_constraints=list(background_constraints),
+                        )
+                        logger.info(
+                            "Pipeline sample=%s round=%d: %d gap bridge(s) "
+                            "committed, verdict %s→%s",
+                            sample.id, round_num,
+                            len(accepted_gap_bridges), old_verdict_for_log, verdict,
+                        )
+
+                self._write_json(
+                    out_dir / f"round{round_num}_repair.json",
+                    _phase5_to_dict(p5_gap, accepted_bridges=_gap_committed),
+                )
+                rounds.append(round_record)
+                # Continue to next round for verification of the new theory
+                continue
 
             if mw.num_witnesses_constructed == 0:
                 logger.warning(
@@ -471,6 +602,7 @@ class CGBVPipeline:
                         prompt_engine=self.prompt_engine,
                         max_retries=self.config.pipeline.grounding_retries,
                         world_assumption=self.config.pipeline.world_assumption,
+                        solver=self.solver,
                     )
                     resolved = False
                     if not new_gf.failed:
@@ -520,41 +652,149 @@ class CGBVPipeline:
             # We must perform this check here (after re-grounding) rather than relying
             # on the pre-reground verified check at the top of the loop, which fired
             # before Phase 3 errors were detected and resolved.
-            if not phase3_errors and not actionable_mismatches and not carried and not open_issues:
-                round_record.all_passed = True
-                # Drop the resolved Phase 3 entries from the mismatches snapshot —
-                # they are no longer errors and should not appear in the final record.
-                round_record.mismatches = [
-                    m for m in round_record.mismatches
-                    if not m.get("is_phase3_error", False)
-                ]
-                rounds.append(round_record)
-                result = PipelineResult(
-                    sample_id=sample.id,
-                    dataset=sample.dataset,
-                    label=sample.label,
-                    verdict=verdict,
-                    verdict_pre_bridge=verdict_pre_bridge,
-                    verdict_post_bridge=verdict_post_bridge,
-                    verified=True,
-                    num_rounds=round_num,
-                    rounds=rounds,
-                    phase1_raw_code=p1.raw_code,
-                    execution_status="success",
-                    verification_status="verified",
+            # Also apply gap analysis routing: defer verification if structural gaps exist.
+            if not actionable_mismatches and not carried and not open_issues:
+                gap_post = (
+                    compute_gap_analysis(premises, q, [], background_constraints)
+                    if verdict == VERDICT_UNCERTAIN
+                    else None
                 )
-                self._write_json(out_dir / "result.json", asdict(result))
-                logger.info(
-                    "Pipeline sample=%s VERIFIED at round %d "
-                    "(all Phase 3 grounding errors resolved via targeted re-grounding)",
-                    sample.id, round_num,
-                )
-                return result
+                if (gap_post is None or not gap_post.missing_links) and not phase3_errors:
+                    round_record.all_passed = True
+                    # Drop the resolved Phase 3 entries from the mismatches snapshot —
+                    # they are no longer errors and should not appear in the final record.
+                    round_record.mismatches = [
+                        m for m in round_record.mismatches
+                        if not m.get("is_phase3_error", False)
+                    ]
+                    rounds.append(round_record)
+                    result = PipelineResult(
+                        sample_id=sample.id,
+                        dataset=sample.dataset,
+                        label=sample.label,
+                        verdict=verdict,
+                        verdict_pre_bridge=verdict_pre_bridge,
+                        verdict_post_bridge=verdict_post_bridge,
+                        verified=True,
+                        num_rounds=round_num,
+                        rounds=rounds,
+                        phase1_raw_code=p1.raw_code,
+                        execution_status="success",
+                        verification_status="verified",
+                        verification_confidence="high",
+                    )
+                    self._write_json(out_dir / "result.json", asdict(result))
+                    logger.info(
+                        "Pipeline sample=%s VERIFIED at round %d "
+                        "(all Phase 3 grounding errors resolved via targeted re-grounding)",
+                        sample.id, round_num,
+                    )
+                    return result
+                elif gap_post is not None and gap_post.missing_links:
+                    # Structural gap found after Phase 3/4 (possibly alongside Phase 3
+                    # errors on the conclusion).  Fire bridge-only Phase 5 to commit
+                    # the missing link — the updated theory may resolve Phase 3 errors
+                    # and change the verdict in the next round.
+                    logger.info(
+                        "Pipeline sample=%s round=%d: %d missing link(s) found "
+                        "after Phase 3/4 — entering bridge-only Phase 5%s",
+                        sample.id, round_num, len(gap_post.missing_links),
+                        " (Phase 3 errors present)" if phase3_errors else "",
+                    )
+                    first_wr = mw.witness_results[0] if mw.witness_results else None
+                    first_witness_domain = first_wr.phase2.domain if first_wr else {}
 
-            if round_num < self.config.pipeline.r_max and actionable_mismatches:
+                    cgbv_log.update_phase("phase5", f"bridge-only round {round_num}")
+                    p5_gap2 = await run_phase5(
+                        mismatches=[],
+                        premises=premises,
+                        q=q,
+                        namespace=namespace,
+                        raw_code=p1.raw_code,
+                        domain=first_witness_domain,
+                        llm=self.llm,
+                        prompt_engine=self.prompt_engine,
+                        max_retries=self.config.pipeline.repair_retries,
+                        models=witness_models,
+                        domains=witness_domains,
+                        solver=self.solver,
+                        world_assumption=self.config.pipeline.world_assumption,
+                        gap_analysis=gap_post,
+                    )
+
+                    _gap2_committed: list = []
+                    if p5_gap2.bridge_axioms:
+                        accepted_gap2_bridges = list(p5_gap2.bridge_axioms)
+                        background_constraints.extend(accepted_gap2_bridges)
+
+                        solver_premises = list(premises) + background_constraints
+                        if sample.task_type == "three_class":
+                            new_verdict, new_model_info, new_model_info_q = (
+                                self.solver.check_entailment_three_class(solver_premises, q)
+                            )
+                        else:
+                            new_verdict, new_model_info = self.solver.check_entailment(
+                                solver_premises, q
+                            )
+                            new_model_info_q = None
+
+                        new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                        old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                        if new_is_unknown and not old_is_unknown:
+                            for _ in accepted_gap2_bridges:
+                                if background_constraints:
+                                    background_constraints.pop()
+                            logger.warning(
+                                "Pipeline sample=%s round=%d: post-Phase4 gap bridge "
+                                "degraded solver to Unknown; reverted",
+                                sample.id, round_num,
+                            )
+                        else:
+                            _gap2_committed = accepted_gap2_bridges
+                            old_verdict_for_log = verdict
+                            verdict = new_verdict
+                            model_info = new_model_info
+                            model_info_q = new_model_info_q
+                            round_record.verdict_after = new_verdict
+                            round_record.repair_success = True
+
+                            bridge_notes = [
+                                f"# Gap bridge axiom (post-Phase4): {str(b)}"
+                                for b in accepted_gap2_bridges
+                            ]
+                            updated_code = (
+                                p1.raw_code.rstrip()
+                                + "\n\n# ---- Gap analysis bridges (round "
+                                + str(round_num) + ") ----\n"
+                                + "\n".join(bridge_notes)
+                            )
+                            p1 = _patched_p1(
+                                p1, premises, q, new_verdict, new_model_info,
+                                new_model_info_q, raw_code=updated_code,
+                                background_constraints=list(background_constraints),
+                            )
+                            logger.info(
+                                "Pipeline sample=%s round=%d: %d post-Phase4 gap "
+                                "bridge(s) committed, verdict %s→%s",
+                                sample.id, round_num,
+                                len(accepted_gap2_bridges), old_verdict_for_log, verdict,
+                            )
+
+                    self._write_json(
+                        out_dir / f"round{round_num}_repair.json",
+                        _phase5_to_dict(p5_gap2, accepted_bridges=_gap2_committed),
+                    )
+                    rounds.append(round_record)
+                    continue
+                # else: phase3_errors remain but no structural gap → fall through
+
+            if actionable_mismatches:
                 # Use the first witness for repair prompt context (fallback domain)
                 first_wr = mw.witness_results[0] if mw.witness_results else None
                 first_witness_domain = first_wr.phase2.domain if first_wr else {}
+
+                # Compute gap analysis for unified repair
+                gap = compute_gap_analysis(premises, q, actionable_mismatches, background_constraints)
 
                 cgbv_log.update_phase("phase5", f"round {round_num}/{self.config.pipeline.r_max}")
                 p5 = await run_phase5(
@@ -573,17 +813,22 @@ class CGBVPipeline:
                     mismatch_domains=carried_mismatch_domains,
                     solver=self.solver,
                     world_assumption=self.config.pipeline.world_assumption,
+                    gap_analysis=gap,
                 )
-                self._write_json(
-                    out_dir / f"round{round_num}_repair.json",
-                    _phase5_to_dict(p5),
-                )
+                # Phase 5 repair.json written after bridge decisions so it
+                # reflects which bridges were actually committed (Fix #4).
+                _committed_bridges: list = []
 
                 round_record.repair_attempted = True
-                round_record.repair_success = p5.all_repaired
                 round_record.repair_local_validated = p5.num_local_validated
 
-                if p5.all_repaired:
+                # 9.2: Partial commit — commit successful repairs even if some failed.
+                # p5.repaired_premises/q already contain successful repairs mixed with
+                # unchanged originals (run_phase5 applies repairs incrementally).
+                any_succeeded = any(r.success for r in p5.repairs)
+                round_record.repair_success = any_succeeded
+
+                if any_succeeded:
                     # Snapshot for possible revert
                     old_premises = list(premises)
                     old_q = q
@@ -591,6 +836,31 @@ class CGBVPipeline:
 
                     premises = p5.repaired_premises
                     q = p5.repaired_q
+
+                    # Per-bridge filter: only commit bridges that contradict at
+                    # least one mismatch witness.  Bridges that don't eliminate
+                    # any problematic world stay out of background_constraints
+                    # and out of raw_code, so they can't piggyback on formula
+                    # repairs or pollute future prompt context.
+                    accepted_bridges = _filter_helpful_bridges(
+                        p5.bridge_axioms, actionable_mismatches,
+                        witness_models, carried_mismatch_models,
+                    ) if p5.bridge_axioms else []
+                    n_stripped = len(p5.bridge_axioms) - len(accepted_bridges)
+                    if accepted_bridges:
+                        background_constraints.extend(accepted_bridges)
+                        logger.info(
+                            "Pipeline sample=%s round=%d: %d/%d bridge(s) accepted "
+                            "(%d stripped — no witness contradiction)",
+                            sample.id, round_num,
+                            len(accepted_bridges), len(p5.bridge_axioms), n_stripped,
+                        )
+                    elif p5.bridge_axioms:
+                        logger.info(
+                            "Pipeline sample=%s round=%d: all %d bridge(s) stripped "
+                            "(none contradict any mismatch witness)",
+                            sample.id, round_num, len(p5.bridge_axioms),
+                        )
 
                     solver_premises = list(premises) + background_constraints
                     if sample.task_type == "three_class":
@@ -603,16 +873,21 @@ class CGBVPipeline:
                         )
                         new_model_info_q = None
 
-                    # P0.4 Global revert: undo repair if it regressed from the best
-                    # known correct verdict (dynamic guard — catches round-1-fixes/
-                    # round-2-breaks regressions that static initial_correct misses).
-                    new_correct = (_normalise_verdict(new_verdict) == label_norm)
+                    # Label-free verdict stability guard: only revert if the
+                    # repair caused the solver to degrade to Unknown (solver
+                    # failure / timeout).  All other verdict changes — including
+                    # Entailed↔Refuted, Entailed↔Uncertain, etc. — are accepted
+                    # as the system's honest belief after repair.
+                    # NOTE: we intentionally do NOT use sample.label here to
+                    # avoid oracle leakage that would invalidate experiments.
                     round_record.verdict_candidate = new_verdict
-                    if best_correct and not new_correct:
+                    new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                    old_is_unknown = (old_verdict == VERDICT_UNKNOWN)
+                    if new_is_unknown and not old_is_unknown:
                         logger.warning(
-                            "Pipeline sample=%s round=%d: repair regressed verdict "
-                            "(%s → %s vs label=%s); reverting",
-                            sample.id, round_num, old_verdict, new_verdict, sample.label,
+                            "Pipeline sample=%s round=%d: repair degraded solver "
+                            "verdict to Unknown (%s → %s); reverting",
+                            sample.id, round_num, old_verdict, new_verdict,
                         )
                         premises = old_premises
                         q = old_q
@@ -621,10 +896,12 @@ class CGBVPipeline:
                         round_record.repair_reverted = True
                         round_record.repair_success = False
 
-                        # Repair reverted — persist actionable mismatches only.
-                        # Phase 3 errors are never added to open_issues because
-                        # Phase 5 cannot repair them (they need re-grounding, not
-                        # FOL patching).
+                        # Revert accepted bridge axioms committed this round
+                        for _ in accepted_bridges:
+                            if background_constraints:
+                                background_constraints.pop()
+
+                        # Repair reverted — persist all actionable mismatches.
                         for m in actionable_mismatches:
                             wm, wd = _pick_world_for_issue(
                                 m, current_mismatch_indices,
@@ -638,10 +915,7 @@ class CGBVPipeline:
                         round_record.verdict_after = new_verdict
                         model_info = new_model_info
                         model_info_q = new_model_info_q
-                        # Once we land on the correct verdict, lock in the guard so
-                        # no subsequent round can silently undo this improvement.
-                        if new_correct:
-                            best_correct = True
+                        _committed_bridges = accepted_bridges
                         # Append Phase 5 repair notes to raw_code so subsequent
                         # repair prompts reflect the current formula state.
                         repair_notes_p5 = []
@@ -654,6 +928,11 @@ class CGBVPipeline:
                                 repair_notes_p5.append(
                                     f"# Phase 5 repair: {label} = {str(new_f)}"
                                 )
+                        # Only annotate bridges that were actually accepted
+                        for bridge in accepted_bridges:
+                            repair_notes_p5.append(
+                                f"# Phase 5 bridge axiom: {str(bridge)}"
+                            )
                         updated_code = p1.raw_code
                         if repair_notes_p5:
                             updated_code = (
@@ -665,44 +944,290 @@ class CGBVPipeline:
                         p1 = _patched_p1(
                             p1, premises, q, new_verdict, new_model_info, new_model_info_q,
                             raw_code=updated_code,
+                            background_constraints=list(background_constraints),
                         )
                         logger.info(
-                            "Pipeline sample=%s round=%d: repair committed, new verdict=%s",
-                            sample.id, round_num, verdict,
+                            "Pipeline sample=%s round=%d: repair committed "
+                            "(%d/%d succeeded, %d bridge(s) kept), new verdict=%s",
+                            sample.id, round_num,
+                            sum(1 for r in p5.repairs if r.success),
+                            len(p5.repairs), len(accepted_bridges), verdict,
                         )
-                        # Repair committed — clear resolved open_issues.
-                        # (Phase 3 errors were never added to open_issues.)
+                        # Clear open_issues for successfully repaired formulas.
+                        # Also clear mismatches whose witness is eliminated by an
+                        # accepted bridge (even if their formula wasn't touched).
+                        # Persist mismatches that neither formula-repaired nor bridge-resolved.
+                        repaired_indices = {
+                            r.sentence_index for r in p5.repairs if r.success
+                        }
+                        for r in p5.repairs:
+                            if r.success:
+                                open_issues.pop(r.sentence_index, None)
+                        if accepted_bridges:
+                            import z3 as _z3
+                            _carried = carried_mismatch_models or {}
                         for m in actionable_mismatches:
-                            open_issues.pop(m.sentence_index, None)
+                            if m.sentence_index in repaired_indices:
+                                continue  # already cleared above
+                            # Check if an accepted bridge resolves this mismatch
+                            bridge_resolves = False
+                            if accepted_bridges:
+                                _wm = (_carried.get(m.sentence_index)
+                                       or witness_models.get(m.witness_index))
+                                if _wm is not None:
+                                    for _b in accepted_bridges:
+                                        try:
+                                            if _z3.is_false(_wm.evaluate(_b)):
+                                                bridge_resolves = True
+                                                break
+                                        except Exception:
+                                            pass
+                            if bridge_resolves:
+                                open_issues.pop(m.sentence_index, None)
+                                logger.debug(
+                                    "Pipeline sample=%s: bridge resolved "
+                                    "mismatch %d alongside formula repair; "
+                                    "cleared from open_issues",
+                                    sample.id, m.sentence_index,
+                                )
+                            else:
+                                wm, wd = _pick_world_for_issue(
+                                    m, current_mismatch_indices,
+                                    open_issues, witness_models, witness_domains,
+                                )
+                                open_issues[m.sentence_index] = (
+                                    m, _formula_str(m.sentence_index, premises, q), wm, wd,
+                                )
                 else:
                     logger.warning(
-                        "Pipeline sample=%s round=%d: repair partially failed",
+                        "Pipeline sample=%s round=%d: all repairs failed",
                         sample.id, round_num,
                     )
-                    # Partial failure — persist actionable mismatches only.
-                    for m in actionable_mismatches:
-                        wm, wd = _pick_world_for_issue(
-                            m, current_mismatch_indices,
-                            open_issues, witness_models, witness_domains,
+                    # Per-bridge filter: only commit bridges that contradict at
+                    # least one mismatch witness.  Unhelpful bridges stay out of
+                    # background_constraints and raw_code entirely.
+                    bridge_accepted = False
+                    accepted_bridges_bo: list = []
+                    if p5.bridge_axioms:
+                        accepted_bridges_bo = _filter_helpful_bridges(
+                            p5.bridge_axioms, actionable_mismatches,
+                            witness_models, carried_mismatch_models,
                         )
-                        open_issues[m.sentence_index] = (
-                            m, _formula_str(m.sentence_index, premises, q), wm, wd,
-                        )
+                        n_stripped_bo = len(p5.bridge_axioms) - len(accepted_bridges_bo)
+                        if not accepted_bridges_bo:
+                            logger.info(
+                                "Pipeline sample=%s round=%d: all %d bridge(s) stripped "
+                                "(none contradict any mismatch witness); no commit",
+                                sample.id, round_num, len(p5.bridge_axioms),
+                            )
+                        else:
+                            background_constraints.extend(accepted_bridges_bo)
+                            bridge_notes = [
+                                f"# Phase 5 bridge axiom: {str(b)}"
+                                for b in accepted_bridges_bo
+                            ]
+                            updated_code = (
+                                p1.raw_code.rstrip()
+                                + "\n\n# ---- Phase 5 bridges (round "
+                                + str(round_num) + ") ----\n"
+                                + "\n".join(bridge_notes)
+                            )
+                            # Re-solve with accepted bridges so verdict/model_info
+                            # are fresh for the next round's witness construction.
+                            solver_premises = list(premises) + background_constraints
+                            if sample.task_type == "three_class":
+                                new_verdict, new_model_info, new_model_info_q = (
+                                    self.solver.check_entailment_three_class(
+                                        solver_premises, q)
+                                )
+                            else:
+                                new_verdict, new_model_info = (
+                                    self.solver.check_entailment(solver_premises, q)
+                                )
+                                new_model_info_q = None
+
+                            # Unknown guard: reject bridges if they degrade verdict
+                            new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                            old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                            if new_is_unknown and not old_is_unknown:
+                                for _ in accepted_bridges_bo:
+                                    if background_constraints:
+                                        background_constraints.pop()
+                                accepted_bridges_bo = []
+                                logger.warning(
+                                    "Pipeline sample=%s round=%d: bridge-only "
+                                    "degraded solver to Unknown; reverted",
+                                    sample.id, round_num,
+                                )
+                            else:
+                                bridge_accepted = True
+                                old_verdict_for_log = verdict  # Fix #5: capture before update
+                                verdict = new_verdict
+                                model_info = new_model_info
+                                model_info_q = new_model_info_q
+                                round_record.verdict_after = new_verdict
+                                round_record.repair_success = True  # Fix #3
+                                _committed_bridges = accepted_bridges_bo  # Fix #4
+                                p1 = _patched_p1(
+                                    p1, premises, q, new_verdict, new_model_info,
+                                    new_model_info_q, raw_code=updated_code,
+                                    background_constraints=list(background_constraints),
+                                )
+                                logger.info(
+                                    "Pipeline sample=%s round=%d: %d/%d bridge(s) "
+                                    "committed (%d stripped), verdict %s→%s",
+                                    sample.id, round_num,
+                                    len(accepted_bridges_bo), len(p5.bridge_axioms),
+                                    n_stripped_bo, old_verdict_for_log, verdict,
+                                )
+                    # Persist open_issues.
+                    # When a bridge is accepted: for each mismatch check whether
+                    # the accepted subset contradicts its witness (i.e. eliminates
+                    # that problematic world).  If yes → clear from open_issues.
+                    # If no → re-fingerprint and keep for the next round.
+                    # When bridge was reverted or not present → persist all.
+                    if bridge_accepted:
+                        import z3 as _z3
+                        _carried = carried_mismatch_models or {}
+                        for m in actionable_mismatches:
+                            _wm = (_carried.get(m.sentence_index)
+                                   or witness_models.get(m.witness_index))
+                            bridge_resolves = False
+                            if _wm is not None:
+                                for _b in accepted_bridges_bo:
+                                    try:
+                                        if _z3.is_false(_wm.evaluate(_b)):
+                                            bridge_resolves = True
+                                            break
+                                    except Exception:
+                                        pass
+                            if bridge_resolves:
+                                open_issues.pop(m.sentence_index, None)
+                                logger.debug(
+                                    "Pipeline sample=%s: bridge resolved "
+                                    "mismatch %d; cleared from open_issues",
+                                    sample.id, m.sentence_index,
+                                )
+                            else:
+                                wm, wd = _pick_world_for_issue(
+                                    m, current_mismatch_indices,
+                                    open_issues, witness_models, witness_domains,
+                                )
+                                open_issues[m.sentence_index] = (
+                                    m, _formula_str(m.sentence_index, premises, q),
+                                    wm, wd,
+                                )
+                    else:
+                        for m in actionable_mismatches:
+                            wm, wd = _pick_world_for_issue(
+                                m, current_mismatch_indices,
+                                open_issues, witness_models, witness_domains,
+                            )
+                            open_issues[m.sentence_index] = (
+                                m, _formula_str(m.sentence_index, premises, q), wm, wd,
+                            )
+                # Write Phase 5 repair.json after bridge decisions so
+                # accepted_bridge_axioms reflects only what was committed (Fix #4).
+                self._write_json(
+                    out_dir / f"round{round_num}_repair.json",
+                    _phase5_to_dict(p5, accepted_bridges=_committed_bridges),
+                )
+
+                # --- Targeted re-formalization ---
+                # When Phase 5 fails on some mismatches, the detect-repair loop is
+                # incomplete: Phase 4 detected the problem but Phase 5 couldn't fix
+                # it within the existing namespace (e.g., missing entity constants,
+                # wrong predicate decomposition).  Targeted re-formalization rewrites
+                # the entire Z3 theory to close this gap.
+                mismatch_by_idx_local = {m.sentence_index: m for m in actionable_mismatches}
+                failed_repairs = [
+                    (mismatch_by_idx_local[r.sentence_index], r.error)
+                    for r in p5.repairs
+                    if not r.success and r.sentence_index in mismatch_by_idx_local
+                ]
+                if failed_repairs and not round_record.repair_reverted:
+                    cgbv_log.update_phase("phase1", f"re-formalize round {round_num}")
+                    p1_new = await run_phase1_targeted(
+                        original_code=p1.raw_code,
+                        failed_repairs=failed_repairs,
+                        premises_nl=sample.premises,
+                        conclusion_nl=sample.conclusion,
+                        llm=self.llm,
+                        solver=self.solver,
+                        prompt_engine=self.prompt_engine,
+                        task_type=sample.task_type,
+                        code_exec_timeout=self.config.pipeline.code_exec_timeout,
+                        world_assumption=self.config.pipeline.world_assumption,
+                        max_retries=self.config.pipeline.formalize_retries,
+                    )
+                    if p1_new is not None:
+                        # Unknown guard: only accept if it doesn't degrade to Unknown
+                        old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                        if p1_new.verdict == VERDICT_UNKNOWN and not old_is_unknown:
+                            logger.warning(
+                                "Pipeline sample=%s round=%d: targeted re-formalization "
+                                "degraded solver to Unknown; discarding",
+                                sample.id, round_num,
+                            )
+                        else:
+                            logger.info(
+                                "Pipeline sample=%s round=%d: targeted re-formalization "
+                                "succeeded, verdict %s→%s",
+                                sample.id, round_num, verdict, p1_new.verdict,
+                            )
+                            # Replace the full theory state
+                            premises = list(p1_new.premises)
+                            q = p1_new.q
+                            background_constraints = list(p1_new.background_constraints)
+                            bound_var_names = p1_new.bound_var_names
+                            namespace = p1_new.namespace
+                            verdict = p1_new.verdict
+                            model_info = p1_new.model_info
+                            model_info_q = p1_new.model_info_q
+                            sentences = sample.premises + [sample.conclusion]
+                            p1 = p1_new
+                            round_record.verdict_after = verdict
+                            # Clear all open_issues — the theory has been fully
+                            # rewritten, so all fingerprints are stale.
+                            open_issues.clear()
+                    self._write_json(
+                        out_dir / f"round{round_num}_reformalize.json",
+                        {
+                            "success": p1_new is not None,
+                            "verdict": p1_new.verdict if p1_new else None,
+                            "raw_code": p1_new.raw_code if p1_new else None,
+                            "failed_mismatches": [
+                                {
+                                    "sentence_index": m.sentence_index,
+                                    "nl_sentence": m.nl_sentence,
+                                    "mismatch_type": m.mismatch_type,
+                                    "repair_error": err,
+                                }
+                                for m, err in failed_repairs
+                            ],
+                        },
+                    )
             else:
-                # Last round or no actionable mismatches to repair.
-                # Phase 3 errors are excluded — they cannot be repaired by Phase 5.
-                for m in actionable_mismatches:
-                    wm, wd = _pick_world_for_issue(
-                        m, current_mismatch_indices,
-                        open_issues, witness_models, witness_domains,
-                    )
-                    open_issues[m.sentence_index] = (
-                        m, _formula_str(m.sentence_index, premises, q), wm, wd,
-                    )
+                # No actionable mismatches to repair (only Phase 3 errors remain).
+                pass
 
             rounds.append(round_record)
 
         # Exhausted R_max rounds without full verification
+        # P6: Compute verification confidence for unverified results
+        if _final_verification_status == "witness_failed":
+            _confidence = "none"
+        elif rounds:
+            any_reverted = any(r.repair_reverted for r in rounds)
+            any_repair_succeeded = any(r.repair_success for r in rounds)
+            has_open_issues = bool(open_issues)
+            if any_repair_succeeded and not any_reverted and not has_open_issues:
+                _confidence = "medium"
+            else:
+                _confidence = "low"
+        else:
+            _confidence = "none"
+
         result = PipelineResult(
             sample_id=sample.id,
             dataset=sample.dataset,
@@ -716,6 +1241,7 @@ class CGBVPipeline:
             phase1_raw_code=p1.raw_code,
             execution_status="success",
             verification_status=_final_verification_status,
+            verification_confidence=_confidence,
         )
         self._write_json(out_dir / "result.json", asdict(result))
         logger.info(
@@ -856,7 +1382,19 @@ def _phase4_to_dict(p4: Phase4Result) -> dict:
     }
 
 
-def _phase5_to_dict(p5: Phase5Result) -> dict:
+def _phase5_to_dict(p5: Phase5Result, accepted_bridges: list | None = None) -> dict:
+    """Serialise Phase5Result to a JSON-compatible dict.
+
+    Field semantics for bridge axioms (both fields are always present):
+      bridge_axioms          — all axioms the LLM proposed this round
+                               (may include ones later stripped by the pipeline)
+      accepted_bridge_axioms — the subset actually committed to background_constraints
+                               and annotated in raw_code; this is the authoritative
+                               signal for "what the solver currently knows about bridges"
+
+    Downstream scripts should read accepted_bridge_axioms for the committed state
+    and bridge_axioms only to inspect the full LLM proposal.
+    """
     return {
         "all_repaired": p5.all_repaired,
         "num_local_validated": p5.num_local_validated,
@@ -891,6 +1429,13 @@ def _phase5_to_dict(p5: Phase5Result) -> dict:
             }
             for r in p5.repairs
         ],
+        "bridge_axioms": [str(b) for b in p5.bridge_axioms],
+        "accepted_bridge_axioms": [
+            str(b) for b in (
+                accepted_bridges if accepted_bridges is not None else p5.bridge_axioms
+            )
+        ],
+        "unified_attempts": p5.unified_attempts,
     }
 
 
@@ -898,6 +1443,59 @@ def _json_default(obj):
     if isinstance(obj, tuple):
         return list(obj)
     return str(obj)
+
+
+def _bridge_eliminates_witness(
+    bridges: list,
+    mismatches: list,
+    witness_models: dict[int, object],
+    carried_mismatch_models: dict[int, object] | None = None,
+) -> bool:
+    """Quick check: does any bridge axiom evaluate to False on any mismatch witness?
+
+    If a bridge contradicts a mismatch's witness model, that witness world is
+    eliminated under the enriched theory — the bridge is actively resolving a
+    problematic world.  This is O(bridges × mismatches) z3 model evaluations,
+    no solver calls.
+
+    For carried mismatches (from prior rounds), the witness model is looked up
+    by sentence_index in carried_mismatch_models rather than by witness_index
+    (which gets renumbered each round).
+    """
+    return bool(_filter_helpful_bridges(
+        bridges, mismatches, witness_models, carried_mismatch_models
+    ))
+
+
+def _filter_helpful_bridges(
+    bridges: list,
+    mismatches: list,
+    witness_models: dict[int, object],
+    carried_mismatch_models: dict[int, object] | None = None,
+) -> list:
+    """Return the subset of bridges that contradict at least one mismatch witness.
+
+    Evaluates each bridge individually against each mismatch's Z3 model.
+    A bridge is 'helpful' iff it evaluates to False on some witness world,
+    meaning it eliminates that problematic world under the enriched theory.
+    Bridges that don't contradict any witness are neither committed to
+    background_constraints nor annotated in raw_code.
+    """
+    import z3
+    carried = carried_mismatch_models or {}
+    helpful = []
+    for bridge in bridges:
+        for m in mismatches:
+            wm = carried.get(m.sentence_index) or witness_models.get(m.witness_index)
+            if wm is None:
+                continue
+            try:
+                if z3.is_false(wm.evaluate(bridge)):
+                    helpful.append(bridge)
+                    break
+            except Exception:
+                pass
+    return helpful
 
 
 def _make_serialisable(obj):
@@ -970,17 +1568,23 @@ def _patched_p1(
     model_info: object,
     model_info_q: object | None = None,
     raw_code: str | None = None,
+    background_constraints: list | None = None,
 ) -> Phase1Result:
     """Return a shallow copy of p1 with updated premises/q/verdict/model_info.
 
     raw_code: if provided, replaces p1.raw_code (used to append repair notes so
     downstream Phase 5 prompts show current formula state).
+    background_constraints: if provided, replaces p1.background_constraints so
+    the p1 snapshot stays consistent with the pipeline's live solver state.
     """
     from cgbv.core.phase1_formalize import Phase1Result as P1
     return P1(
         verdict=verdict,
         premises=premises,
-        background_constraints=p1.background_constraints,
+        background_constraints=(
+            background_constraints if background_constraints is not None
+            else p1.background_constraints
+        ),
         bound_var_names=p1.bound_var_names,
         q=q,
         model_info=model_info,

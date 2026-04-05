@@ -57,8 +57,6 @@ def load(dataset_path: str, split: str, limit: int | None = None) -> list[DataSa
                 task_type="three_class",
                 options=None,
                 display_id=display_id,
-                source_id=story_id,
-                raw=raw,
             ))
             if limit and len(samples) >= limit:
                 break

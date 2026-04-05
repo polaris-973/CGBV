@@ -5,7 +5,7 @@ from typing import Any
 
 import z3
 
-from cgbv.solver.model_extractor import extract_model_description, format_domain_desc
+from cgbv.solver.model_extractor import extract_model_description
 
 logger = logging.getLogger(__name__)
 
@@ -263,15 +263,6 @@ class Z3Solver:
     # ------------------------------------------------------------------
     # Phase 4: Formula Evaluation on Model
     # ------------------------------------------------------------------
-
-    def evaluate_formula(self, model: z3.ModelRef, formula: z3.ExprRef) -> bool:
-        """
-        Evaluate a Z3 FOL formula on a given model.
-
-        Returns True/False.
-        """
-        val = model.evaluate(formula, model_completion=True)
-        return z3.is_true(val)
 
     def evaluate_grounded_formula(
         self,

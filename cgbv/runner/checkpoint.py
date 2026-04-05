@@ -30,17 +30,12 @@ class CheckpointManager:
             # A result counts as done only when the pipeline ran successfully.
             # Results with error != None (phase1_error, pipeline_error, etc.) are
             # NOT considered done so they will be retried on the next run.
-            # Support both new-style (execution_status field) and legacy results.
             if "execution_status" in data:
                 return data["execution_status"] == "success"
             # Legacy results without execution_status field.
-            # Also exclude solver-Unknown verdicts: old runs where Phase 1 code
-            # executed but Z3 timed out wrote error=None yet verdict=Unknown,
-            # which is not a successful result worth skipping on resume.
             verdict_raw = str(data.get("verdict", "")).strip().lower()
             return (
-                "verdict" in data
-                and data.get("error") is None
+                data.get("error") is None
                 and verdict_raw not in ("unknown", "")
             )
         except Exception:

@@ -400,3 +400,100 @@ def format_domain_desc(domain: dict) -> str:
             lines.append(f"  {pred_name}({args_str}) = {val}")
 
     return "\n".join(lines)
+
+
+def format_filtered_domain_desc(
+    domain: dict,
+    relevant_predicates: set[str],
+) -> str:
+    """Format domain description filtered to only show predicates relevant
+    to a specific repair target.
+
+    Like format_domain_desc() but omits ground atoms for predicates not in
+    relevant_predicates. Keeps entity/sort/canonical ID sections intact
+    since they are compact and provide necessary context.
+    """
+    lines: list[str] = []
+
+    # Sort-grouped entity lists (always shown — compact)
+    sorts: dict[str, list[str]] = domain.get("sorts", {})
+    if sorts:
+        lines.append("Entities by sort:")
+        for sort_name, entities in sorts.items():
+            lines.append(f"  {sort_name}: {entities}")
+    else:
+        lines.append(f"Domain entities: {domain['entities']}")
+    lines.append("")
+
+    # Predicate signatures (filtered)
+    pred_sigs: dict[str, list[str]] = domain.get("predicate_signatures", {})
+    if pred_sigs:
+        # Include a predicate if it or its base (without _is) is relevant
+        filtered_sigs = {
+            k: v for k, v in pred_sigs.items()
+            if k in relevant_predicates
+            or k.removesuffix("_is") in relevant_predicates
+        }
+        bool_sigs = {k: v for k, v in filtered_sigs.items() if not k.endswith("_is")}
+        func_sigs = {k: v for k, v in filtered_sigs.items() if k.endswith("_is")}
+
+        if bool_sigs:
+            lines.append("Predicate signatures (relevant to this repair):")
+            for pred_name, arg_sorts in bool_sigs.items():
+                lines.append(f"  {pred_name}({', '.join(arg_sorts)}) → bool")
+        if func_sigs:
+            lines.append("")
+            lines.append("Function-value relations (relevant):")
+            for pred_name, arg_sorts in func_sigs.items():
+                func_name = pred_name.removesuffix("_is")
+                arg_part = ", ".join(arg_sorts[:-1])
+                ret_part = arg_sorts[-1]
+                lines.append(f"  value[\"{func_name}({arg_part})\"] : {ret_part}")
+    lines.append("")
+
+    # Canonical entity IDs (always shown)
+    all_entities = domain.get("entities", [])
+    if all_entities:
+        lines.append(f"Canonical entity IDs: {', '.join(all_entities)}")
+    lines.append("")
+
+    # Function values (filtered)
+    function_values: dict = domain.get("function_values", {})
+    if function_values:
+        filtered_fv = {
+            k: v for k, v in function_values.items()
+            if any(p in k for p in relevant_predicates)
+        }
+        if filtered_fv:
+            lines.append("Function values (relevant):")
+            for fval_key, fval in filtered_fv.items():
+                lines.append(f'  value["{fval_key}"] = {fval}')
+            lines.append("")
+
+    # Ground atoms — only for relevant predicates
+    all_preds = domain.get("predicates", {})
+    relevant_count = 0
+    omitted_count = 0
+    lines.append("Ground atoms (relevant to this repair):")
+    for pred_name, interp in all_preds.items():
+        if (pred_name in relevant_predicates
+                or pred_name.removesuffix("_is") in relevant_predicates):
+            for args, val in interp.items():
+                args_str = ", ".join(args)
+                # For _is predicates (booleanized functions), show in value[]
+                # notation consistent with normalized grounded formulas.
+                if pred_name.endswith("_is") and len(args) >= 2 and val is True:
+                    func_name = pred_name.removesuffix("_is")
+                    entity_args = ", ".join(args[:-1])
+                    value_arg = args[-1]
+                    lines.append(f'  value["{func_name}({entity_args})"] == "{value_arg}"')
+                else:
+                    lines.append(f"  {pred_name}({args_str}) = {val}")
+                relevant_count += 1
+        else:
+            omitted_count += len(interp)
+
+    if omitted_count > 0:
+        lines.append(f"  ... ({omitted_count} ground atoms from other predicates omitted)")
+
+    return "\n".join(lines)

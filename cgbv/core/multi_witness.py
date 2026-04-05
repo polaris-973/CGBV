@@ -12,7 +12,6 @@ from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
 from cgbv.llm.base import LLMClient
 from cgbv.prompts.prompt_engine import PromptEngine
 from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNCERTAIN
-from cgbv.solver.model_extractor import format_domain_desc
 
 logger = logging.getLogger(__name__)
 

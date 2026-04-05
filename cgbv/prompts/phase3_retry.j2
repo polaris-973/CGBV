@@ -33,15 +33,12 @@ Write a **single Python boolean expression**. Use:
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
 
 **Critical rules:**
-1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate name and entity IDs).
-2. Iterate each `for e in [...]` loop over ONLY the entity list for the CORRECT sort of that predicate's argument. **Never mix entities from different sorts in the same loop.**
-3. If a sentence's quantifier ("all", "some", "no") ranges over a type already determined by the sort (e.g., all entities in the `Stock` sort ARE stocks), do **NOT** add a redundant `if truth["is_stock(e)"]` guard. Only add an `if truth[...]` guard if the NL sentence explicitly conditions on an additional predicate.
-4. Do **NOT** invent entity names. Use only the canonical IDs listed in "Canonical entity IDs".
-5. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
-6. Do **NOT** call predicates directly — access them via `truth[...]` subscripts. For example, `moved_to(u, x)` is **wrong**; `truth[f"moved_to({u}, x)"]` is **correct**.
-7. When the domain lists `Function values` entries (`value["fname(entity)"] = N`), use `value[...]` directly for comparisons — do **not** iterate over `_is` predicates. E.g. "Y has the highest score" → `all(value[f"score({e})"] < value["score(y)"] for e in SORT_LIST if e != "y")`. Operator must match NL exactly: `<` for "less/smaller", `>` for "greater/larger", `==` for "same/equal", `<=`/`>=` for "at most/least". "X has the largest" → all others are strictly below X → `value[f"f({e})"] < value["f(x)"]`.
-8. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
-9. Output ONLY the expression — no imports, no assignments, no prose.
+Follow all Critical Rules from the initial grounding instructions above. Additionally:
+1. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+2. Do **NOT** call predicates directly — access them via `truth[...]` subscripts. For example, `moved_to(u, x)` is **wrong**; `truth[f"moved_to({u}, x)"]` is **correct**.
+3. When the domain lists `Function values` entries (`value["fname(entity)"] = N`), use `value[...]` directly for comparisons — do **not** iterate over `_is` predicates. E.g. "Y has the highest score" → `all(value[f"score({e})"] < value["score(y)"] for e in SORT_LIST if e != "y")`. Operator must match NL exactly: `<` for "less/smaller", `>` for "greater/larger", `==` for "same/equal", `<=`/`>=` for "at most/least". "X has the largest" → all others are strictly below X → `value[f"f({e})"] < value["f(x)"]`.
+4. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
+5. Output ONLY the expression — no imports, no assignments, no prose.
 
 ---
 

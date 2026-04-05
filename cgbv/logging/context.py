@@ -28,10 +28,6 @@ def get_sample_id() -> str:
     return _sample_id.get()
 
 
-def get_sample_display_id() -> str:
-    return _sample_display_id.get()
-
-
 def get_log_dir() -> Path | None:
     return _log_dir.get()
 

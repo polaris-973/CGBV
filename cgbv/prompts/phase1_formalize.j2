@@ -154,6 +154,33 @@ top-level formulas in the same order.
 - If one numbered premise is internally conjunctive or disjunctive, keep that
   structure inside a single formula instead of splitting it into multiple entries.
 
+### RULE 10 — Comparison predicates require mathematical axioms
+
+When the formalization uses uninterpreted comparison predicates (`equal_to`,
+`more_than`, `no_more_than`, `less_than`, etc.), you MUST add their mathematical
+axioms as **additional `background_constraints`**. These are mathematical facts —
+they hold regardless of world assumption.
+
+```python
+# Transitivity: more_than(a,b) ∧ more_than(b,c) → more_than(a,c)
+x = Const('x', Amount)
+y = Const('y', Amount)
+z = Const('z', Amount)
+f_trans = ForAll([x, y, z], Implies(And(more_than(x, y), more_than(y, z)),
+                                    more_than(x, z)))
+# Antisymmetry: more_than(a,b) → ¬equal_to(a,b) ∧ ¬no_more_than(a,b)
+f_antisym = ForAll([x, y], Implies(more_than(x, y),
+                                   And(Not(equal_to(x, y)),
+                                       Not(no_more_than(x, y)))))
+# Equivalence: equal_to(a,b) → no_more_than(a,b) ∧ no_more_than(b,a)
+f_eq_nm = ForAll([x, y], Implies(equal_to(x, y),
+                                  And(no_more_than(x, y),
+                                      no_more_than(y, x))))
+background_constraints = [f_trans, f_antisym, f_eq_nm]
+```
+
+If none of these predicates appear, omit `background_constraints` entirely.
+
 ---
 
 ## Worked Example
@@ -193,7 +220,7 @@ q = allows_pets(olive_garden)
 ```
 
 ---
-
+{% if not few_shot_examples %}
 ## Second Example (binary predicate, multiple sorts)
 
 **Premises:**
@@ -230,6 +257,7 @@ q = happy(alice)
 ```
 
 ---
+{% endif %}
 {% if few_shot_examples %}
 ## Dataset-Specific Examples
 
@@ -258,7 +286,7 @@ Conclusion: {{ ex.conclusion }}
 The following additional rules apply under the Closed-World Assumption. What is not stated or
 derivable from the premises is assumed to be **false**.
 
-### RULE 10 — Exclusive Disjunction (XOR)
+### CWA RULE 1 — Exclusive Disjunction (XOR)
 
 When the NL says "either A or B" for category membership or properties, model as **exclusive or**
 (exactly one holds):
@@ -272,7 +300,7 @@ f = ForAll([v], And(Or(is_honey_bee(v), is_bumble_bee(v)),
 
 Under CWA, "either...or" means exactly one category applies, not possibly both.
 
-### RULE 11 — Type Subsumption Axioms
+### CWA RULE 2 — Type Subsumption Axioms
 
 When a type hierarchy is implied (e.g., "bees are insects", "insects are animals"), add **explicit
 upward-closure axioms** so that membership propagates through the chain:
@@ -287,24 +315,23 @@ f_sub2 = ForAll([v], Implies(is_insect(v), is_animal(v)))
 Under CWA, an entity stated to be a "bee" is NOT independently recognized as an "animal" unless
 the complete chain of subsumption axioms is present.
 
-### RULE 12 — Comparison Predicates as Concrete Relations
+### CWA RULE 3 — Comparison Predicates: Explicit Assertions Under CWA
 
 Predicates like `equal_to`, `more_than`, `no_more_than` must be **explicitly asserted** for all
 needed entity pairs. Under CWA, unasserted comparisons evaluate to false.
 
-When arithmetic ordering is implied, add **transitivity and antisymmetry axioms**:
+(Mathematical axioms for these predicates — transitivity, antisymmetry — are handled by
+RULE 10 above.)
 
-```python
-# If more_than(a, b) and more_than(b, c), then more_than(a, c)
-x = Const('x', Amount)
-y = Const('y', Amount)
-z = Const('z', Amount)
-f_trans = ForAll([x, y, z], Implies(And(more_than(x, y), more_than(y, z)), more_than(x, z)))
-# If more_than(a, b), then not equal_to(a, b) and not no_more_than(a, b)
-f_antisym = ForAll([x, y], Implies(more_than(x, y), And(Not(equal_to(x, y)), Not(no_more_than(x, y)))))
-```
+### CWA RULE 4 — Post-Generation Subsumption Audit
 
-Also: `equal_to(a, b)` implies `no_more_than(a, b)` and `no_more_than(b, a)`.
+After writing all premises, review the NL text for implicit type hierarchies:
+1. List every type predicate (`is_X`) used in the code.
+2. For each pair (is_X, is_Y), check: does the NL state or imply "every X is a Y"?
+   - Patterns: "X is a Y", "X are Y", "X is a type/kind of Y", "X such as Y and Z"
+3. If yes AND no `ForAll([v], Implies(is_X(v), is_Y(v)))` exists → ADD it as an extra premise.
+4. The system will automatically close transitive chains (X→Y + Y→Z ⇒ X→Z),
+   but each direct link MUST be explicitly present.
 {% endif %}
 
 ## Your Task

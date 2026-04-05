@@ -43,14 +43,38 @@ class ExperimentRunner:
             cfg.experiment_id, cfg.run_id, cfg.dataset.name, cfg.dataset.split, cfg.llm.model,
         )
 
+        load_limit = cfg.dataset.limit
+        if cfg.dataset.sample_index_range is not None:
+            start, end = cfg.dataset.sample_index_range
+            load_limit = end
+            if cfg.dataset.limit is not None:
+                logger.warning(
+                    "dataset.limit=%s is ignored because dataset.sample_index_range=%d-%d is set",
+                    cfg.dataset.limit, start, end,
+                )
+
         # Load dataset
         all_samples = load_dataset(
             name=cfg.dataset.name,
             split=cfg.dataset.split,
             path=cfg.dataset.path,
-            limit=cfg.dataset.limit,
+            limit=load_limit,
         )
         logger.info("Loaded %d samples from %s/%s", len(all_samples), cfg.dataset.name, cfg.dataset.split)
+
+        if cfg.dataset.sample_index_range is not None:
+            start, end = cfg.dataset.sample_index_range
+            all_samples = all_samples[start - 1:end]
+            logger.info(
+                "Filtered to %d samples by sample_index_range=%d-%d (1-based, inclusive)",
+                len(all_samples), start, end,
+            )
+
+        # Filter to specific sample IDs if requested
+        if cfg.dataset.only_ids:
+            id_set = set(str(i) for i in cfg.dataset.only_ids)
+            all_samples = [s for s in all_samples if str(s.id) in id_set]
+            logger.info("Filtered to %d samples by only_ids", len(all_samples))
 
         # Warn explicitly if this is a multi-choice dataset
         if all_samples and all_samples[0].task_type == "multi_choice":

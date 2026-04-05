@@ -100,6 +100,51 @@ def build_name_error_hint(code: str, error_msg: str) -> str | None:
     return " ".join(parts)
 
 
+def build_runtime_error_hint(code: str, error_msg: str) -> str | None:
+    """Diagnose common Z3 runtime errors beyond NameError.
+
+    Returns a human-readable hint or None if no pattern matches.
+    """
+    err = str(error_msg)
+
+    # IndexError / sequence errors
+    if "index out of bounds" in err or "IndexError" in err:
+        return (
+            "A function or sequence was indexed beyond its declared arity. "
+            "Check that each Function(...) declaration has the right number "
+            "of argument sorts and that all call sites pass the correct "
+            "number of arguments."
+        )
+
+    # Sort mismatch
+    if "sort mismatch" in err.lower():
+        return (
+            "Z3 sort mismatch: a predicate or function received an argument "
+            "of the wrong sort. Verify that ForAll/Exists bound variables "
+            "use the correct DeclareSort type and that constants match "
+            "their declared sorts."
+        )
+
+    # Arity mismatch
+    m = re.search(r'takes (\d+) positional argument', err)
+    if m:
+        return (
+            f"Function arity error: a function was called with the wrong "
+            f"number of arguments (expected {m.group(1)}). Check Function(...) "
+            f"declarations and all call sites."
+        )
+
+    # Bool vs non-Bool confusion
+    if "BoolRef" in err and ("ArithRef" in err or "SeqRef" in err):
+        return (
+            "Type confusion between Bool and non-Bool expressions. "
+            "Ensure boolean predicates return BoolSort() and are not "
+            "used in arithmetic or string contexts."
+        )
+
+    return None
+
+
 def attempt_name_error_autocorrect(code: str, error_msg: str) -> tuple[str, str] | None:
     """
     Attempt to auto-correct a NameError caused by a trivial spelling typo.
@@ -151,6 +196,12 @@ _live_workers: set[threading.Thread] = set()
 _live_workers_lock = threading.Lock()
 
 
+def configure_max_workers(n: int) -> None:
+    """Set the maximum number of concurrent code-execution threads."""
+    global _MAX_LIVE_WORKERS
+    _MAX_LIVE_WORKERS = n
+
+
 def _register_worker(t: threading.Thread) -> None:
     """Prune finished threads, then register a new one (or raise if cap reached)."""
     with _live_workers_lock:
@@ -173,17 +224,27 @@ def _unregister_worker(t: threading.Thread) -> None:
 
 def _extract_bound_var_names(code: str) -> set[str]:
     """
-    Extract names of variables declared as ForAll/Exists quantifier variables.
+    Extract names of variables that should be excluded from the Unique Name
+    Assumption (UNA) because they are quantifier-bound variables, not named
+    domain entities.
 
-    These are Const declarations that appear as the first argument list of
-    ForAll([x, y, ...], ...) or Exists([x, y, ...], ...) and should NOT
-    be treated as named entity constants in model extraction.
+    Two sources:
+    1. Variables that explicitly appear in ForAll([x, y, ...], ...) or
+       Exists([x, y, ...], ...) lists.
+    2. Single-lowercase-letter Const declarations (e.g. ``c = Const('c', Sort)``).
+       By universal convention in FOL code, single-letter names are quantifier
+       variables.  An LLM may declare such a constant intending it as a bound
+       variable but accidentally omit it from a ForAll/Exists list; treating it
+       as a named entity and applying UNA (Distinct) would then force it to be
+       distinct from every other named constant, causing vacuous entailment.
     """
     bound_names: set[str] = set()
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return bound_names
+
+    # Pass 1: explicit ForAll/Exists quantifier variable lists
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -199,6 +260,29 @@ def _extract_bound_var_names(code: str) -> set[str]:
                 for elt in first_arg.elts:
                     if isinstance(elt, ast.Name):
                         bound_names.add(elt.id)
+
+    # Pass 2: single-letter Const declarations  (e.g. `c = Const('c', Channel)`)
+    # Named domain entities always have multi-character names; single letters
+    # are always intended as quantifier variables.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        py_name = node.targets[0].id
+        if len(py_name) != 1 or not py_name.islower():
+            continue
+        val = node.value
+        if isinstance(val, ast.Call):
+            fn = val.func
+            fn_name = (
+                fn.id if isinstance(fn, ast.Name)
+                else fn.attr if isinstance(fn, ast.Attribute)
+                else None
+            )
+            if fn_name == "Const":
+                bound_names.add(py_name)
+
     return bound_names
 
 

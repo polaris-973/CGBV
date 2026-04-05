@@ -53,6 +53,15 @@ def write_report(
         "description": config.description,
         "dataset": config.dataset.name,
         "split": config.dataset.split,
+        "dataset_filters": {
+            "limit": config.dataset.limit,
+            "sample_index_range": (
+                list(config.dataset.sample_index_range)
+                if config.dataset.sample_index_range is not None
+                else None
+            ),
+            "only_ids": config.dataset.only_ids,
+        },
         "llm_model": config.llm.model,
         "pipeline": {
             "num_witnesses": config.pipeline.num_witnesses,

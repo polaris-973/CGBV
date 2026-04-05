@@ -6,6 +6,7 @@ dataset:
   name: folio
   split: validation
   path: ./datasets
+  # sample_index_range: full  # omit or set to full to run the entire split
 
 llm:
   provider: openai

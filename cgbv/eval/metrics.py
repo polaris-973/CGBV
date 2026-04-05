@@ -7,15 +7,10 @@ def _is_successful_result(result: dict | None) -> bool:
     """Return True iff *result* contains a meaningful semantic verdict."""
     if result is None:
         return False
-
     exec_status = result.get("execution_status", "")
     if exec_status:
         return exec_status == "success"
-
     # Legacy results without execution_status field.
-    # Exclude solver-Unknown verdicts: old runs where Phase 1 code executed but
-    # Z3 timed out wrote error=None yet verdict=Unknown, which is not a
-    # successful semantic result.
     verdict_raw = str(result.get("verdict", "")).strip().lower()
     return (
         result.get("error") is None
@@ -163,8 +158,8 @@ def compute_metrics(
 
       6.  mismatch_detection_precision — among samples with mismatches, fraction post-bridge wrong
       7.  mismatch_detection_recall    — fraction of post-bridge-wrong samples that had mismatches
-      8.  repair_round_commit_rate  — fraction of repair rounds where all mismatches were fixed
-                                      and the verdict was not reverted (i.e., committed)
+      8.  repair_round_commit_rate  — fraction of repair rounds where at least one mismatch
+                                      was fixed and the verdict was not reverted (partial commit)
       9.  repair_local_fix_rate     — fraction of mismatches that passed local acceptance check
      10.  repair_verdict_recovery_rate — among post-bridge-wrong repaired samples, fraction fixed
      11.  repair_regression_rate       — among post-bridge-correct repaired samples, fraction broken
@@ -210,6 +205,8 @@ def compute_metrics(
     uncertain_total = 0
     phase3_errors_detected = 0    # structural Phase 3 grounding errors detected
     phase3_reground_success = 0   # Phase 3 errors resolved via targeted re-grounding
+    # P6: Verification confidence distribution
+    confidence_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "none": 0}
 
     # Pre-count label totals from the full sample list (not just completed results)
     # so that missing/errored samples count as incorrect for label-specific metrics.
@@ -241,6 +238,11 @@ def compute_metrics(
         v_pre, v_post, v_final = _read_verdicts(r)
         is_verified = r.get("verified", False)
         rounds = r.get("rounds", [])
+
+        # P6: Accumulate confidence distribution
+        conf = r.get("verification_confidence", "none")
+        if conf in confidence_counts:
+            confidence_counts[conf] += 1
 
         final_correct = (v_final == label)
         # post_bridge_correct: baseline after bridge, before repair loop.
@@ -342,6 +344,8 @@ def compute_metrics(
         "cgbv_repair_recovery_rate": cgbv_repair_audit["cgbv_repair_recovery_rate"],
         # Phase 3 re-grounding metrics
         "phase3_reground_rate": safe_div(phase3_reground_success, phase3_errors_detected),
+        # P6: Verification confidence distribution
+        "verification_confidence": confidence_counts,
         # Raw counts (for inspection)
         "_counts": {
             "correct": correct,
@@ -412,5 +416,6 @@ def _empty_metrics() -> dict:
         "repair_regression_rate": 0.0,
         "cgbv_repair_recovery_rate": 0.0,
         "phase3_reground_rate": 0.0,
+        "verification_confidence": {"high": 0, "medium": 0, "low": 0, "none": 0},
         "_counts": {},
     }

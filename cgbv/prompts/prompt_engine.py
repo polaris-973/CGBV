@@ -41,18 +41,3 @@ class PromptEngine:
         few_shot = self._load_few_shot(dataset) if dataset else []
         template = self._env.get_template(template_name)
         return template.render(few_shot_examples=few_shot, **kwargs)
-
-    def build_messages(
-        self,
-        system_template: str,
-        user_template: str,
-        dataset: str = "",
-        **kwargs,
-    ) -> list[dict]:
-        """Render system + user templates and return OpenAI-format messages list."""
-        system_content = self.render(system_template, dataset=dataset, **kwargs)
-        user_content = self.render(user_template, dataset=dataset, **kwargs)
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content},
-        ]

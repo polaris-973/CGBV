@@ -39,6 +39,8 @@ class DatasetConfig:
     split: str              # train | validation | test | dev | easy | medium | hard
     path: str = "./datasets"
     limit: Optional[int] = None  # limit number of samples (for debugging)
+    sample_index_range: tuple[int, int] | None = None  # 1-based inclusive [start, end]
+    only_ids: Optional[list[str]] = None  # if set, only run these sample IDs
 
 
 @dataclass
@@ -50,7 +52,12 @@ class PipelineConfig:
     formalize_retries: int = 3
     grounding_retries: int = 2
     repair_retries: int = 2       # Phase 5 LLM repair retries per mismatch
+    bridge_retries: int = 2       # Phase 1.5 bridge axiom LLM retries per orphaned premise
+    batch_repair_threshold: int = 2  # deprecated: unified repair always uses joint mode
+    min_uncertain_witnesses: int = 2  # minimum witnesses for Uncertain verdicts
+    max_exec_workers: int = 8     # max concurrent code execution threads
     world_assumption: str = "owa"  # "owa" (open world) | "cwa" (closed world)
+    enable_phase1_bridge: bool = True  # Phase 1.5 bridge axiom injection
 
 
 @dataclass
@@ -118,6 +125,31 @@ def _build_run_id(base_experiment_id: str, pipeline: PipelineConfig, timestamp: 
     return "_".join(parts)
 
 
+def _parse_sample_index_range(raw: Any) -> tuple[int, int] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"", "full", "all"}:
+            return None
+        raise ValueError(
+            "dataset.sample_index_range must be [start, end] or 'full'"
+        )
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        raise ValueError(
+            "dataset.sample_index_range must be [start, end] or 'full'"
+        )
+
+    start, end = raw
+    if not isinstance(start, int) or not isinstance(end, int):
+        raise ValueError("dataset.sample_index_range values must both be integers")
+    if start < 1 or end < 1:
+        raise ValueError("dataset.sample_index_range must use 1-based positive indices")
+    if start > end:
+        raise ValueError("dataset.sample_index_range start must be <= end")
+    return (start, end)
+
+
 def load_config(config_path: str | Path) -> ExperimentConfig:
     with open(config_path) as f:
         raw = yaml.safe_load(f)
@@ -143,6 +175,8 @@ def load_config(config_path: str | Path) -> ExperimentConfig:
             split=dataset_raw.get("split", "validation"),
             path=dataset_raw.get("path", "./datasets"),
             limit=dataset_raw.get("limit"),
+            sample_index_range=_parse_sample_index_range(dataset_raw.get("sample_index_range")),
+            only_ids=dataset_raw.get("only_ids"),
         ),
         llm=LLMConfig(
             provider=llm_raw["provider"],

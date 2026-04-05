@@ -143,6 +143,7 @@ async def reground_with_hint(
     prompt_engine: PromptEngine,
     max_retries: int = 2,
     world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
 ) -> GroundedFormula:
     """
     Re-ground a sentence when Phase 4 detected a structural Phase 3 semantic error.
@@ -157,6 +158,8 @@ async def reground_with_hint(
         current_formula: The Phase 3 formula that Phase 4 found to be incorrect.
         expected_truth:  What the formula should evaluate to on this witness
                          (False for ¬q witness, True for q witness).
+        solver:          If provided, used for in-loop semantic validation
+                         (evaluate formula on witness to check truth value).
     """
     semantic_hint = (
         f"Your formula evaluated to {not expected_truth} but must evaluate to "
@@ -222,6 +225,28 @@ async def reground_with_hint(
                 idx, attempt + 1, err,
             )
             continue
+
+        # Semantic validation: formula must evaluate to expected_truth on witness
+        if solver is not None:
+            try:
+                actual_truth = solver.evaluate_grounded_formula(domain, formula_code)
+            except Exception:
+                actual_truth = None
+            if actual_truth is None or actual_truth != expected_truth:
+                last_error = (
+                    f"Formula is syntactically valid but evaluates to {actual_truth} "
+                    f"on the witness; expected {expected_truth}. "
+                    f"Re-check the comparison direction, quantifier structure, or "
+                    f"negation placement."
+                )
+                attempt_record.validation_error = last_error
+                attempts.append(attempt_record)
+                logger.debug(
+                    "reground_with_hint idx=%d attempt %d: semantic mismatch "
+                    "(actual=%s, expected=%s)",
+                    idx, attempt + 1, actual_truth, expected_truth,
+                )
+                continue
 
         attempt_record.accepted = True
         attempts.append(attempt_record)

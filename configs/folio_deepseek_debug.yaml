@@ -7,6 +7,9 @@ dataset:
   split: validation
   path: ./datasets
   limit: 50
+  # sample_index_range: [1, 50]   # 1-based inclusive range on dataset order
+  # sample_index_range: [51, 100]
+  # sample_index_range: full      # or just omit this field for a full run
 
 llm:
   provider: deepseek
@@ -21,6 +24,11 @@ pipeline:
   r_max: 3
   formalize_retries: 3
   grounding_retries: 3
+  repair_retries: 2
+  bridge_retries: 2               # Phase 1.5 bridge axiom LLM retries per orphaned premise
+  batch_repair_threshold: 2       # deprecated: unified repair always uses joint mode
+  min_uncertain_witnesses: 2      # minimum witnesses for Uncertain verdicts
+  max_exec_workers: 8             # max concurrent code execution threads
   solver_timeout: 60
   world_assumption: owa
 

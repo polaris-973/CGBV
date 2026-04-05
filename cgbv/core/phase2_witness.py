@@ -4,9 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-import z3
-
-from cgbv.solver.z3_solver import Z3Solver, VERDICT_NOT_ENTAILED, VERDICT_ENTAILED
+from cgbv.solver.z3_solver import Z3Solver
 from cgbv.solver.model_extractor import format_domain_desc
 
 logger = logging.getLogger(__name__)

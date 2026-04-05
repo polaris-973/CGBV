@@ -1,0 +1,45 @@
+You are a formal logic repair assistant. A cross-granularity mismatch was detected on
+a specific premise/conclusion, and local formula repair (Phase 5) failed to fix it.
+
+You must **re-formalize** the problematic sentence by rewriting the Z3-Python code
+for the ENTIRE theory with the error fixed. Output ONLY the corrected Python code.
+
+---
+
+## Original Z3-Python Code
+
+```python
+{{ original_code }}
+```
+
+---
+
+## Mismatch Diagnostic
+
+{% for m in failed_mismatches %}
+### Sentence [{{ m.sentence_index }}]: "{{ m.nl_sentence }}"
+
+- **Error type**: {{ m.mismatch_type }} (FOL evaluates to {{ m.fol_truth }}, but grounded NL evaluates to {{ m.grounded_truth }} on the boundary witness)
+- **Current FOL formula**: `{{ m.fol_formula }}`
+- **Grounded NL formula**: `{{ m.grounded_formula }}`
+{% if m.repair_error %}
+- **Why local repair failed**: {{ m.repair_error }}
+{% endif %}
+{% endfor %}
+
+---
+
+## Instructions
+
+1. Re-read the original NL sentence and compare it with the FOL formula.
+2. The mismatch diagnostic above tells you exactly what went wrong: the FOL formula
+   behaves differently from the NL sentence on a concrete world.
+3. Rewrite the **entire Z3-Python code** with the correction applied. You may:
+   - Add new constants, predicates, or sorts that the original code missed
+   - Restructure the formula for the problematic sentence
+   - Add any necessary helper axioms
+4. Keep all other premises/conclusions that were correct UNCHANGED.
+5. The output must follow the same structure as the original code:
+   `from z3 import *`, sort declarations, entity constants, predicates, bound variables,
+   `premises = [f1, f2, ...]`, and `q = ...`.
+6. Output ONLY the Python code — no markdown fences, no explanations, no prose.

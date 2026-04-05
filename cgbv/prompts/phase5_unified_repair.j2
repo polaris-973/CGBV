@@ -1,0 +1,129 @@
+You are a formal logic repair assistant. {{ mismatches | length }} cross-granularity mismatch(es)
+detected between FOL formulas and their grounded interpretations on a boundary witness world.
+
+Your task: fix ALL mismatched formulas simultaneously, ensuring mutual consistency.
+You may also output bridge axioms to connect disconnected predicates.
+
+---
+
+## All Detected Mismatches
+
+{% for m in mismatches %}
+### Mismatch {{ loop.index }}: Sentence {{ m.sentence_index }}
+
+- **NL sentence:** "{{ m.nl_sentence }}"
+- **Current FOL formula:** `{{ m.fol_formula }}`
+- **Mismatch type:** {{ m.mismatch_type }}
+{% if m.mismatch_type == "strengthening" %}
+  → FOL is **too restrictive** (False in world, but NL holds True).
+    Look for: extra predicate, `And` → `Or`, predicate guard mismatch.
+{% elif m.mismatch_type == "weakening" %}
+  → FOL is **too permissive** (True in world, but NL does not hold).
+    Look for: missing predicate, inclusive `Or` → exclusive, missing negation.
+{% endif %}
+- **FOL truth:** {{ m.fol_truth }} | **Grounded truth:** {{ m.grounded_truth }}
+- **Correct grounded interpretation:** `{{ m.grounded_formula }}`
+{% if m.witness_desc is defined and m.witness_desc %}
+
+**Witness World for this mismatch:**
+
+{{ m.witness_desc }}
+{% endif %}
+{% endfor %}
+
+---
+
+## Original Phase 1 Code (Symbol Table)
+
+Use the exact predicate names, sort names, constant names, and bound variable names from this code:
+
+```python
+{{ original_code }}
+```
+
+---
+
+{% if function_value_helpers %}
+## Available Value-Comparison Helpers
+
+For non-boolean functions, the following helpers are available in your repair
+expression. Each returns a Z3 boolean `f(entity) == value`:
+
+{% for helper_name, original_func, arity_desc in function_value_helpers %}
+- `{{ helper_name }}({{ arity_desc }})` — returns `{{ original_func }}({{ arity_desc.rsplit(', ', 1)[0] }}) == {{ arity_desc.rsplit(', ', 1)[1] }}`
+{% endfor %}
+
+Use these when the grounded formula compares function outputs to specific values.
+{% endif %}
+
+{% if witness_desc %}
+## Boundary Witness World
+
+{{ witness_desc }}
+
+---
+{% endif %}
+
+{% if gap_analysis and gap_analysis.ungrounded_predicates %}
+## Gap Analysis
+
+The following predicates appear in rule antecedents but have NO grounding facts
+and are NOT derivable from other rules:
+{% for p in gap_analysis.ungrounded_predicates | sort %}
+- `{{ p }}`
+{% endfor %}
+
+{% if gap_analysis.missing_links %}
+These predicate pairs may need a linking axiom (structural gap — verify NL support):
+{% for src, tgt in gap_analysis.missing_links %}
+- `{{ src }}` → `{{ tgt }}` (structural gap — verify against NL text before bridging)
+{% endfor %}
+
+If a mismatch cannot be fixed by editing the formula alone, you may output a
+**bridge axiom** — a ForAll rule connecting two predicates — using the `[BRIDGE]` prefix.
+
+**Bridge axiom rules:**
+- Only output a bridge if the NL text states or implies the relationship. Do NOT invent
+  relationships that lack textual support.
+- The axiom MUST be universally quantified (ForAll/Exists form), not a ground fact.
+- Use ONLY identifiers (predicates, constants, sorts, bound variables) already declared
+  in the original code. Do NOT introduce new names.
+- If no semantically justified bridge exists, do NOT output a `[BRIDGE]` line.
+{% endif %}
+{% endif %}
+
+{% if world_assumption == "cwa" %}
+## CWA Repair Guidance
+
+Under the Closed-World Assumption, modify the **existing formulas' logical structures**
+(do NOT introduce new axioms unless using the [BRIDGE] mechanism).
+{% endif %}
+
+---
+
+## Repair Instructions
+
+1. For EACH mismatch above, output a repaired Z3-Python **expression**.
+2. Use **only** predicate/sort/constant/variable names from the original code,
+   plus any value-comparison helpers listed in the "Available Helpers" section above.
+3. Repairs must be **mutually consistent** — do not fix one formula in a way that
+   contradicts the fix for another.
+4. Make **minimal edits** to each formula, but ensure the NL sentence's full meaning
+   is captured (do not drop information).
+5. Each repaired formula must evaluate to its expected grounded_truth on the witness world.
+6. If the grounded formula uses `all(...)` → use `ForAll`.
+   If it uses `any(...)` → use `Exists`.
+   If it is a conjunction of ground atoms → use `And(...)` with ground predicates only.
+{% if gap_analysis and gap_analysis.missing_links %}
+7. If a mismatch requires a **new linking rule** between predicates (not just formula editing),
+   output it as a `[BRIDGE]` line. Bridge axioms must be ForAll quantified.
+{% endif %}
+
+## Output Format
+
+Output ONLY the repaired expressions, one per line, prefixed with the sentence index in brackets:
+
+```
+{% for m in mismatches %}[{{ m.sentence_index }}] repaired_expression
+{% endfor %}{% if gap_analysis and gap_analysis.missing_links %}[BRIDGE] ForAll([x], Implies(pred_a(x), pred_b(x)))
+{% endif %}```

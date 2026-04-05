@@ -61,6 +61,9 @@ class Mismatch:
     #   "top"    — outermost constructor is ForAll/Exists
     #   "buried" — quantifier exists but is not the outermost constructor
     fol_quantifier_layout: str = "none"
+    # 9.5: Number of repair rounds this mismatch has persisted without resolution.
+    # Set by the pipeline when the same sentence_index re-appears across rounds.
+    persist_rounds: int = 0
 
 
 @dataclass

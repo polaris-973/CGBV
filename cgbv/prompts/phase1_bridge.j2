@@ -56,12 +56,16 @@ participate in deriving the conclusion?
   → `ForAll([x], Implies(is_mature_stock(x), is_stock(x)))`
 
 **Rules:**
+- If no semantically justified linking axiom exists between the orphaned and connected
+  predicates — i.e., the NL text does NOT state or imply a general relationship —
+  output the single word `NONE` (uppercase). Do NOT invent relationships that lack
+  textual support.
 - The axiom MUST be a **universally quantified rule** (ForAll/Exists form).
   Do NOT output a ground fact (e.g. `is_stock(ko)`) — ground facts replace individual
   premises rather than bridging the proof chain.
 - Use **ONLY** identifiers (predicates, constants, sorts, bound variables) already declared
   in the code above.  Do NOT introduce new names.
-- Output **ONLY** the Python expression for the linking axiom.
+- Output **ONLY** the Python expression for the linking axiom (or `NONE`).
 - No imports, no assignments, no comments, no prose.
-- The output must be a Z3 boolean expression (BoolRef) that can be evaluated in the same
-  namespace as the original code.
+- If not `NONE`, the output must be a Z3 boolean expression (BoolRef) that can be evaluated
+  in the same namespace as the original code.
