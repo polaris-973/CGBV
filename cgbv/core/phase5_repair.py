@@ -18,6 +18,34 @@ logger = logging.getLogger(__name__)
 _evaluator = FiniteModelEvaluator()
 
 
+def _gap_analysis_field(gap_analysis: Any, name: str, default: Any) -> Any:
+    """Read a gap-analysis field from either an object or a dict-like payload."""
+    if gap_analysis is None:
+        return default
+    if isinstance(gap_analysis, dict):
+        return gap_analysis.get(name, default)
+    return getattr(gap_analysis, name, default)
+
+
+def _gap_analysis_prompt_data(gap_analysis: Any) -> dict[str, Any] | None:
+    """Normalize gap analysis into a stable prompt contract."""
+    if gap_analysis is None:
+        return None
+
+    ungrounded_predicates = list(_gap_analysis_field(gap_analysis, "ungrounded_predicates", []) or [])
+    missing_links = list(_gap_analysis_field(gap_analysis, "missing_links", []) or [])
+    obligation_hints = list(_gap_analysis_field(gap_analysis, "obligation_hints", []) or [])
+
+    if not (ungrounded_predicates or missing_links or obligation_hints):
+        return None
+
+    return {
+        "ungrounded_predicates": ungrounded_predicates,
+        "missing_links": missing_links,
+        "obligation_hints": obligation_hints,
+    }
+
+
 # ---------------------------------------------------------------------------
 # f_is() normalization: Phase 3 grounded formulas use truth["f_is(e, v)"]
 # keys for booleanized functions, but Phase 1 namespace only has f(e).
@@ -194,10 +222,10 @@ async def run_phase5(
          (keyed by sentence_index to avoid witness_index renumbering collisions)
       2. models/domains[witness_index]  — current-round witnesses
     """
+    gap_data = _gap_analysis_prompt_data(gap_analysis)
+
     if not mismatches:
-        has_gap = (gap_analysis is not None and bool(
-            getattr(gap_analysis, 'missing_links', None)
-        ))
+        has_gap = bool(gap_data and gap_data["missing_links"])
         if not has_gap:
             return Phase5Result(
                 repaired_premises=list(premises),
@@ -205,7 +233,7 @@ async def run_phase5(
                 all_repaired=True,
             )
 
-    has_gap = (gap_analysis is not None and bool(gap_analysis.ungrounded_predicates))
+    has_gap = bool(gap_data)
 
     # Single mismatch without gap signals → lightweight per-mismatch path
     if len(mismatches) == 1 and not has_gap:
@@ -244,7 +272,7 @@ async def run_phase5(
         mismatch_domains=mismatch_domains,
         solver=solver,
         world_assumption=world_assumption,
-        gap_analysis=gap_analysis,
+        gap_analysis=gap_data,
     )
 
 
@@ -431,13 +459,7 @@ async def _run_unified_repair(
             entry["witness_desc"] = mismatch_witness_descs[m.sentence_index]
         mismatch_data.append(entry)
 
-    # Prepare gap analysis data for template
-    gap_data = None
-    if gap_analysis is not None and gap_analysis.ungrounded_predicates:
-        gap_data = {
-            "ungrounded_predicates": gap_analysis.ungrounded_predicates,
-            "missing_links": gap_analysis.missing_links,
-        }
+    gap_data = _gap_analysis_prompt_data(gap_analysis)
 
     function_value_helpers = _build_function_value_helpers(namespace)
 

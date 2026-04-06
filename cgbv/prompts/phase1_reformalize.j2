@@ -19,9 +19,15 @@ Output ONLY the corrected Python code.
 {% for m in failed_mismatches %}
 ### Sentence [{{ m.sentence_index }}]: "{{ m.nl_sentence }}"
 
+{% if m.fol_truth is not none and m.grounded_truth is not none %}
 - **Error type**: {{ m.mismatch_type }} (FOL evaluates to {{ m.fol_truth }}, grounded NL evaluates to {{ m.grounded_truth }} on the boundary witness)
+{% else %}
+- **Error type**: {{ m.mismatch_type }}
+{% endif %}
 - **Current FOL formula**: `{{ m.fol_formula }}`
+{% if m.grounded_formula %}
 - **Grounded NL formula**: `{{ m.grounded_formula }}`
+{% endif %}
 {% if m.repair_error %}
 - **Why local repair failed**: {{ m.repair_error }}
 {% endif %}

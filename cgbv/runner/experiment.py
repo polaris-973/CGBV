@@ -76,16 +76,6 @@ class ExperimentRunner:
             all_samples = [s for s in all_samples if str(s.id) in id_set]
             logger.info("Filtered to %d samples by only_ids", len(all_samples))
 
-        # Warn explicitly if this is a multi-choice dataset
-        if all_samples and all_samples[0].task_type == "multi_choice":
-            logger.warning(
-                "Dataset '%s' is a multi-choice task (labels are A/B/C/D). "
-                "The CGBV pipeline only supports binary entailment tasks. "
-                "Pipeline will run but accuracy metrics will be meaningless — "
-                "Entailed/Not Entailed verdicts cannot be compared against A/B/C/D labels.",
-                cfg.dataset.name,
-            )
-
         # Filter already-done samples (checkpoint)
         pending: list[DataSample]
         if cfg.runner.checkpoint:

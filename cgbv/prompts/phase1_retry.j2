@@ -1,11 +1,18 @@
 You are repairing previously generated Z3-Python code for first-order logic entailment checking.
 
-The natural-language task has not changed. Make the smallest possible fix. Reuse all
-correct declarations and formulas.
+The natural-language task has not changed. Recompile the same theory object under the constraints below.
+Preserve all correct declarations and formulas.
 
 ## Retry Context
 
 This is retry attempt {{ attempt_num }} of {{ max_retries }}.
+
+{% if repeated_failure %}
+### Escalation Mode
+
+The previous retry repeated the same structural failure. Do NOT make another tiny surface edit that preserves
+the same broken shape. Regenerate the affected part cleanly while keeping valid symbols and premise alignment.
+{% endif %}
 
 ## Original Task
 
@@ -22,7 +29,7 @@ Conclusion: {{ conclusion }}
 {{ previous_code }}
 ```
 
-## Observed Error
+## Raw Error
 
 {{ last_error }}
 
@@ -31,6 +38,29 @@ Conclusion: {{ conclusion }}
 
 {{ name_error_hint }}
 
+{% endif %}
+{% if diagnostic %}
+## Repair Contract
+
+- Failure stage: `{{ diagnostic.failure_stage or "unknown" }}`
+{% if diagnostic.source_slots %}
+- Source slots: {% for slot in diagnostic.source_slots %}`{{ slot }}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
+{% if diagnostic.offending_symbols %}
+- Offending symbols: {% for sym in diagnostic.offending_symbols %}`{{ sym }}`{% if not loop.last %}, {% endif %}{% endfor %}
+{% endif %}
+{% if diagnostic.preserve_constraints %}
+- Must preserve:
+{% for line in diagnostic.preserve_constraints %}
+  - {{ line }}
+{% endfor %}
+{% endif %}
+{% if diagnostic.forbidden_patterns %}
+- Do not repeat:
+{% for line in diagnostic.forbidden_patterns %}
+  - {{ line }}
+{% endfor %}
+{% endif %}
 {% endif %}
 {% if validation_feedback %}
 ## Validation Feedback
@@ -42,11 +72,12 @@ Conclusion: {{ conclusion }}
 {% endif %}
 ## Repair Requirements
 
-1. Make the smallest change that fixes the error. Preserve all correct declarations and formulas.
+1. Make the smallest structural change that removes the failure. Preserve all correct declarations and formulas.
 2. `premises` must align one-to-one with the numbered NL premises: N premises → exactly N
    top-level formulas in the same order. Do not omit, merge, or split entries (RULE 9).
 3. Every identifier used in `premises` or `q` must exactly match a previously declared name (RULE 8).
-4. Do not invent new entities, predicates, sorts, or bound variables unless the NL explicitly requires them.
+4. Reuse the existing symbol table whenever possible. Do not introduce new entities, predicates,
+   sorts, or bound variables unless the NL explicitly requires them.
 5. Do not add a new premise, ground fact, or extra conjunct unless that content is stated in the NL above.
 6. If an NL premise is a plain disjunction, keep it as `Or(...)`. Do not rewrite it as
    `And(Or(...), ...)` or otherwise strengthen its meaning.

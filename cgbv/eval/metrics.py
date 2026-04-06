@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from cgbv.data.base import DataSample
+
+logger = logging.getLogger(__name__)
 
 
 def _is_successful_result(result: dict | None) -> bool:
@@ -145,6 +149,7 @@ def compute_sample_id_audit(
     result_map: dict[str, dict] = {r["sample_id"]: r for r in results if "sample_id" in r}
 
     error_sample_ids: list[str] = []
+    error_details: list[dict] = []
     reasoning_error_sample_ids: list[str] = []
     phase1_wrong_but_final_correct_sample_ids: list[str] = []
 
@@ -152,6 +157,14 @@ def compute_sample_id_audit(
         result = result_map.get(sample.id)
         if not _is_successful_result(result):
             error_sample_ids.append(sample.id)
+            if result is not None:
+                error_details.append({
+                    "sample_id": sample.id,
+                    "execution_status": result.get("execution_status", "missing"),
+                    "acceptance_state": result.get("acceptance_state", ""),
+                    "diagnostic_tags": list(result.get("diagnostic_tags", [])),
+                    "error": result.get("error"),
+                })
             continue
 
         label = label_map[sample.id]
@@ -166,6 +179,7 @@ def compute_sample_id_audit(
     return {
         "error_count": len(error_sample_ids),
         "error_sample_ids": error_sample_ids,
+        "error_details": error_details,
         "reasoning_error_count": len(reasoning_error_sample_ids),
         "reasoning_error_sample_ids": reasoning_error_sample_ids,
         "phase1_wrong_but_final_correct_count": len(phase1_wrong_but_final_correct_sample_ids),
@@ -228,7 +242,12 @@ def compute_metrics(
       system that crashes on all Uncertain samples cannot claim a perfect
       uncertain_recall by having an empty denominator.  Unanswered/errored samples
       count as incorrect for those label-specific metrics.
+
+    NOTE: All datasets are normalized to three-class tasks (true/false/uncertain)
+    for consistent metric computation. Datasets like ProverQA with A/B/C options
+    are converted to true/false/uncertain labels by their adapters.
     """
+
     label_map: dict[str, str] = {s.id: _normalise_label(s.label) for s in samples}
     total = len(samples)
 
@@ -259,6 +278,13 @@ def compute_metrics(
     uncertain_total = 0
     phase3_errors_detected = 0    # structural Phase 3 grounding errors detected
     phase3_reground_success = 0   # Phase 3 errors resolved via targeted re-grounding
+    underformalized = 0
+    semantic_unstable = 0
+    verified_uncertain = 0
+    verified_uncertain_correct = 0
+    obligation_resolution_eligible = 0
+    obligation_resolution_success = 0
+    repeated_phase1_failures = 0
     # P6: Verification confidence distribution
     confidence_counts: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "none": 0}
 
@@ -274,6 +300,9 @@ def compute_metrics(
     for sample in samples:
         r = result_map.get(sample.id)
         label = label_map[sample.id]
+
+        if r is not None and r.get("phase1_repeated_failure", False):
+            repeated_phase1_failures += 1
 
         # Determine if this sample ran successfully (has a meaningful semantic verdict)
         is_successful = _is_successful_result(r)
@@ -292,6 +321,17 @@ def compute_metrics(
         v_pre, v_post, v_final = _read_verdicts(r)
         is_verified = r.get("verified", False)
         rounds = r.get("rounds", [])
+        diagnostic_tags = set(r.get("diagnostic_tags", []))
+        if "underformalized" in diagnostic_tags:
+            underformalized += 1
+        if "semantic_unstable" in diagnostic_tags or r.get("verification_status") == "semantic_unstable":
+            semantic_unstable += 1
+        init_ob = int(r.get("initial_obligation_count", 0) or 0)
+        final_ob = int(r.get("final_obligation_count", 0) or 0)
+        if init_ob > 0:
+            obligation_resolution_eligible += 1
+            if final_ob < init_ob:
+                obligation_resolution_success += 1
 
         # P6: Accumulate confidence distribution
         conf = r.get("verification_confidence", "none")
@@ -314,6 +354,10 @@ def compute_metrics(
             verified += 1
             if final_correct:
                 verified_correct += 1
+            if v_final == "uncertain":
+                verified_uncertain += 1
+                if final_correct:
+                    verified_uncertain_correct += 1
 
         if label in ("true", "false") and final_correct:
             binary_correct += 1
@@ -388,6 +432,7 @@ def compute_metrics(
         # Verification
         "verification_precision": safe_div(verified_correct, verified),
         "verification_coverage": safe_div(verified, total),
+        "verified_uncertain_precision": safe_div(verified_uncertain_correct, verified_uncertain),
         # Mismatch detection (both use initial verdict)
         "mismatch_detection_precision": safe_div(mismatch_wrong, has_mismatch),
         "mismatch_detection_recall": safe_div(mismatch_wrong, wrong_initial),
@@ -399,6 +444,13 @@ def compute_metrics(
         "cgbv_repair_recovery_rate": cgbv_repair_audit["cgbv_repair_recovery_rate"],
         # Phase 3 re-grounding metrics
         "phase3_reground_rate": safe_div(phase3_reground_success, phase3_errors_detected),
+        # Acceptance / adequacy diagnostics
+        "underformalized_rate": safe_div(underformalized, successful),
+        "semantic_instability_rate": safe_div(semantic_unstable, successful),
+        "phase1_repeat_failure_rate": safe_div(repeated_phase1_failures, total),
+        "obligation_resolution_rate": safe_div(
+            obligation_resolution_success, obligation_resolution_eligible
+        ),
         # P6: Verification confidence distribution
         "verification_confidence": confidence_counts,
         "sample_id_audit": sample_id_audit,
@@ -408,6 +460,8 @@ def compute_metrics(
             "wrong_initial": wrong_initial,
             "verified": verified,
             "verified_correct": verified_correct,
+            "verified_uncertain": verified_uncertain,
+            "verified_uncertain_correct": verified_uncertain_correct,
             "has_mismatch": has_mismatch,
             "mismatch_wrong": mismatch_wrong,
             "repair_round_attempts": repair_round_attempts,
@@ -426,6 +480,11 @@ def compute_metrics(
             "binary_total": binary_total,
             "phase3_errors_detected": phase3_errors_detected,
             "phase3_reground_success": phase3_reground_success,
+            "underformalized": underformalized,
+            "semantic_unstable": semantic_unstable,
+            "repeated_phase1_failures": repeated_phase1_failures,
+            "obligation_resolution_eligible": obligation_resolution_eligible,
+            "obligation_resolution_success": obligation_resolution_success,
             "uncertain_correct": uncertain_correct,
             "uncertain_total": uncertain_total,
         },
@@ -435,11 +494,15 @@ def compute_metrics(
 def _normalise_label(label: str) -> str:
     """Normalise label/verdict strings for comparison.
 
-    "unknown" is intentionally NOT mapped to "uncertain":
-      - "uncertain" = semantic (premises neither entail nor refute conclusion)
-      - "unknown"   = solver/execution failure (Z3 timeout, Phase 1 error)
-    Keeping them distinct prevents errored samples from spuriously matching
-    Uncertain-labelled ground truth.
+    Maps all three-class variants to a unified representation:
+      - true: true, entailed, yes, correct
+      - false: false, not entailed, no, incorrect, refuted
+      - uncertain: uncertain, neither, unknown
+      - (unknown only matches if it was originally from verdict, not ground truth)
+
+    NOTE: Datasets are now normalized to use lowercase (true/false/uncertain).
+    Verdicts from the system use title case (Entailed/Not Entailed/Uncertain).
+    This function normalizes both to lowercase for comparison.
     """
     if label is None:
         return ""
@@ -448,9 +511,9 @@ def _normalise_label(label: str) -> str:
         return "true"
     if s in ("false", "not entailed", "no", "incorrect", "refuted"):
         return "false"
-    if s in ("uncertain", "neither"):
+    if s in ("uncertain", "neither", "unknown"):
         return "uncertain"
-    return s  # "unknown" → "unknown" (does not match any label)
+    return s  # fallback: return normalized string as-is
 
 
 def _empty_metrics() -> dict:
@@ -464,6 +527,7 @@ def _empty_metrics() -> dict:
         "uncertain_recall": 0.0,
         "verification_precision": 0.0,
         "verification_coverage": 0.0,
+        "verified_uncertain_precision": 0.0,
         "mismatch_detection_precision": 0.0,
         "mismatch_detection_recall": 0.0,
         "repair_round_commit_rate": 0.0,
@@ -472,10 +536,15 @@ def _empty_metrics() -> dict:
         "repair_regression_rate": 0.0,
         "cgbv_repair_recovery_rate": 0.0,
         "phase3_reground_rate": 0.0,
+        "underformalized_rate": 0.0,
+        "semantic_instability_rate": 0.0,
+        "phase1_repeat_failure_rate": 0.0,
+        "obligation_resolution_rate": 0.0,
         "verification_confidence": {"high": 0, "medium": 0, "low": 0, "none": 0},
         "sample_id_audit": {
             "error_count": 0,
             "error_sample_ids": [],
+            "error_details": [],
             "reasoning_error_count": 0,
             "reasoning_error_sample_ids": [],
             "phase1_wrong_but_final_correct_count": 0,

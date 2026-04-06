@@ -1,15 +1,12 @@
 experiment:
-  id: folio_deepseek_error_respin
-  description: "Re-run on 12 error samples after shape-guard + safety-gate fixes"
+  id: folio_deepseek_error_respin_regress
+  description: "Regression run for Phase 5 gap-analysis prompt contract bug"
 
 dataset:
   name: folio
   split: validation
   path: ./datasets
-  # sample_index_range: [51, 100]
-  # only_ids: [173, 361, 476, 527, 528, 547, 560, 562, 960, 1012, 1368]
-  only_ids: [361, 756, 173, 547, 476, 1367, 560, 370, 372, 527, 529, 440, 739, 846, 75, 388, 389, 1328, 1329, 133, 134, 1244, 803, 804, 1033]
-  # only_ids: [361]
+  only_ids: [476, 1367, 370, 372, 527, 389, 1329, 803, 1033]
 
 llm:
   provider: deepseek

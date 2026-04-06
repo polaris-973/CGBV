@@ -23,15 +23,22 @@ def _extract_conclusion(question: str) -> str:
 
 
 def _answer_to_label(answer: str, options: list[str]) -> str:
-    """Convert answer letter (A/B/C) to label string."""
+    """Convert answer letter (A/B/C) to label string (lowercase).
+
+    Normalizes "Unknown" to "uncertain" for consistency with FOLIO and ProverQA.
+    """
     idx = ord(answer.upper()) - ord('A')
     if 0 <= idx < len(options):
         option_text = options[idx]
-        # Extract just "True", "False", or "Unknown" from "A) True"
+        # Extract "True", "False", or "Unknown" from "A) True"
         match = re.search(r'\)\s*(\w+)', option_text)
         if match:
-            return match.group(1)
-    return answer
+            label = match.group(1).lower()
+            # Normalize "unknown" to "uncertain" for consistency
+            if label == "unknown":
+                label = "uncertain"
+            return label
+    return answer.lower()
 
 
 def load(dataset_path: str, split: str, limit: int | None = None) -> list[DataSample]:

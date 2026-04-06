@@ -12,6 +12,7 @@ from cgbv.core.gap_analysis import compute_gap_analysis
 from cgbv.core.multi_witness import MultiWitnessResult, WitnessCheckResult, run_multi_witness
 from cgbv.core.phase1_formalize import Phase1Result, run_phase1, run_phase1_targeted
 from cgbv.core.phase3_grounded import Phase3Result, reground_with_hint
+from cgbv.core.semantic_stability import SemanticAuditResult, audit_semantic_stability
 from cgbv.solver.model_extractor import format_domain_desc
 from cgbv.solver.code_executor import configure_max_workers
 from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
@@ -104,6 +105,12 @@ class PipelineResult:
     verdict_post_bridge: str | None = None  # verdict AFTER Phase 1.5 bridge repair, before repair loop
     rounds: list[RoundRecord] = field(default_factory=list)
     phase1_raw_code: str = ""
+    phase1_repeated_failure: bool = False
+    acceptance_state: str = "needs_repair"  # accepted | needs_repair | failed
+    diagnostic_tags: list[str] = field(default_factory=list)
+    semantic_stable: bool | None = None
+    initial_obligation_count: int = 0
+    final_obligation_count: int = 0
     # Execution/verification status (separate concepts — see DESIGN NOTES below)
     #
     # execution_status: did the pipeline produce a valid semantic verdict?
@@ -117,6 +124,8 @@ class PipelineResult:
     #   "verified"         — all witnesses clean, no mismatches, no carried issues
     #   "exhausted_rounds" — mismatches remained after R_max repair rounds
     #   "witness_failed"   — Phase 2 witness construction failed in the final round
+    #   "semantic_unstable" — witness bank is clean but independent locked-symbol audit
+    #                         still disagrees on a query-relevant formula
     #   "not_run"          — verification never started (execution failed before it)
     execution_status: str = "success"
     verification_status: str = "not_run"
@@ -194,6 +203,12 @@ class CGBVPipeline:
                 verified=False,
                 num_rounds=0,
                 phase1_raw_code=p1.raw_code,
+                phase1_repeated_failure=p1.repeated_failure,
+                acceptance_state="failed",
+                diagnostic_tags=["compile_error"],
+                semantic_stable=None,
+                initial_obligation_count=0,
+                final_obligation_count=0,
                 execution_status="phase1_error",
                 verification_status="not_run",
                 error=p1.error or "Phase 1 produced no formula",
@@ -216,6 +231,12 @@ class CGBVPipeline:
                 verified=False,
                 num_rounds=0,
                 phase1_raw_code=p1.raw_code,
+                phase1_repeated_failure=p1.repeated_failure,
+                acceptance_state="failed",
+                diagnostic_tags=["solver_unknown"],
+                semantic_stable=None,
+                initial_obligation_count=0,
+                final_obligation_count=0,
                 execution_status="solver_unknown",
                 verification_status="not_run",
                 error="Phase 1 solver returned Unknown (timeout or undecidable formula)",
@@ -238,6 +259,8 @@ class CGBVPipeline:
         namespace = p1.namespace
         model_info = p1.model_info
         model_info_q = p1.model_info_q             # P1.1: q-side model for Uncertain
+        initial_gap = compute_gap_analysis(premises, q, [], background_constraints)
+        initial_obligation_count = initial_gap.obligation_count
 
         sentences = sample.premises + [sample.conclusion]
         rounds: list[RoundRecord] = []
@@ -408,6 +431,85 @@ class CGBVPipeline:
                     else None
                 )
                 if gap is None or not gap.missing_links:
+                    semantic_audit = await audit_semantic_stability(
+                        sentences=sentences,
+                        premises=premises,
+                        q=q,
+                        namespace=namespace,
+                        raw_code=p1.raw_code,
+                        witness_results=mw.witness_results,
+                        llm=self.llm,
+                        prompt_engine=self.prompt_engine,
+                    )
+                    self._write_json(
+                        out_dir / f"round{round_num}_semantic_audit.json",
+                        _semantic_audit_to_dict(semantic_audit),
+                    )
+                    if not semantic_audit.stable:
+                        logger.warning(
+                            "Pipeline sample=%s round=%d: semantic stability audit "
+                            "flagged %d issue(s); triggering targeted re-formalization",
+                            sample.id, round_num, len(semantic_audit.issues),
+                        )
+                        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
+                        p1_new = await run_phase1_targeted(
+                            original_code=p1.raw_code,
+                            failed_repairs=[
+                                (issue, "Semantic stability audit diverged on the current witness bank.")
+                                for issue in semantic_audit.issues
+                            ],
+                            premises_nl=sample.premises,
+                            conclusion_nl=sample.conclusion,
+                            llm=self.llm,
+                            solver=self.solver,
+                            prompt_engine=self.prompt_engine,
+                            task_type=sample.task_type,
+                            code_exec_timeout=self.config.pipeline.code_exec_timeout,
+                            world_assumption=self.config.pipeline.world_assumption,
+                            max_retries=self.config.pipeline.formalize_retries,
+                        )
+                        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
+                            rounds.append(round_record)
+                            final_gap = compute_gap_analysis(premises, q, [], background_constraints)
+                            result = PipelineResult(
+                                sample_id=sample.id,
+                                dataset=sample.dataset,
+                                label=sample.label,
+                                verdict=verdict,
+                                verdict_pre_bridge=verdict_pre_bridge,
+                                verdict_post_bridge=verdict_post_bridge,
+                                verified=False,
+                                num_rounds=round_num,
+                                rounds=rounds,
+                                phase1_raw_code=p1.raw_code,
+                                phase1_repeated_failure=p1.repeated_failure,
+                                acceptance_state="needs_repair",
+                                diagnostic_tags=["semantic_unstable"],
+                                semantic_stable=False,
+                                initial_obligation_count=initial_obligation_count,
+                                final_obligation_count=final_gap.obligation_count,
+                                execution_status="success",
+                                verification_status="semantic_unstable",
+                                verification_confidence="low",
+                                error="Semantic stability audit rejected an otherwise clean witness bank.",
+                            )
+                            self._write_json(out_dir / "result.json", asdict(result))
+                            return result
+
+                        premises = list(p1_new.premises)
+                        q = p1_new.q
+                        background_constraints = list(p1_new.background_constraints)
+                        bound_var_names = p1_new.bound_var_names
+                        namespace = p1_new.namespace
+                        verdict = p1_new.verdict
+                        model_info = p1_new.model_info
+                        model_info_q = p1_new.model_info_q
+                        p1 = p1_new
+                        round_record.verdict_after = verdict
+                        rounds.append(round_record)
+                        continue
+
+                    final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
                         sample_id=sample.id,
@@ -420,6 +522,12 @@ class CGBVPipeline:
                         num_rounds=round_num,
                         rounds=rounds,
                         phase1_raw_code=p1.raw_code,
+                        phase1_repeated_failure=p1.repeated_failure,
+                        acceptance_state="accepted",
+                        diagnostic_tags=[],
+                        semantic_stable=True,
+                        initial_obligation_count=initial_obligation_count,
+                        final_obligation_count=final_gap.obligation_count,
                         execution_status="success",
                         verification_status="verified",
                         verification_confidence="high",
@@ -461,65 +569,73 @@ class CGBVPipeline:
                     # Filter out bridges that would make the premise set UNSAT
                     # (ex falso quodlibet — an inconsistent bridge lets Z3 prove
                     # any conclusion vacuously, corrupting the verdict).
-                    accepted_gap_bridges = _filter_consistent_bridges(
-                        list(p5_gap.bridge_axioms),
-                        list(premises) + background_constraints,
+                    accepted_gap_bridges = _filter_obligation_reducing_bridges(
+                        bridges=list(p5_gap.bridge_axioms),
+                        premises=list(premises),
                         q=q,
+                        mismatches=[],
+                        background_constraints=list(background_constraints),
                     )
-                    background_constraints.extend(accepted_gap_bridges)
+                    if accepted_gap_bridges:
+                        background_constraints.extend(accepted_gap_bridges)
 
-                    solver_premises = list(premises) + background_constraints
-                    if sample.task_type == "three_class":
-                        new_verdict, new_model_info, new_model_info_q = (
-                            self.solver.check_entailment_three_class(solver_premises, q)
-                        )
+                        solver_premises = list(premises) + background_constraints
+                        if sample.task_type == "three_class":
+                            new_verdict, new_model_info, new_model_info_q = (
+                                self.solver.check_entailment_three_class(solver_premises, q)
+                            )
+                        else:
+                            new_verdict, new_model_info = self.solver.check_entailment(
+                                solver_premises, q
+                            )
+                            new_model_info_q = None
+
+                        # Unknown guard
+                        new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                        old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                        if new_is_unknown and not old_is_unknown:
+                            for _ in accepted_gap_bridges:
+                                if background_constraints:
+                                    background_constraints.pop()
+                            logger.warning(
+                                "Pipeline sample=%s round=%d: gap bridge degraded "
+                                "solver to Unknown; reverted",
+                                sample.id, round_num,
+                            )
+                        else:
+                            _gap_committed = accepted_gap_bridges
+                            old_verdict_for_log = verdict
+                            verdict = new_verdict
+                            model_info = new_model_info
+                            model_info_q = new_model_info_q
+                            round_record.verdict_after = new_verdict
+                            round_record.repair_success = True
+
+                            bridge_notes = [
+                                f"# Gap bridge axiom: {str(b)}"
+                                for b in accepted_gap_bridges
+                            ]
+                            updated_code = (
+                                p1.raw_code.rstrip()
+                                + "\n\n# ---- Gap analysis bridges (round "
+                                + str(round_num) + ") ----\n"
+                                + "\n".join(bridge_notes)
+                            )
+                            p1 = _patched_p1(
+                                p1, premises, q, new_verdict, new_model_info,
+                                new_model_info_q, raw_code=updated_code,
+                                background_constraints=list(background_constraints),
+                            )
+                            logger.info(
+                                "Pipeline sample=%s round=%d: %d gap bridge(s) "
+                                "committed, verdict %s→%s",
+                                sample.id, round_num,
+                                len(accepted_gap_bridges), old_verdict_for_log, verdict,
+                            )
                     else:
-                        new_verdict, new_model_info = self.solver.check_entailment(
-                            solver_premises, q
-                        )
-                        new_model_info_q = None
-
-                    # Unknown guard
-                    new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
-                    old_is_unknown = (verdict == VERDICT_UNKNOWN)
-                    if new_is_unknown and not old_is_unknown:
-                        for _ in accepted_gap_bridges:
-                            if background_constraints:
-                                background_constraints.pop()
-                        logger.warning(
-                            "Pipeline sample=%s round=%d: gap bridge degraded "
-                            "solver to Unknown; reverted",
-                            sample.id, round_num,
-                        )
-                    else:
-                        _gap_committed = accepted_gap_bridges
-                        old_verdict_for_log = verdict
-                        verdict = new_verdict
-                        model_info = new_model_info
-                        model_info_q = new_model_info_q
-                        round_record.verdict_after = new_verdict
-                        round_record.repair_success = True
-
-                        bridge_notes = [
-                            f"# Gap bridge axiom: {str(b)}"
-                            for b in accepted_gap_bridges
-                        ]
-                        updated_code = (
-                            p1.raw_code.rstrip()
-                            + "\n\n# ---- Gap analysis bridges (round "
-                            + str(round_num) + ") ----\n"
-                            + "\n".join(bridge_notes)
-                        )
-                        p1 = _patched_p1(
-                            p1, premises, q, new_verdict, new_model_info,
-                            new_model_info_q, raw_code=updated_code,
-                            background_constraints=list(background_constraints),
-                        )
                         logger.info(
-                            "Pipeline sample=%s round=%d: %d gap bridge(s) "
-                            "committed, verdict %s→%s",
+                            "Pipeline sample=%s round=%d: no gap bridge reduced obligations; no commit",
                             sample.id, round_num,
-                            len(accepted_gap_bridges), old_verdict_for_log, verdict,
                         )
 
                 self._write_json(
@@ -683,6 +799,85 @@ class CGBVPipeline:
                         m for m in round_record.mismatches
                         if not m.get("is_phase3_error", False)
                     ]
+                    semantic_audit = await audit_semantic_stability(
+                        sentences=sentences,
+                        premises=premises,
+                        q=q,
+                        namespace=namespace,
+                        raw_code=p1.raw_code,
+                        witness_results=mw.witness_results,
+                        llm=self.llm,
+                        prompt_engine=self.prompt_engine,
+                    )
+                    self._write_json(
+                        out_dir / f"round{round_num}_semantic_audit.json",
+                        _semantic_audit_to_dict(semantic_audit),
+                    )
+                    if not semantic_audit.stable:
+                        logger.warning(
+                            "Pipeline sample=%s round=%d: semantic stability audit "
+                            "flagged %d issue(s) after re-grounding; triggering targeted re-formalization",
+                            sample.id, round_num, len(semantic_audit.issues),
+                        )
+                        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
+                        p1_new = await run_phase1_targeted(
+                            original_code=p1.raw_code,
+                            failed_repairs=[
+                                (issue, "Semantic stability audit diverged on the current witness bank.")
+                                for issue in semantic_audit.issues
+                            ],
+                            premises_nl=sample.premises,
+                            conclusion_nl=sample.conclusion,
+                            llm=self.llm,
+                            solver=self.solver,
+                            prompt_engine=self.prompt_engine,
+                            task_type=sample.task_type,
+                            code_exec_timeout=self.config.pipeline.code_exec_timeout,
+                            world_assumption=self.config.pipeline.world_assumption,
+                            max_retries=self.config.pipeline.formalize_retries,
+                        )
+                        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
+                            rounds.append(round_record)
+                            final_gap = compute_gap_analysis(premises, q, [], background_constraints)
+                            result = PipelineResult(
+                                sample_id=sample.id,
+                                dataset=sample.dataset,
+                                label=sample.label,
+                                verdict=verdict,
+                                verdict_pre_bridge=verdict_pre_bridge,
+                                verdict_post_bridge=verdict_post_bridge,
+                                verified=False,
+                                num_rounds=round_num,
+                                rounds=rounds,
+                                phase1_raw_code=p1.raw_code,
+                                phase1_repeated_failure=p1.repeated_failure,
+                                acceptance_state="needs_repair",
+                                diagnostic_tags=["semantic_unstable"],
+                                semantic_stable=False,
+                                initial_obligation_count=initial_obligation_count,
+                                final_obligation_count=final_gap.obligation_count,
+                                execution_status="success",
+                                verification_status="semantic_unstable",
+                                verification_confidence="low",
+                                error="Semantic stability audit rejected an otherwise clean witness bank.",
+                            )
+                            self._write_json(out_dir / "result.json", asdict(result))
+                            return result
+
+                        premises = list(p1_new.premises)
+                        q = p1_new.q
+                        background_constraints = list(p1_new.background_constraints)
+                        bound_var_names = p1_new.bound_var_names
+                        namespace = p1_new.namespace
+                        verdict = p1_new.verdict
+                        model_info = p1_new.model_info
+                        model_info_q = p1_new.model_info_q
+                        p1 = p1_new
+                        round_record.verdict_after = verdict
+                        rounds.append(round_record)
+                        continue
+
+                    final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
                         sample_id=sample.id,
@@ -695,6 +890,12 @@ class CGBVPipeline:
                         num_rounds=round_num,
                         rounds=rounds,
                         phase1_raw_code=p1.raw_code,
+                        phase1_repeated_failure=p1.repeated_failure,
+                        acceptance_state="accepted",
+                        diagnostic_tags=[],
+                        semantic_stable=True,
+                        initial_obligation_count=initial_obligation_count,
+                        final_obligation_count=final_gap.obligation_count,
                         execution_status="success",
                         verification_status="verified",
                         verification_confidence="high",
@@ -740,64 +941,72 @@ class CGBVPipeline:
 
                     _gap2_committed: list = []
                     if p5_gap2.bridge_axioms:
-                        accepted_gap2_bridges = _filter_consistent_bridges(
-                            list(p5_gap2.bridge_axioms),
-                            list(premises) + background_constraints,
+                        accepted_gap2_bridges = _filter_obligation_reducing_bridges(
+                            bridges=list(p5_gap2.bridge_axioms),
+                            premises=list(premises),
                             q=q,
+                            mismatches=[],
+                            background_constraints=list(background_constraints),
                         )
-                        background_constraints.extend(accepted_gap2_bridges)
+                        if accepted_gap2_bridges:
+                            background_constraints.extend(accepted_gap2_bridges)
 
-                        solver_premises = list(premises) + background_constraints
-                        if sample.task_type == "three_class":
-                            new_verdict, new_model_info, new_model_info_q = (
-                                self.solver.check_entailment_three_class(solver_premises, q)
-                            )
+                            solver_premises = list(premises) + background_constraints
+                            if sample.task_type == "three_class":
+                                new_verdict, new_model_info, new_model_info_q = (
+                                    self.solver.check_entailment_three_class(solver_premises, q)
+                                )
+                            else:
+                                new_verdict, new_model_info = self.solver.check_entailment(
+                                    solver_premises, q
+                                )
+                                new_model_info_q = None
+
+                            new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
+                            old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                            if new_is_unknown and not old_is_unknown:
+                                for _ in accepted_gap2_bridges:
+                                    if background_constraints:
+                                        background_constraints.pop()
+                                logger.warning(
+                                    "Pipeline sample=%s round=%d: post-Phase4 gap bridge "
+                                    "degraded solver to Unknown; reverted",
+                                    sample.id, round_num,
+                                )
+                            else:
+                                _gap2_committed = accepted_gap2_bridges
+                                old_verdict_for_log = verdict
+                                verdict = new_verdict
+                                model_info = new_model_info
+                                model_info_q = new_model_info_q
+                                round_record.verdict_after = new_verdict
+                                round_record.repair_success = True
+
+                                bridge_notes = [
+                                    f"# Gap bridge axiom (post-Phase4): {str(b)}"
+                                    for b in accepted_gap2_bridges
+                                ]
+                                updated_code = (
+                                    p1.raw_code.rstrip()
+                                    + "\n\n# ---- Gap analysis bridges (round "
+                                    + str(round_num) + ") ----\n"
+                                    + "\n".join(bridge_notes)
+                                )
+                                p1 = _patched_p1(
+                                    p1, premises, q, new_verdict, new_model_info,
+                                    new_model_info_q, raw_code=updated_code,
+                                    background_constraints=list(background_constraints),
+                                )
+                                logger.info(
+                                    "Pipeline sample=%s round=%d: %d post-Phase4 gap "
+                                    "bridge(s) committed, verdict %s→%s",
+                                    sample.id, round_num,
+                                    len(accepted_gap2_bridges), old_verdict_for_log, verdict,
+                                )
                         else:
-                            new_verdict, new_model_info = self.solver.check_entailment(
-                                solver_premises, q
-                            )
-                            new_model_info_q = None
-
-                        new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
-                        old_is_unknown = (verdict == VERDICT_UNKNOWN)
-                        if new_is_unknown and not old_is_unknown:
-                            for _ in accepted_gap2_bridges:
-                                if background_constraints:
-                                    background_constraints.pop()
-                            logger.warning(
-                                "Pipeline sample=%s round=%d: post-Phase4 gap bridge "
-                                "degraded solver to Unknown; reverted",
-                                sample.id, round_num,
-                            )
-                        else:
-                            _gap2_committed = accepted_gap2_bridges
-                            old_verdict_for_log = verdict
-                            verdict = new_verdict
-                            model_info = new_model_info
-                            model_info_q = new_model_info_q
-                            round_record.verdict_after = new_verdict
-                            round_record.repair_success = True
-
-                            bridge_notes = [
-                                f"# Gap bridge axiom (post-Phase4): {str(b)}"
-                                for b in accepted_gap2_bridges
-                            ]
-                            updated_code = (
-                                p1.raw_code.rstrip()
-                                + "\n\n# ---- Gap analysis bridges (round "
-                                + str(round_num) + ") ----\n"
-                                + "\n".join(bridge_notes)
-                            )
-                            p1 = _patched_p1(
-                                p1, premises, q, new_verdict, new_model_info,
-                                new_model_info_q, raw_code=updated_code,
-                                background_constraints=list(background_constraints),
-                            )
                             logger.info(
-                                "Pipeline sample=%s round=%d: %d post-Phase4 gap "
-                                "bridge(s) committed, verdict %s→%s",
+                                "Pipeline sample=%s round=%d: no post-Phase4 gap bridge reduced obligations; no commit",
                                 sample.id, round_num,
-                                len(accepted_gap2_bridges), old_verdict_for_log, verdict,
                             )
 
                     self._write_json(
@@ -868,28 +1077,29 @@ class CGBVPipeline:
                     premises = p5.repaired_premises
                     q = p5.repaired_q
 
-                    # Per-bridge filter: only commit bridges that contradict at
-                    # least one mismatch witness.  Bridges that don't eliminate
-                    # any problematic world stay out of background_constraints
-                    # and out of raw_code, so they can't piggyback on formula
-                    # repairs or pollute future prompt context.
-                    accepted_bridges = _filter_helpful_bridges(
-                        p5.bridge_axioms, actionable_mismatches,
-                        witness_models, carried_mismatch_models,
+                    # Per-bridge filter: only commit bridges that strictly reduce
+                    # unresolved obligations. Bridges that don't improve theory
+                    # adequacy stay out of background_constraints and raw_code.
+                    accepted_bridges = _filter_obligation_reducing_bridges(
+                        bridges=list(p5.bridge_axioms),
+                        premises=list(premises),
+                        q=q,
+                        mismatches=actionable_mismatches,
+                        background_constraints=list(background_constraints),
                     ) if p5.bridge_axioms else []
                     n_stripped = len(p5.bridge_axioms) - len(accepted_bridges)
                     if accepted_bridges:
                         background_constraints.extend(accepted_bridges)
                         logger.info(
                             "Pipeline sample=%s round=%d: %d/%d bridge(s) accepted "
-                            "(%d stripped — no witness contradiction)",
+                            "(%d stripped — no obligation reduction)",
                             sample.id, round_num,
                             len(accepted_bridges), len(p5.bridge_axioms), n_stripped,
                         )
                     elif p5.bridge_axioms:
                         logger.info(
                             "Pipeline sample=%s round=%d: all %d bridge(s) stripped "
-                            "(none contradict any mismatch witness)",
+                            "(no obligation reduction)",
                             sample.id, round_num, len(p5.bridge_axioms),
                         )
 
@@ -947,6 +1157,34 @@ class CGBVPipeline:
                                 f"violation set ({len(old_violation_keys)} → "
                                 f"{len(new_violation_keys)})"
                             )
+                        if reject_reason is None:
+                            changed_indices = [
+                                i for i, (old_f, new_f) in enumerate(
+                                    zip(list(old_premises) + [old_q], list(premises) + [q])
+                                )
+                                if str(old_f) != str(new_f)
+                            ]
+                            if changed_indices:
+                                semantic_audit = await audit_semantic_stability(
+                                    sentences=sentences,
+                                    premises=premises,
+                                    q=q,
+                                    namespace=namespace,
+                                    raw_code=p1.raw_code,
+                                    witness_results=mw.witness_results,
+                                    llm=self.llm,
+                                    prompt_engine=self.prompt_engine,
+                                    indices=changed_indices,
+                                )
+                                self._write_json(
+                                    out_dir / f"round{round_num}_semantic_audit.json",
+                                    _semantic_audit_to_dict(semantic_audit),
+                                )
+                                if not semantic_audit.stable:
+                                    reject_reason = (
+                                        "semantic stability audit rejected the candidate patch "
+                                        f"({len(semantic_audit.issues)} issue(s))"
+                                    )
 
                     if reject_reason is not None:
                         logger.warning(
@@ -1078,21 +1316,24 @@ class CGBVPipeline:
                             carried_mismatch_models,
                         )
                     )
-                    # Per-bridge filter: only commit bridges that contradict at
-                    # least one mismatch witness.  Unhelpful bridges stay out of
+                    # Per-bridge filter: only commit bridges that strictly reduce
+                    # unresolved obligations. Others stay out of
                     # background_constraints and raw_code entirely.
                     bridge_accepted = False
                     accepted_bridges_bo: list = []
                     if p5.bridge_axioms:
-                        accepted_bridges_bo = _filter_helpful_bridges(
-                            p5.bridge_axioms, actionable_mismatches,
-                            witness_models, carried_mismatch_models,
+                        accepted_bridges_bo = _filter_obligation_reducing_bridges(
+                            bridges=list(p5.bridge_axioms),
+                            premises=list(premises),
+                            q=q,
+                            mismatches=actionable_mismatches,
+                            background_constraints=list(background_constraints),
                         )
                         n_stripped_bo = len(p5.bridge_axioms) - len(accepted_bridges_bo)
                         if not accepted_bridges_bo:
                             logger.info(
                                 "Pipeline sample=%s round=%d: all %d bridge(s) stripped "
-                                "(none contradict any mismatch witness); no commit",
+                                "(no obligation reduction); no commit",
                                 sample.id, round_num, len(p5.bridge_axioms),
                             )
                         else:
@@ -1334,6 +1575,26 @@ class CGBVPipeline:
         else:
             _confidence = "none"
 
+        final_gap = compute_gap_analysis(
+            premises,
+            q,
+            [],
+            background_constraints,
+        )
+        diagnostic_tags: list[str] = []
+        if verdict == VERDICT_UNCERTAIN and final_gap.obligation_count > 0:
+            diagnostic_tags.append("underformalized")
+        if _final_verification_status == "witness_failed":
+            diagnostic_tags.append("witness_failed")
+        if open_issues:
+            diagnostic_tags.append("boundary_failed")
+        acceptance_state = (
+            "accepted"
+            if _final_verification_status == "verified"
+            and "underformalized" not in diagnostic_tags
+            else "needs_repair"
+        )
+
         result = PipelineResult(
             sample_id=sample.id,
             dataset=sample.dataset,
@@ -1345,6 +1606,12 @@ class CGBVPipeline:
             num_rounds=self.config.pipeline.r_max,
             rounds=rounds,
             phase1_raw_code=p1.raw_code,
+            phase1_repeated_failure=p1.repeated_failure,
+            acceptance_state=acceptance_state,
+            diagnostic_tags=diagnostic_tags,
+            semantic_stable=None,
+            initial_obligation_count=initial_obligation_count,
+            final_obligation_count=final_gap.obligation_count,
             execution_status="success",
             verification_status=_final_verification_status,
             verification_confidence=_confidence,
@@ -1374,6 +1641,7 @@ def _phase1_to_dict(p1: Phase1Result, sample: DataSample | None = None) -> dict:
         "verdict": p1.verdict,
         "verdict_pre_bridge": p1.verdict_pre_bridge,
         "raw_code": p1.raw_code,
+        "repeated_failure": p1.repeated_failure,
         "premises_nl": list(sample.premises) if sample is not None else None,
         "conclusion_nl": sample.conclusion if sample is not None else None,
         "num_premises_nl": len(sample.premises) if sample is not None else None,
@@ -1388,8 +1656,10 @@ def _phase1_to_dict(p1: Phase1Result, sample: DataSample | None = None) -> dict:
                 "messages": a.messages,
                 "raw_output": a.raw_output,
                 "code_exec_error": a.code_exec_error,
+                "validation_error": a.validation_error,
                 "solver_error": a.solver_error,
                 "verdict": a.verdict,
+                "diagnostic": a.diagnostic,
             }
             for a in p1.attempts
         ],
@@ -1545,103 +1815,87 @@ def _phase5_to_dict(p5: Phase5Result, accepted_bridges: list | None = None) -> d
     }
 
 
+def _semantic_audit_to_dict(audit: SemanticAuditResult) -> dict:
+    return {
+        "stable": audit.stable,
+        "checked_indices": list(audit.checked_indices),
+        "issues": [
+            {
+                "sentence_index": issue.sentence_index,
+                "nl_sentence": issue.nl_sentence,
+                "current_formula": issue.current_formula_str,
+                "audited_formula": issue.audited_formula_str,
+                "differing_witnesses": issue.differing_witnesses,
+                "error": issue.error,
+            }
+            for issue in audit.issues
+        ],
+    }
+
+
 def _json_default(obj):
     if isinstance(obj, tuple):
         return list(obj)
     return str(obj)
 
 
-def _bridge_eliminates_witness(
+def _filter_obligation_reducing_bridges(
+    *,
     bridges: list,
+    premises: list,
+    q: object,
     mismatches: list,
-    witness_models: dict[int, object],
-    carried_mismatch_models: dict[int, object] | None = None,
-) -> bool:
-    """Quick check: does any bridge axiom evaluate to False on any mismatch witness?
-
-    If a bridge contradicts a mismatch's witness model, that witness world is
-    eliminated under the enriched theory — the bridge is actively resolving a
-    problematic world.  This is O(bridges × mismatches) z3 model evaluations,
-    no solver calls.
-
-    For carried mismatches (from prior rounds), the witness model is looked up
-    by sentence_index in carried_mismatch_models rather than by witness_index
-    (which gets renumbered each round).
-    """
-    return bool(_filter_helpful_bridges(
-        bridges, mismatches, witness_models, carried_mismatch_models
-    ))
-
-
-def _filter_helpful_bridges(
-    bridges: list,
-    mismatches: list,
-    witness_models: dict[int, object],
-    carried_mismatch_models: dict[int, object] | None = None,
+    background_constraints: list,
 ) -> list:
-    """Return the subset of bridges that contradict at least one mismatch witness.
-
-    Evaluates each bridge individually against each mismatch's Z3 model.
-    A bridge is 'helpful' iff it evaluates to False on some witness world,
-    meaning it eliminates that problematic world under the enriched theory.
-    Bridges that don't contradict any witness are neither committed to
-    background_constraints nor annotated in raw_code.
     """
-    import z3
-    carried = carried_mismatch_models or {}
-    helpful = []
-    for bridge in bridges:
-        for m in mismatches:
-            wm = carried.get(m.sentence_index) or witness_models.get(m.witness_index)
-            if wm is None:
-                continue
-            try:
-                if z3.is_false(wm.evaluate(bridge)):
-                    helpful.append(bridge)
-                    break
-            except Exception:
-                pass
-    return helpful
+    Greedily accept bridges that strictly reduce unresolved query-relevant obligations.
 
-
-def _filter_consistent_bridges(
-    bridges: list,
-    existing_premises: list,
-    q: object = None,
-) -> list:
-    """Return only bridges consistent with existing_premises and not entailing q.
-
-    A bridge is rejected if:
-    - Adding it makes existing_premises UNSAT (ex falso quodlibet)
-    - Adding it makes premises ∪ {bridge} ⊨ q (conclusion injection)
+    This keeps bridge selection tied to theory adequacy rather than to the current
+    witness geometry. Consistency is still enforced first to avoid UNSAT bridges.
     """
-    import z3
-    consistent = []
+    accepted: list = []
+    current_bg = list(background_constraints)
+    current_gap = compute_gap_analysis(premises, q, mismatches, current_bg)
+    current_score = current_gap.obligation_count
+
     for bridge in bridges:
-        s_test = z3.Solver()
-        for p in existing_premises:
-            s_test.add(p)
-        s_test.add(bridge)
-        if s_test.check() == z3.unsat:
-            logger.warning(
-                "Gap analysis bridge rejected (inconsistent with premises): %.80s",
+        if not _is_bridge_consistent(bridge, list(premises) + current_bg):
+            continue
+        trial_bg = current_bg + [bridge]
+        trial_gap = compute_gap_analysis(premises, q, mismatches, trial_bg)
+        if trial_gap.obligation_count < current_score:
+            accepted.append(bridge)
+            current_bg = trial_bg
+            current_score = trial_gap.obligation_count
+            logger.info(
+                "Accepted bridge by obligation reduction: %d -> %d",
+                current_gap.obligation_count, trial_gap.obligation_count,
+            )
+            current_gap = trial_gap
+        else:
+            logger.info(
+                "Rejected bridge without obligation reduction: %.80s",
                 str(bridge),
             )
-            continue
-        if q is not None:
-            s_entail = z3.Solver()
-            for p in existing_premises:
-                s_entail.add(p)
-            s_entail.add(bridge)
-            s_entail.add(z3.Not(q))
-            if s_entail.check() == z3.unsat:
-                logger.warning(
-                    "Gap analysis bridge rejected (entails conclusion): %.80s",
-                    str(bridge),
-                )
-                continue
-        consistent.append(bridge)
-    return consistent
+    return accepted
+
+
+def _is_bridge_consistent(
+    bridge: object,
+    existing_premises: list,
+) -> bool:
+    import z3
+    s_test = z3.Solver()
+    for p in existing_premises:
+        s_test.add(p)
+    s_test.add(bridge)
+    if s_test.check() == z3.unsat:
+        logger.warning(
+            "Bridge rejected (inconsistent with premises): %.80s",
+            str(bridge),
+        )
+        return False
+    return True
 
 
 def _witness_eliminated_by_bridges(bridges: list, model: Any | None) -> bool:
@@ -1831,5 +2085,6 @@ def _patched_p1(
         raw_code=raw_code if raw_code is not None else p1.raw_code,
         verdict_pre_bridge=p1.verdict_pre_bridge,  # preserve original pre-bridge snapshot
         attempts=p1.attempts,
+        repeated_failure=p1.repeated_failure,
         error=None,
     )

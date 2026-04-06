@@ -1,0 +1,30 @@
+You are independently auditing whether a Z3 formula faithfully expresses one natural-language sentence.
+
+Use ONLY identifiers already declared in the code below. Do NOT invent new predicates, constants, sorts,
+or bound variables.
+
+## Frozen Symbol Table
+
+```python
+{{ raw_code }}
+```
+
+## Sentence To Audit
+
+- Role: {{ sentence_role }}
+- Sentence index: {{ sentence_index }}
+- NL sentence: "{{ nl_sentence }}"
+- Current formula: `{{ current_formula }}`
+
+## Task
+
+Decide whether the current formula already captures the sentence faithfully under the frozen symbol table.
+
+- If the current formula is already faithful, output `MATCH`.
+- Otherwise, output ONE corrected Z3 boolean expression that better matches the sentence.
+
+## Output Rules
+
+1. Output ONLY `MATCH` or one Z3 boolean expression.
+2. Use ONLY identifiers already declared in the code above.
+3. Do NOT add imports, assignments, comments, markdown fences, or prose.

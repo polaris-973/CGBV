@@ -12,6 +12,22 @@ def _split_context(context: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
+def _answer_to_label(answer: str, options: list[str]) -> str:
+    """Convert answer letter (A/B/C) to label string.
+
+    ProverQA options are always ["A) True", "B) False", "C) Uncertain"],
+    so A→true, B→false, C→uncertain.
+    """
+    idx = ord(answer.upper()) - ord('A')
+    if 0 <= idx < len(options):
+        option_text = options[idx]
+        # Extract "True", "False", or "Uncertain" from "A) True"
+        match = re.search(r'\)\s*(\w+)', option_text)
+        if match:
+            return match.group(1).lower()
+    return answer.lower()
+
+
 def load(dataset_path: str, split: str, limit: int | None = None) -> list[DataSample]:
     # ProverQA has easy/medium/hard splits
     split_map = {
@@ -32,14 +48,16 @@ def load(dataset_path: str, split: str, limit: int | None = None) -> list[DataSa
         premises = _split_context(raw.get("context", ""))
         conclusion = raw.get("question", "").strip()
         options = raw.get("options", [])
-        label = raw.get("answer", "A")
+        answer = raw.get("answer", "A")
+        # Convert A/B/C to true/false/uncertain
+        label = _answer_to_label(answer, options)
         samples.append(DataSample(
-            id=raw.get("id", str(len(samples))),
+            id=str(raw.get("id", len(samples))),
             dataset="proverqa",
             premises=premises,
             conclusion=conclusion,
             label=label,
-            task_type="multi_choice",
+            task_type="three_class",  # ProverQA is three-class, not multi-choice
             options=options,
         ))
         if limit and len(samples) >= limit:

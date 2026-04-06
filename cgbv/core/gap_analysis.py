@@ -240,9 +240,14 @@ def get_connected_predicates(
 class GapAnalysisResult:
     """Structured gap analysis for Phase 5 repair prompt injection."""
     ungrounded_predicates: set[str] = field(default_factory=set)
+    relevant_ungrounded_predicates: set[str] = field(default_factory=set)
     disconnected_premise_indices: list[int] = field(default_factory=list)
+    query_relevant_predicates: set[str] = field(default_factory=set)
+    query_relevant_premise_indices: list[int] = field(default_factory=list)
     predicate_graph: dict[str, set[str]] = field(default_factory=dict)
     missing_links: list[tuple[str, str]] = field(default_factory=list)
+    obligation_hints: list[str] = field(default_factory=list)
+    obligation_count: int = 0
 
 
 def _build_predicate_graph(premises: list[z3.ExprRef], q: z3.ExprRef) -> dict[str, set[str]]:
@@ -334,6 +339,21 @@ def compute_gap_analysis(
     # Build predicate graph (includes background constraints for bridge visibility)
     graph = _build_predicate_graph(all_formulas, q)
 
+    # Query-relevant predicate slice: predicates reachable from the conclusion.
+    query_relevant_preds: set[str] = set(extract_predicate_names(q))
+    frontier = list(query_relevant_preds)
+    while frontier:
+        cur = frontier.pop()
+        for nb in graph.get(cur, set()):
+            if nb not in query_relevant_preds:
+                query_relevant_preds.add(nb)
+                frontier.append(nb)
+
+    query_relevant_premise_indices = [
+        i for i, ps in enumerate(pred_sets[:len(premises)])
+        if ps & query_relevant_preds
+    ]
+
     # Find missing links: scope to predicates relevant to current mismatches.
     # Only compute for ungrounded preds in the mismatch formula or 1-hop away,
     # avoiding noisy global BFS suggestions for unrelated predicates.
@@ -366,9 +386,24 @@ def compute_gap_analysis(
         if closest and closest != pred:
             missing_links.append((closest, pred))
 
+    obligation_hints: list[str] = []
+    for idx in disconnected:
+        obligation_hints.append(
+            f"premise[{idx}] is outside the current query-relevant slice"
+        )
+    for pred in sorted(relevant_ungrounded - bg_antecedent_preds):
+        obligation_hints.append(
+            f"predicate `{pred}` is required by a query-relevant rule but lacks grounding/derivation"
+        )
+
     return GapAnalysisResult(
         ungrounded_predicates=ungrounded,
+        relevant_ungrounded_predicates=(relevant_ungrounded - bg_antecedent_preds),
         disconnected_premise_indices=disconnected,
+        query_relevant_predicates=query_relevant_preds,
+        query_relevant_premise_indices=query_relevant_premise_indices,
         predicate_graph=graph,
         missing_links=missing_links,
+        obligation_hints=obligation_hints,
+        obligation_count=len(disconnected) + len(relevant_ungrounded - bg_antecedent_preds),
     )

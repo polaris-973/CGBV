@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import ast
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -20,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class Phase1Diagnostic:
+    """Best-effort structural diagnosis for a failed Phase 1 attempt."""
+    raw_error: str = ""
+    failure_stage: str = ""  # exec | validation | solver
+    source_slots: list[str] = field(default_factory=list)
+    offending_symbols: list[str] = field(default_factory=list)
+    preserve_constraints: list[str] = field(default_factory=list)
+    forbidden_patterns: list[str] = field(default_factory=list)
+    attempt_fingerprint: str = ""
+
+
+@dataclass
 class Phase1Attempt:
     """One Phase 1 LLM attempt, including retry context and failure mode."""
     attempt_num: int
@@ -29,6 +42,7 @@ class Phase1Attempt:
     validation_error: str | None = None
     solver_error: str | None = None
     verdict: str | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 @dataclass
@@ -46,6 +60,7 @@ class Phase1Result:
     raw_code: str                      # the generated Z3 code
     verdict_pre_bridge: str = ""       # verdict before Phase 1.5 bridge repair (empty = no bridge ran)
     attempts: list[Phase1Attempt] = field(default_factory=list)
+    repeated_failure: bool = False     # True iff compile/validation failure repeated structurally
     error: str | None = None           # set if all retries failed
 
 
@@ -80,8 +95,11 @@ async def run_phase1(
     last_error: str | None = None
     last_validation_feedback: list[str] = []
     last_name_error_hint: str | None = None   # specific spelling-error diagnosis for retry
+    last_diagnostic = Phase1Diagnostic()
     raw_code = ""
     attempts: list[Phase1Attempt] = []
+    failure_fingerprints: list[str] = []
+    repeated_failure_detected = False
     _vacuous_check_done: bool = False       # fire vacuous-model check at most once
 
     for attempt in range(max_retries):
@@ -95,6 +113,8 @@ async def run_phase1(
                     last_error=last_error or "Unknown error",
                     validation_feedback=last_validation_feedback,
                     name_error_hint=last_name_error_hint,
+                    diagnostic=last_diagnostic,
+                    repeated_failure=repeated_failure_detected,
                     attempt_num=attempt + 1,
                     max_retries=max_retries,
                     prompt_engine=prompt_engine,
@@ -123,6 +143,21 @@ async def run_phase1(
             if last_name_error_hint is None:
                 last_name_error_hint = build_runtime_error_hint(raw_code, last_error)
             attempt_record.code_exec_error = last_error
+            last_diagnostic = _build_phase1_diagnostic(
+                raw_code=raw_code,
+                failure_stage="exec",
+                raw_error=last_error,
+                validation_feedback=[],
+                name_error_hint=last_name_error_hint,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
+            )
+            repeated_failure_detected = bool(
+                failure_fingerprints
+                and failure_fingerprints[-1] == last_diagnostic.attempt_fingerprint
+            )
+            failure_fingerprints.append(last_diagnostic.attempt_fingerprint)
+            attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
             attempts.append(attempt_record)
             logger.warning(
                 "Phase 1 attempt %d/%d: code execution error: %s",
@@ -135,6 +170,21 @@ async def run_phase1(
         if validation_result:
             last_error, last_validation_feedback = validation_result
             attempt_record.validation_error = last_error
+            last_diagnostic = _build_phase1_diagnostic(
+                raw_code=raw_code,
+                failure_stage="validation",
+                raw_error=last_error,
+                validation_feedback=last_validation_feedback,
+                name_error_hint=last_name_error_hint,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
+            )
+            repeated_failure_detected = bool(
+                failure_fingerprints
+                and failure_fingerprints[-1] == last_diagnostic.attempt_fingerprint
+            )
+            failure_fingerprints.append(last_diagnostic.attempt_fingerprint)
+            attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
             attempts.append(attempt_record)
             logger.warning(
                 "Phase 1 attempt %d/%d: %s", attempt + 1, max_retries, last_error
@@ -179,6 +229,21 @@ async def run_phase1(
             last_error = str(e)
             last_validation_feedback = []
             attempt_record.solver_error = last_error
+            last_diagnostic = _build_phase1_diagnostic(
+                raw_code=raw_code,
+                failure_stage="solver",
+                raw_error=last_error,
+                validation_feedback=[],
+                name_error_hint=last_name_error_hint,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
+            )
+            repeated_failure_detected = bool(
+                failure_fingerprints
+                and failure_fingerprints[-1] == last_diagnostic.attempt_fingerprint
+            )
+            failure_fingerprints.append(last_diagnostic.attempt_fingerprint)
+            attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
             attempts.append(attempt_record)
             logger.warning(
                 "Phase 1 attempt %d/%d: solver error: %s", attempt + 1, max_retries, e
@@ -265,6 +330,7 @@ async def run_phase1(
             raw_code=ctx["raw_code"],
             verdict_pre_bridge=verdict,           # snapshot before Phase 1.5 may change verdict
             attempts=attempts,
+            repeated_failure=repeated_failure_detected or _has_repeated_phase1_failure(attempts),
         )
 
         # Phase 1.5: predicate connectivity bridge check (only for non-Entailed)
@@ -305,6 +371,7 @@ async def run_phase1(
         namespace={},
         raw_code=raw_code,
         attempts=attempts,
+        repeated_failure=repeated_failure_detected or _has_repeated_phase1_failure(attempts),
         error=f"Phase 1 failed after {max_retries} attempts. Last error: {last_error}",
     )
 
@@ -437,6 +504,7 @@ async def _run_bridge_check(
         raw_code=updated_raw_code,
         verdict_pre_bridge=result.verdict_pre_bridge,  # preserve original pre-bridge snapshot
         attempts=result.attempts,
+        repeated_failure=result.repeated_failure,
         error=None,
     )
 
@@ -588,30 +656,6 @@ async def _repair_bridge_premise(
                 )
                 continue
 
-            # Anti-entailment gate: reject axioms where premises ∪ {bridge} ⊨ q.
-            # A bridge that directly proves the conclusion is false premise injection —
-            # it would force a Entailed verdict even when the premises alone are Uncertain.
-            s_entail = z3.Solver()
-            for p in all_premises:
-                s_entail.add(p)
-            s_entail.add(formula)
-            s_entail.add(z3.Not(q))
-            if s_entail.check() == z3.unsat:
-                _rejected_bridge_str = str(formula)
-                _rejected_bridge_reason = "entails_conclusion"
-                _consistency_rejected = True
-                last_error = (
-                    f"ENTAILMENT GATE: bridge `{formula}` + existing premises directly "
-                    f"entails the conclusion `{q}`. This is conclusion injection — "
-                    f"generate a bridge that does NOT prove the conclusion."
-                )
-                logger.warning(
-                    "Phase 1.5 idx=%d attempt %d: anti-entailment gate REJECTED "
-                    "(bridge proves conclusion): %.80s",
-                    idx, attempt + 1, str(formula),
-                )
-                continue
-
         return formula
 
     return None
@@ -756,7 +800,7 @@ async def _run_canonicalization(
 
 async def run_phase1_targeted(
     original_code: str,
-    failed_repairs: list[tuple[Mismatch, str | None]],
+    failed_repairs: list[tuple[Any, str | None]],
     premises_nl: list[str],
     conclusion_nl: str,
     llm: LLMClient,
@@ -796,13 +840,13 @@ async def run_phase1_targeted(
     mismatch_data = []
     for m, repair_error in failed_repairs:
         mismatch_data.append({
-            "sentence_index": m.sentence_index,
-            "nl_sentence": m.nl_sentence,
-            "mismatch_type": m.mismatch_type,
-            "fol_truth": m.fol_truth,
-            "grounded_truth": m.grounded_truth,
-            "fol_formula": m.fol_formula_str,
-            "grounded_formula": m.grounded_formula,
+            "sentence_index": getattr(m, "sentence_index", -1),
+            "nl_sentence": getattr(m, "nl_sentence", ""),
+            "mismatch_type": getattr(m, "mismatch_type", "semantic_drift"),
+            "fol_truth": getattr(m, "fol_truth", None),
+            "grounded_truth": getattr(m, "grounded_truth", None),
+            "fol_formula": getattr(m, "fol_formula_str", getattr(m, "current_formula_str", "")),
+            "grounded_formula": getattr(m, "grounded_formula", getattr(m, "audited_formula_str", "")),
             "repair_error": repair_error,
         })
 
@@ -906,6 +950,7 @@ async def run_phase1_targeted(
             raw_code=ctx["raw_code"],
             verdict_pre_bridge="",  # not applicable for re-formalization
             attempts=[],
+            repeated_failure=False,
         )
 
     logger.warning(
@@ -945,6 +990,8 @@ def _build_retry_message(
     max_retries: int,
     prompt_engine: PromptEngine,
     name_error_hint: str | None = None,
+    diagnostic: Phase1Diagnostic | None = None,
+    repeated_failure: bool = False,
 ) -> dict[str, str]:
     user_content = prompt_engine.render(
         "phase1_retry.j2",
@@ -954,6 +1001,8 @@ def _build_retry_message(
         last_error=last_error,
         validation_feedback=validation_feedback,
         name_error_hint=name_error_hint,
+        diagnostic=_diagnostic_to_dict(diagnostic),
+        repeated_failure=repeated_failure,
         attempt_num=attempt_num,
         max_retries=max_retries,
     )
@@ -1293,6 +1342,132 @@ def _check_model_vacuousness(
         return False, []   # couldn't evaluate any target predicate
 
     return len(always_false) == len(checked), always_false
+
+
+# ---------------------------------------------------------------------------
+# Retry diagnostics
+# ---------------------------------------------------------------------------
+
+def _build_phase1_diagnostic(
+    raw_code: str,
+    failure_stage: str,
+    raw_error: str,
+    validation_feedback: list[str],
+    name_error_hint: str | None,
+    premises_nl: list[str],
+    conclusion_nl: str,
+) -> Phase1Diagnostic:
+    """
+    Build a best-effort retry contract for Phase 1 failures.
+
+    This is intentionally soft-structured: only `failure_stage` is mandatory.
+    All other fields may be empty when the error text offers no reliable signal.
+    """
+    source_slots: list[str] = []
+    offending_symbols: list[str] = []
+    forbidden_patterns: list[str] = []
+
+    err = raw_error or ""
+    if re.search(r"premises\[(\d+)\]", err):
+        source_slots.extend(
+            f"premises[{m}]"
+            for m in re.findall(r"premises\[(\d+)\]", err)
+        )
+    if "`q`" in err or re.search(r"\bq\b", err):
+        source_slots.append("q")
+    if "premises must contain exactly one top-level formula" in err:
+        source_slots.append("premises")
+
+    offending_symbols.extend(re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", name_error_hint or ""))
+    m_name = re.search(r"name '(\w+)' is not defined", err)
+    if m_name:
+        offending_symbols.append(m_name.group(1))
+
+    err_lower = err.lower()
+    if "sort mismatch" in err_lower:
+        forbidden_patterns.append("Do not use Bool predicates as values inside equality/comparison predicates.")
+    if "literal boolean" in err_lower or "raw python boolean" in err_lower:
+        forbidden_patterns.append("Do not place literal True/False inside premises or q.")
+    if "exactly one top-level formula" in err_lower:
+        forbidden_patterns.append("Do not change the number of top-level formulas in premises.")
+    if "not a z3 boolean formula" in err_lower:
+        forbidden_patterns.append("Every premise entry and q must evaluate to a BoolRef.")
+    if "tautolog" in err_lower:
+        forbidden_patterns.append("Do not collapse a numbered premise into a tautology or empty semantic shell.")
+
+    preserve_constraints = [
+        f"Keep exactly {len(premises_nl)} top-level formulas in `premises`, in NL order.",
+        f"Keep `q` aligned with the same conclusion sentence: {conclusion_nl}",
+        "Preserve valid declarations, constants, sorts, and predicates unless the error proves one is wrong.",
+        "Reuse the existing symbol table whenever possible; do not rename working identifiers.",
+    ]
+    preserve_constraints.extend(validation_feedback[:3])
+
+    fingerprint = _fingerprint_phase1_attempt(
+        raw_code=raw_code,
+        failure_stage=failure_stage,
+        raw_error=raw_error,
+        source_slots=source_slots,
+    )
+
+    return Phase1Diagnostic(
+        raw_error=raw_error,
+        failure_stage=failure_stage,
+        source_slots=sorted(set(source_slots)),
+        offending_symbols=sorted(set(offending_symbols)),
+        preserve_constraints=preserve_constraints,
+        forbidden_patterns=forbidden_patterns,
+        attempt_fingerprint=fingerprint,
+    )
+
+
+def _fingerprint_phase1_attempt(
+    raw_code: str,
+    failure_stage: str,
+    raw_error: str,
+    source_slots: list[str],
+) -> str:
+    """Return a stable-ish fingerprint for repeated structural failures."""
+    code_key = raw_code.strip()
+    try:
+        tree = ast.parse(_normalise_code_for_prompt(raw_code))
+        code_key = ast.dump(tree, annotate_fields=False, include_attributes=False)
+    except Exception:
+        code_key = re.sub(r"\s+", " ", code_key)
+    error_key = re.sub(r"\s+", " ", (raw_error or "").strip().lower())
+    error_key = re.sub(r"`[^`]+`", "`sym`", error_key)
+    return "|".join([
+        failure_stage,
+        ",".join(sorted(source_slots)),
+        error_key[:240],
+        code_key[:1200],
+    ])
+
+
+def _diagnostic_to_dict(diagnostic: Phase1Diagnostic | None) -> dict[str, Any] | None:
+    if diagnostic is None:
+        return None
+    return {
+        "raw_error": diagnostic.raw_error,
+        "failure_stage": diagnostic.failure_stage,
+        "source_slots": list(diagnostic.source_slots),
+        "offending_symbols": list(diagnostic.offending_symbols),
+        "preserve_constraints": list(diagnostic.preserve_constraints),
+        "forbidden_patterns": list(diagnostic.forbidden_patterns),
+        "attempt_fingerprint": diagnostic.attempt_fingerprint,
+    }
+
+
+def _has_repeated_phase1_failure(attempts: list[Phase1Attempt]) -> bool:
+    fingerprints = [
+        (a.diagnostic or {}).get("attempt_fingerprint", "")
+        for a in attempts
+        if a.diagnostic
+    ]
+    return any(
+        fingerprints[i] and fingerprints[i] == fingerprints[i - 1]
+        for i in range(1, len(fingerprints))
+    )
 
 
 # ---------------------------------------------------------------------------

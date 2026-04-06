@@ -18,6 +18,7 @@ _METRIC_LABELS = {
     "uncertain_recall": "Uncertain Recall",
     "verification_precision": "Verification Precision",
     "verification_coverage": "Verification Coverage",
+    "verified_uncertain_precision": "Verified Uncertain Precision",
     "mismatch_detection_precision": "Mismatch Detection Precision",
     "mismatch_detection_recall": "Mismatch Detection Recall",
     "repair_round_commit_rate": "Repair Round Commit Rate",
@@ -26,6 +27,10 @@ _METRIC_LABELS = {
     "repair_regression_rate": "Repair Regression Rate",
     "cgbv_repair_recovery_rate": "CGBV Repair Recovery Rate",
     "phase3_reground_rate": "Phase 3 Re-grounding Resolution Rate",
+    "underformalized_rate": "Underformalized Rate",
+    "semantic_instability_rate": "Semantic Instability Rate",
+    "phase1_repeat_failure_rate": "Phase 1 Repeat Failure Rate",
+    "obligation_resolution_rate": "Obligation Resolution Rate",
 }
 
 
@@ -115,6 +120,18 @@ def write_report(
                 f"- Error samples ({sample_id_audit.get('error_count', 0)}): "
                 f"{', '.join(sample_id_audit.get('error_sample_ids', [])) or '-'}\n"
             )
+            error_details = sample_id_audit.get("error_details", [])
+            if error_details:
+                f.write("\n### Error Details\n\n")
+                for item in error_details:
+                    tags = ", ".join(item.get("diagnostic_tags", [])) or "-"
+                    err = item.get("error") or "-"
+                    f.write(
+                        f"- {item.get('sample_id', '-')}: "
+                        f"status={item.get('execution_status', '-')}, "
+                        f"acceptance={item.get('acceptance_state', '-')}, "
+                        f"tags={tags}, error={err}\n"
+                    )
             f.write(
                 f"- Reasoning-error samples ({sample_id_audit.get('reasoning_error_count', 0)}): "
                 f"{', '.join(sample_id_audit.get('reasoning_error_sample_ids', [])) or '-'}\n"

@@ -23,19 +23,6 @@ the conclusion — the proof chain is broken.
 {% if retry_context %}
 ## Previous Bridge Rejected
 
-{% if retry_context.reason == "entails_conclusion" %}
-Your previous bridge was rejected because it **directly proves the conclusion** via the existing premises.
-
-- **Rejected bridge**: `{{ retry_context.rejected_bridge }}`
-- **Reason**: `premises ∪ {bridge}` makes `{{ conclusion_formula }}` unavoidable — Z3 confirms
-  the conclusion is forced even before any grounding. This is conclusion injection and must NOT be used.
-
-Generate a **different** bridge that:
-1. Does **NOT** entail `{{ conclusion_formula }}` even when combined with ALL existing premises
-2. Still connects `{{ orphaned_preds | join(", ") }}` to the proof chain via a semantically valid link
-3. Does **NOT** contradict any existing premise
-
-{% else %}
 Your previous bridge was rejected because it creates a **logical contradiction** with the existing premises.
 
 - **Rejected bridge**: `{{ retry_context.rejected_bridge }}`
@@ -45,8 +32,6 @@ Your previous bridge was rejected because it creates a **logical contradiction**
 Generate a **different** bridge that:
 1. Does **NOT** contradict any existing premise
 2. Still connects `{{ orphaned_preds | join(", ") }}` to the proof chain via a semantically valid link
-3. Does **NOT** directly prove the conclusion `{{ conclusion_formula }}`
-{% endif %}
 
 If no valid alternative exists, output `NONE`.
 
@@ -89,19 +74,13 @@ What general semantic relationship between the orphaned and connected predicates
 **When to output `NONE` (uppercase):**
 - The NL text does not state or imply a general relationship between the orphaned and
   connected predicates — do NOT invent relationships without textual support.
-- The only plausible link would directly target the conclusion predicate `{{ conclusion_formula }}`.
-  A bridge that trivially proves the conclusion bypasses the proof chain and constitutes
-  false premise injection — output `NONE` in this case.
 
 ---
 
 ## Output Rules
 
-1. **Bridge guard**: Do NOT output a bridge whose consequent directly contains or trivially
-   implies the conclusion formula `{{ conclusion_formula }}`. If the only plausible link leads
-   directly to the conclusion predicate, output `NONE`.
-2. The axiom MUST be universally quantified (`ForAll`/`Exists` form). Do NOT output a ground fact.
-3. Use ONLY identifiers already declared in the code above. Do NOT introduce new names.
-4. Output ONLY the Python expression (or `NONE`). No imports, assignments, comments, or prose.
-5. The output (if not `NONE`) must be a valid Z3 `BoolRef` evaluable in the same namespace
+1. The axiom MUST be universally quantified (`ForAll`/`Exists` form). Do NOT output a ground fact.
+2. Use ONLY identifiers already declared in the code above. Do NOT introduce new names.
+3. Output ONLY the Python expression (or `NONE`). No imports, assignments, comments, or prose.
+4. The output (if not `NONE`) must be a valid Z3 `BoolRef` evaluable in the same namespace
    as the original code.
