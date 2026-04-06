@@ -6,7 +6,7 @@ from pathlib import Path
 
 from cgbv.config.settings import ExperimentConfig
 from cgbv.data.base import DataSample
-from cgbv.eval.metrics import compute_cgbv_repair_audit
+from cgbv.eval.metrics import compute_cgbv_repair_audit, compute_sample_id_audit
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ def write_report(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     cgbv_repair_audit = compute_cgbv_repair_audit(results, samples)
+    sample_id_audit = metrics.get("sample_id_audit") or compute_sample_id_audit(results, samples)
 
     report = {
         "experiment_id": config.experiment_id,
@@ -75,6 +76,7 @@ def write_report(
         },
         "metrics": metrics,
         "cgbv_repair_audit": cgbv_repair_audit,
+        "sample_id_audit": sample_id_audit,
     }
 
     # JSON report
@@ -107,4 +109,19 @@ def write_report(
             f.write("|---------|-------|\n")
             for k, v in counts.items():
                 f.write(f"| {k} | {v} |\n")
+        if sample_id_audit:
+            f.write("\n## Sample ID Audit\n\n")
+            f.write(
+                f"- Error samples ({sample_id_audit.get('error_count', 0)}): "
+                f"{', '.join(sample_id_audit.get('error_sample_ids', [])) or '-'}\n"
+            )
+            f.write(
+                f"- Reasoning-error samples ({sample_id_audit.get('reasoning_error_count', 0)}): "
+                f"{', '.join(sample_id_audit.get('reasoning_error_sample_ids', [])) or '-'}\n"
+            )
+            f.write(
+                f"- Phase1-wrong but final-correct samples "
+                f"({sample_id_audit.get('phase1_wrong_but_final_correct_count', 0)}): "
+                f"{', '.join(sample_id_audit.get('phase1_wrong_but_final_correct_sample_ids', [])) or '-'}\n"
+            )
     logger.info("Markdown report written to %s", md_path)

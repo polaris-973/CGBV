@@ -1,7 +1,7 @@
 You are repairing previously generated Z3-Python code for first-order logic entailment checking.
 
-The natural-language task has not changed. Repair the previous code with the smallest
-possible fix. Reuse correct declarations and formulas whenever possible.
+The natural-language task has not changed. Make the smallest possible fix. Reuse all
+correct declarations and formulas.
 
 ## Retry Context
 
@@ -40,25 +40,31 @@ Conclusion: {{ conclusion }}
 {% endfor %}
 
 {% endif %}
-
 ## Repair Requirements
 
-1. Make the smallest possible change that fixes the error.
-2. Preserve the original task: same premises, same conclusion, same entailment question.
-3. Every identifier used in `premises` or `q` must exactly match a previously declared name.
-4. Do not invent new entities, predicates, sorts, or helper names unless the NL task truly requires them.
-5. Keep `premises` aligned with the numbered NL premises. Prefer one top-level formula per numbered premise; if a premise is conjunctive, keep that conjunction inside a single formula instead of splitting it into extra `premises` entries.
-6. Ensure the final code defines both `premises` and `q`.
-7. Do not rename unrelated symbols or rewrite correct sections unless necessary for the fix.
-8. Do not include solver calls, print statements, explanations, or markdown fences in your answer.
+1. Make the smallest change that fixes the error. Preserve all correct declarations and formulas.
+2. `premises` must align one-to-one with the numbered NL premises: N premises → exactly N
+   top-level formulas in the same order. Do not omit, merge, or split entries (RULE 9).
+3. Every identifier used in `premises` or `q` must exactly match a previously declared name (RULE 8).
+4. Do not invent new entities, predicates, sorts, or bound variables unless the NL explicitly requires them.
+5. Do not add a new premise, ground fact, or extra conjunct unless that content is stated in the NL above.
+6. If an NL premise is a plain disjunction, keep it as `Or(...)`. Do not rewrite it as
+   `And(Or(...), ...)` or otherwise strengthen its meaning.
+7. Do not use literal Python `True` or `False` inside `premises` or `q`.
+8. Do not include solver calls, print statements, or markdown fences in your answer.
 
 ## Self-Check Before Answering
 
 - Python syntax is valid.
-- Every name used inside formulas was declared earlier with the exact same spelling.
-- `premises` stays aligned with the original numbered premises.
-- `ForAll(...)` and `Exists(...)` never use an empty variable list.
-- Only `DeclareSort(...)` is used for custom sorts.
-- The answer is only the full corrected Python code.
+- Every name inside `premises` and `q` was declared earlier with identical spelling (RULE 8).
+- `premises` contains exactly as many top-level formulas as there are numbered NL premises, in order (RULE 9).
+- No new premise, ground fact, or extra conjunct was added unless the NL explicitly states it.
+- No disjunction was strengthened into a conjunction.
+- `premises` and `q` contain no literal Python `True` or `False`.
+- `ForAll`/`Exists` list is non-empty; bound variable is a separate `Const`, not an entity constant (RULES 2, 3).
+- Only `DeclareSort(...)` is used; no `IntSort`, `StringSort`, `RealSort`, etc. (RULE 6).
+- Synonymous NL phrases reuse the SAME predicate name — no new synonym predicate was introduced (RULE 11).
+- "X is a [type]" uses a type predicate `is_type(X)`, never entity equality `X == type_entity` (RULE 12).
+- For any clause of the form "not A or B" / "neither A nor B": verify `And(Not(A), Not(B))` was used — not `Or(Not(A), Not(B))`. (RULE 13)
 
 Output only the corrected Python code.

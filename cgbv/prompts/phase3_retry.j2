@@ -1,9 +1,8 @@
 You are a logic translator working with a specific finite domain.
 
-You previously wrote a grounded Python boolean expression for the sentence below,
-but the previous output was invalid. Repair the previous expression so that it is
-a single valid Python boolean expression that evaluates to True if the sentence
-holds in this world, and False otherwise.
+A previous grounded boolean expression for the sentence below was invalid. Repair it so that
+it is a single valid Python boolean expression that evaluates to `True` if the sentence holds
+in this world, and `False` otherwise.
 
 ---
 
@@ -27,32 +26,40 @@ This is attempt {{ attempt_num }} of {{ max_attempts }}.
 
 Write a **single Python boolean expression**. Use:
 - `truth["PredName(entity)"]` — look up a ground atom's truth value
-- `value["fname(entity)"]` — look up a function's numeric value (for comparisons, e.g. `value["score(alice)"] < value["score(bob)"]`)
+- `value["fname(entity)"]` — look up a function's numeric value (for comparisons)
 - `and`, `or`, `not` — boolean connectives
 - `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
 
 **Critical rules:**
-Follow all Critical Rules from the initial grounding instructions above. Additionally:
-1. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
-2. Do **NOT** call predicates directly — access them via `truth[...]` subscripts. For example, `moved_to(u, x)` is **wrong**; `truth[f"moved_to({u}, x)"]` is **correct**.
-3. When the domain lists `Function values` entries (`value["fname(entity)"] = N`), use `value[...]` directly for comparisons — do **not** iterate over `_is` predicates. E.g. "Y has the highest score" → `all(value[f"score({e})"] < value["score(y)"] for e in SORT_LIST if e != "y")`. Operator must match NL exactly: `<` for "less/smaller", `>` for "greater/larger", `==` for "same/equal", `<=`/`>=` for "at most/least". "X has the largest" → all others are strictly below X → `value[f"f({e})"] < value["f(x)"]`.
-4. Repair the previous output with the smallest possible change that fixes the error while preserving the sentence's meaning.
-5. Output ONLY the expression — no imports, no assignments, no prose.
+1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate
+   name and entity IDs, matching capitalisation and spacing).
+2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort of
+   that predicate's argument. Never mix entities from different sorts in the same loop.
+3. If the sort already determines the type, do **not** add a redundant `if truth["is_X(e)"]`
+   guard — it introduces a semantic gap. Only add an `if truth[...]` guard when the NL
+   explicitly conditions on an additional predicate.
+4. Do **not** invent entity names. Use only the canonical IDs listed in the domain below.
+5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+   Access predicates via `truth[...]` subscripts only — never call them directly.
+6. Do **not** iterate over booleanised `_is` predicates when `value[...]` entries are available.
+   For comparisons, use `value[...]` directly with operators that exactly match the NL meaning:
+   `<` for "less/smaller", `>` for "greater/larger", `==` for "same/equal", `<=`/`>=` for
+   "at most/least". "X has the highest" → all others strictly below X.
+7. Repair the previous output with the smallest change that fixes the error while preserving
+   the sentence's full meaning.
+8. Output ONLY the expression — no imports, no assignments, no prose.
 
 ---
 
 {% if world_assumption == "cwa" %}
----
-
 ## Closed-World Assumption
 
-Under the Closed-World Assumption: if a property is not explicitly asserted for an entity in the
-witness domain, treat it as **False**. For "either A or B" patterns, model as **exclusive** (exactly
-one is true). Do not assume unmentioned relationships hold.
-{% endif %}
+Under the Closed-World Assumption: any property not explicitly asserted for an entity is **False**.
+For "either A or B" patterns, model as exclusive: `truth["A(e)"] != truth["B(e)"]`.
 
 ---
+{% endif %}
 
 ## Your Task
 

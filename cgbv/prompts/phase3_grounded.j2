@@ -1,10 +1,12 @@
 You are a logic translator working with a specific finite domain.
 
 You are given:
-1. A **domain description** listing entities grouped by sort, predicate signatures, and the truth value of every ground atom in a specific world.
+1. A **domain description** listing entities grouped by sort, predicate signatures, and the truth
+   value of every ground atom in a specific world.
 2. A **natural language sentence**.
 
-Your task: write a Python boolean expression that evaluates to True if the sentence holds in this world, and False otherwise.
+Your task: write a Python boolean expression that evaluates to `True` if the sentence holds in
+this world, and `False` otherwise.
 
 ---
 
@@ -12,17 +14,22 @@ Your task: write a Python boolean expression that evaluates to True if the sente
 
 Write a **single Python boolean expression**. Use:
 - `truth["PredName(entity)"]` — look up a ground atom's truth value
-- `value["fname(entity)"]` — look up a function's numeric value (for comparisons, e.g. `value["score(alice)"] < value["score(bob)"]`)
+- `value["fname(entity)"]` — look up a function's numeric value (e.g. `value["score(alice)"] < value["score(bob)"]`)
 - `and`, `or`, `not` — boolean connectives
 - `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
 
 **Critical rules:**
-1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate name and entity IDs).
-2. Iterate each `for e in [...]` loop over ONLY the entity list for the CORRECT sort of that predicate's argument. **Never mix entities from different sorts in the same loop.**
-3. If a sentence's quantifier ("all", "some", "no") ranges over a type already determined by the sort (e.g., all entities in the `Stock` sort ARE stocks), do **NOT** add a redundant `if truth["is_stock(e)"]` guard—it creates a semantic gap with the FOL formula. Only add an `if truth[...]` guard if the NL sentence explicitly conditions on an additional predicate.
-4. Do **NOT** invent entity names. Use only the canonical IDs listed in "Canonical entity IDs".
-5. Do **NOT** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate
+   name and entity IDs, matching capitalisation and spacing).
+2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort of
+   that predicate's argument. Never mix entities from different sorts in the same loop.
+3. If the sort already determines the type (e.g., all entities in the `Stock` sort ARE stocks),
+   do **not** add a redundant `if truth["is_stock(e)"]` guard — it creates a semantic gap with
+   the FOL formula. Only add an `if truth[...]` guard when the NL explicitly conditions on an
+   additional predicate.
+4. Do **not** invent entity names. Use only the canonical IDs listed under "Canonical entity IDs".
+5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
 6. Output ONLY the expression — no imports, no assignments, no prose.
 
 ---
@@ -34,21 +41,26 @@ Given sort `Person` with entities `['alice', 'bob', 'carol']`:
 | Natural language | Grounded expression |
 |---|---|
 | "Alice is happy." | `truth["happy(alice)"]` |
+| "Alice is NOT happy." | `not truth["happy(alice)"]` |
 | "All persons are happy." | `all(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
 | "Some person is happy." | `any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
 | "No person is happy." | `not any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
 | "Alice likes Bob." | `truth["likes(alice, bob)"]` |
 | "Alice likes someone." | `any(truth[f"likes(alice, {e})"] for e in ["alice","bob","carol"])` |
 | "Everyone who studies passes." | `all(truth[f"passes({e})"] for e in ["alice","bob","carol"] if truth[f"studies({e})"])` |
+| "If Alice studies, she passes." (conditional/Implies conclusion) | `not truth["studies(alice)"] or truth["passes(alice)"]` |
+| "Alice is happy or sad, but not both." (XOR conclusion) | `truth["happy(alice)"] != truth["sad(alice)"]` |
 
 **Multi-sort example** — sort `Person: ['alice']`, sort `Book: ['walden']`:
+
 | Natural language | Grounded expression |
 |---|---|
 | "Alice reads Walden." | `truth["reads(alice, walden)"]` |
 | "Alice reads some book." | `any(truth[f"reads(alice, {b})"] for b in ["walden"])` |
 | "Every person reads some book." | `all(any(truth[f"reads({p}, {b})"] for b in ["walden"]) for p in ["alice"])` |
 
-Notice: the `for p in [...]` loop uses **only Person entities**, and the `for b in [...]` loop uses **only Book entities**. They are never mixed.
+The `for p in [...]` loop uses **only** Person entities; `for b in [...]` uses **only** Book
+entities. Never mix them.
 
 ---
 
@@ -77,6 +89,7 @@ Ground atoms:
 | Sentence | Output |
 |---|---|
 | "Tweety can fly." | `truth["can_fly(tweety)"]` |
+| "Tweety cannot fly." | `not truth["can_fly(tweety)"]` |
 | "All birds can fly." | `all(truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
 | "Some bird cannot fly." | `any(not truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
 | "Tweety is a bird that can fly." | `truth["is_bird(tweety)"] and truth["can_fly(tweety)"]` |
@@ -85,8 +98,8 @@ Ground atoms:
 
 ## Numeric Comparison (Function-value predicates)
 
-When the domain lists `Function values` entries like `value["score(alice)"] = 42`, use
-the `value[...]` lookup directly — do **not** iterate over booleanized `_is` predicates.
+When the domain lists `Function values` entries like `value["score(alice)"] = 42`, use the
+`value[...]` lookup directly — do **not** iterate over booleanised `_is` predicates.
 
 | Natural language | Grounded expression |
 |---|---|
@@ -95,10 +108,10 @@ the `value[...]` lookup directly — do **not** iterate over booleanized `_is` p
 | "Alice and Bob have equal scores." | `value["score(alice)"] == value["score(bob)"]` |
 | "Alice's score is at most 100." | `value["score(alice)"] <= 100` |
 
-For f-string access over a sort, write `value[f"score({e})"]` where `e` iterates over
-the correct sort list from the domain.
+For f-string access over a sort, write `value[f"score({e})"]` where `e` iterates over the
+correct sort list from the domain.
 
-**Critical**: the comparison operator must **exactly match** the NL meaning.
+**Operator must exactly match the NL meaning:**
 - "less / smaller / lower" → `<`
 - "greater / larger / higher" → `>`
 - "X has the highest/largest" → all others are strictly below X: `value[f"f({e})"] < value["f(x)"]`
@@ -107,18 +120,40 @@ the correct sort list from the domain.
 ---
 
 {% if world_assumption == "cwa" %}
----
-
 ## Closed-World Assumption
 
-Under the Closed-World Assumption: if a property is not explicitly asserted for an entity in the
-witness domain, treat it as **False**. For "either A or B" patterns, model as **exclusive** (exactly
-one is true). Do not assume unmentioned relationships hold — only use facts explicitly listed in the
-ground atoms section.
+Under the Closed-World Assumption: any property not explicitly asserted for an entity in the
+witness domain is **False**. For "either A or B" patterns, model as exclusive (exactly one is
+true): use `truth["A(e)"] != truth["B(e)"]`. Do not assume unmentioned relationships hold.
+
+---
 {% endif %}
+
+{% if fol_formula %}
+## Phase 1 FOL Cross-Reference
+
+The Phase 1 formalization of this sentence is:
+```
+{{ fol_formula }}
+```
+
+Your grounded expression **must match the quantifier structure** of this FOL formula:
+
+| FOL outermost structure | Required grounded form |
+|---|---|
+| `ForAll([x], Implies(type_pred(x), prop(x)))` | `all(truth[f"prop({e})"] for e in SORT if truth[f"type_pred({e})"])` |
+| `ForAll([x], Or(...))` / `ForAll([x], Not(...))` | `all(...)` iterating over the relevant sort |
+| `Exists([x], And(...))` | `any(truth[f"...({e})"] for e in SORT if ...)` |
+| ground atom `pred(entity)` | `truth["pred(entity)"]` |
+
+⚠️ A `ForAll`-form FOL means the sentence is a **universal rule** evaluated over all domain entities.
+Do NOT collapse a universal rule into a single ground atom lookup — evaluate it over the
+full domain using `all(...)`. An entity whose name coincidentally matches a category name
+in the domain is not a substitute for iterating over all members of that category.
 
 ---
 
+{% endif %}
 ## Your Task
 
 **Domain:**

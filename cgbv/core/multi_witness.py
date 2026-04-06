@@ -213,6 +213,8 @@ async def _run_phase3_and_4(
         prompt_engine=prompt_engine,
         max_retries=grounding_retries,
         world_assumption=world_assumption,
+        solver=solver,
+        fol_formula_strs=[str(f) for f in fol_formulas] if fol_formulas else None,
     )
 
     cgbv_log.update_phase("phase4")

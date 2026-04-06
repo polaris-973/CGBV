@@ -6,7 +6,7 @@ dataset:
   name: folio
   split: validation
   path: ./datasets
-  limit: 2
+  limit: 50
 
 llm:
   provider: openai
@@ -27,7 +27,12 @@ pipeline:
   r_max: 3
   formalize_retries: 3
   grounding_retries: 3
+  repair_retries: 2
+  bridge_retries: 2
+  min_uncertain_witnesses: 2
+  max_exec_workers: 8
   solver_timeout: 60
+  world_assumption: owa
 
 runner:
   max_concurrency: 1

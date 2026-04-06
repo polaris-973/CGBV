@@ -119,6 +119,60 @@ def compute_cgbv_repair_audit(
     }
 
 
+def compute_sample_id_audit(
+    results: list[dict],
+    samples: list[DataSample],
+) -> dict:
+    """
+    Collect high-signal sample ID slices for error analysis.
+
+    Definitions:
+      - error_sample_ids:
+          samples that did not successfully produce a semantic verdict. This
+          includes missing result files and non-success execution_status values
+          such as phase1_error / solver_unknown / pipeline_error.
+      - reasoning_error_sample_ids:
+          successful runs whose FINAL verdict does not match the ground-truth label.
+          Execution failures are excluded; those are pipeline/runtime errors, not
+          semantic reasoning errors.
+      - phase1_wrong_but_final_correct_sample_ids:
+          successful runs where the earliest Phase 1 verdict snapshot
+          (verdict_pre_bridge) was wrong, but the FINAL verdict is correct.
+          This answers: "Which samples were initially formalized to the wrong
+          verdict, but were corrected by the full CGBV stack?"
+    """
+    label_map: dict[str, str] = {s.id: _normalise_label(s.label) for s in samples}
+    result_map: dict[str, dict] = {r["sample_id"]: r for r in results if "sample_id" in r}
+
+    error_sample_ids: list[str] = []
+    reasoning_error_sample_ids: list[str] = []
+    phase1_wrong_but_final_correct_sample_ids: list[str] = []
+
+    for sample in samples:
+        result = result_map.get(sample.id)
+        if not _is_successful_result(result):
+            error_sample_ids.append(sample.id)
+            continue
+
+        label = label_map[sample.id]
+        v_pre, _, v_final = _read_verdicts(result)
+
+        if v_final != label:
+            reasoning_error_sample_ids.append(sample.id)
+
+        if v_pre != label and v_final == label:
+            phase1_wrong_but_final_correct_sample_ids.append(sample.id)
+
+    return {
+        "error_count": len(error_sample_ids),
+        "error_sample_ids": error_sample_ids,
+        "reasoning_error_count": len(reasoning_error_sample_ids),
+        "reasoning_error_sample_ids": reasoning_error_sample_ids,
+        "phase1_wrong_but_final_correct_count": len(phase1_wrong_but_final_correct_sample_ids),
+        "phase1_wrong_but_final_correct_sample_ids": phase1_wrong_but_final_correct_sample_ids,
+    }
+
+
 def compute_metrics(
     results: list[dict],
     samples: list[DataSample],
@@ -320,6 +374,7 @@ def compute_metrics(
         return round(num / denom, 4) if denom > 0 else 0.0
 
     cgbv_repair_audit = compute_cgbv_repair_audit(results, samples)
+    sample_id_audit = compute_sample_id_audit(results, samples)
 
     return {
         "total_samples": total,
@@ -346,6 +401,7 @@ def compute_metrics(
         "phase3_reground_rate": safe_div(phase3_reground_success, phase3_errors_detected),
         # P6: Verification confidence distribution
         "verification_confidence": confidence_counts,
+        "sample_id_audit": sample_id_audit,
         # Raw counts (for inspection)
         "_counts": {
             "correct": correct,
@@ -417,5 +473,13 @@ def _empty_metrics() -> dict:
         "cgbv_repair_recovery_rate": 0.0,
         "phase3_reground_rate": 0.0,
         "verification_confidence": {"high": 0, "medium": 0, "low": 0, "none": 0},
+        "sample_id_audit": {
+            "error_count": 0,
+            "error_sample_ids": [],
+            "reasoning_error_count": 0,
+            "reasoning_error_sample_ids": [],
+            "phase1_wrong_but_final_correct_count": 0,
+            "phase1_wrong_but_final_correct_sample_ids": [],
+        },
         "_counts": {},
     }

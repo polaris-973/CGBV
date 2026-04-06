@@ -9,20 +9,22 @@ from typing import Any
 import cgbv.logging as cgbv_log
 from cgbv.config.settings import ExperimentConfig
 from cgbv.core.gap_analysis import compute_gap_analysis
-from cgbv.core.multi_witness import MultiWitnessResult, run_multi_witness
+from cgbv.core.multi_witness import MultiWitnessResult, WitnessCheckResult, run_multi_witness
 from cgbv.core.phase1_formalize import Phase1Result, run_phase1, run_phase1_targeted
 from cgbv.core.phase3_grounded import Phase3Result, reground_with_hint
 from cgbv.solver.model_extractor import format_domain_desc
 from cgbv.solver.code_executor import configure_max_workers
-from cgbv.core.phase4_check import Mismatch, Phase4Result
+from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
 from cgbv.core.phase5_repair import Phase5Result, run_phase5
 from cgbv.data.base import DataSample
 from cgbv.llm.base import LLMClient
 from cgbv.llm.factory import create_llm_client
 from cgbv.prompts.prompt_engine import PromptEngine
+from cgbv.solver.finite_evaluator import FiniteModelEvaluator
 from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNKNOWN, VERDICT_UNCERTAIN
 
 logger = logging.getLogger(__name__)
+_finite_evaluator = FiniteModelEvaluator()
 
 
 def _normalise_verdict(v: str) -> str:
@@ -56,6 +58,16 @@ def _formula_str(idx: int, premises: list, q: object) -> str:
     if idx == n:
         return str(q)
     return ""  # should not occur
+
+
+def _formula_at(idx: int, premises: list, q: object) -> object | None:
+    """Return the concrete Z3 formula object at sentence index *idx*."""
+    n = len(premises)
+    if idx < n:
+        return premises[idx]
+    if idx == n:
+        return q
+    return None
 
 
 @dataclass
@@ -446,10 +458,14 @@ class CGBVPipeline:
                 # Process bridge axioms from gap-triggered Phase 5
                 _gap_committed: list = []
                 if p5_gap.bridge_axioms:
-                    # Accept all proposed bridges (no mismatch witnesses to filter
-                    # against — gap-triggered bridges are accepted if they parse
-                    # and are quantified, then validated via re-solve + next round).
-                    accepted_gap_bridges = list(p5_gap.bridge_axioms)
+                    # Filter out bridges that would make the premise set UNSAT
+                    # (ex falso quodlibet — an inconsistent bridge lets Z3 prove
+                    # any conclusion vacuously, corrupting the verdict).
+                    accepted_gap_bridges = _filter_consistent_bridges(
+                        list(p5_gap.bridge_axioms),
+                        list(premises) + background_constraints,
+                        q=q,
+                    )
                     background_constraints.extend(accepted_gap_bridges)
 
                     solver_premises = list(premises) + background_constraints
@@ -724,7 +740,11 @@ class CGBVPipeline:
 
                     _gap2_committed: list = []
                     if p5_gap2.bridge_axioms:
-                        accepted_gap2_bridges = list(p5_gap2.bridge_axioms)
+                        accepted_gap2_bridges = _filter_consistent_bridges(
+                            list(p5_gap2.bridge_axioms),
+                            list(premises) + background_constraints,
+                            q=q,
+                        )
                         background_constraints.extend(accepted_gap2_bridges)
 
                         solver_premises = list(premises) + background_constraints
@@ -833,6 +853,17 @@ class CGBVPipeline:
                     old_premises = list(premises)
                     old_q = q
                     old_verdict = verdict
+                    old_violation_keys = (
+                        _phase4_violation_keys([wr.phase4 for wr in mw.witness_results])
+                        | _carried_actionable_violation_keys(
+                            actionable_mismatches,
+                            current_mismatch_indices,
+                            old_premises,
+                            old_q,
+                            namespace,
+                            carried_mismatch_models,
+                        )
+                    )
 
                     premises = p5.repaired_premises
                     q = p5.repaired_q
@@ -883,11 +914,44 @@ class CGBVPipeline:
                     round_record.verdict_candidate = new_verdict
                     new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
                     old_is_unknown = (old_verdict == VERDICT_UNKNOWN)
+                    reject_reason: str | None = None
                     if new_is_unknown and not old_is_unknown:
+                        reject_reason = (
+                            f"repair degraded solver verdict to Unknown "
+                            f"({old_verdict} → {new_verdict})"
+                        )
+                    else:
+                        tentative_phase4 = _rerun_phase4_same_bank(
+                            mw.witness_results, sentences, premises, q, namespace, self.solver,
+                        )
+                        eliminated_current = {
+                            wr.witness_index
+                            for wr in mw.witness_results
+                            if _witness_eliminated_by_bridges(accepted_bridges, wr.phase2.model)
+                        }
+                        new_violation_keys = (
+                            _phase4_violation_keys(tentative_phase4, eliminated_current)
+                            | _carried_actionable_violation_keys(
+                                actionable_mismatches,
+                                current_mismatch_indices,
+                                premises,
+                                q,
+                                namespace,
+                                carried_mismatch_models,
+                                accepted_bridges,
+                            )
+                        )
+                        if not new_violation_keys < old_violation_keys:
+                            reject_reason = (
+                                "candidate repair did not strictly shrink the current "
+                                f"violation set ({len(old_violation_keys)} → "
+                                f"{len(new_violation_keys)})"
+                            )
+
+                    if reject_reason is not None:
                         logger.warning(
-                            "Pipeline sample=%s round=%d: repair degraded solver "
-                            "verdict to Unknown (%s → %s); reverting",
-                            sample.id, round_num, old_verdict, new_verdict,
+                            "Pipeline sample=%s round=%d: %s; reverting",
+                            sample.id, round_num, reject_reason,
                         )
                         premises = old_premises
                         q = old_q
@@ -1003,6 +1067,17 @@ class CGBVPipeline:
                         "Pipeline sample=%s round=%d: all repairs failed",
                         sample.id, round_num,
                     )
+                    old_violation_keys = (
+                        _phase4_violation_keys([wr.phase4 for wr in mw.witness_results])
+                        | _carried_actionable_violation_keys(
+                            actionable_mismatches,
+                            current_mismatch_indices,
+                            premises,
+                            q,
+                            namespace,
+                            carried_mismatch_models,
+                        )
+                    )
                     # Per-bridge filter: only commit bridges that contradict at
                     # least one mismatch witness.  Unhelpful bridges stay out of
                     # background_constraints and raw_code entirely.
@@ -1049,15 +1124,46 @@ class CGBVPipeline:
                             # Unknown guard: reject bridges if they degrade verdict
                             new_is_unknown = (new_verdict == VERDICT_UNKNOWN)
                             old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                            reject_reason: str | None = None
                             if new_is_unknown and not old_is_unknown:
+                                reject_reason = "bridge-only degraded solver to Unknown"
+                            else:
+                                tentative_phase4 = _rerun_phase4_same_bank(
+                                    mw.witness_results, sentences, premises, q, namespace, self.solver,
+                                )
+                                eliminated_current = {
+                                    wr.witness_index
+                                    for wr in mw.witness_results
+                                    if _witness_eliminated_by_bridges(
+                                        accepted_bridges_bo, wr.phase2.model
+                                    )
+                                }
+                                new_violation_keys = (
+                                    _phase4_violation_keys(tentative_phase4, eliminated_current)
+                                    | _carried_actionable_violation_keys(
+                                        actionable_mismatches,
+                                        current_mismatch_indices,
+                                        premises,
+                                        q,
+                                        namespace,
+                                        carried_mismatch_models,
+                                        accepted_bridges_bo,
+                                    )
+                                )
+                                if not new_violation_keys < old_violation_keys:
+                                    reject_reason = (
+                                        "bridge-only candidate did not strictly shrink the "
+                                        f"current violation set ({len(old_violation_keys)} → "
+                                        f"{len(new_violation_keys)})"
+                                    )
+                            if reject_reason is not None:
                                 for _ in accepted_bridges_bo:
                                     if background_constraints:
                                         background_constraints.pop()
                                 accepted_bridges_bo = []
                                 logger.warning(
-                                    "Pipeline sample=%s round=%d: bridge-only "
-                                    "degraded solver to Unknown; reverted",
-                                    sample.id, round_num,
+                                    "Pipeline sample=%s round=%d: %s; reverted",
+                                    sample.id, round_num, reject_reason,
                                 )
                             else:
                                 bridge_accepted = True
@@ -1496,6 +1602,138 @@ def _filter_helpful_bridges(
             except Exception:
                 pass
     return helpful
+
+
+def _filter_consistent_bridges(
+    bridges: list,
+    existing_premises: list,
+    q: object = None,
+) -> list:
+    """Return only bridges consistent with existing_premises and not entailing q.
+
+    A bridge is rejected if:
+    - Adding it makes existing_premises UNSAT (ex falso quodlibet)
+    - Adding it makes premises ∪ {bridge} ⊨ q (conclusion injection)
+    """
+    import z3
+    consistent = []
+    for bridge in bridges:
+        s_test = z3.Solver()
+        for p in existing_premises:
+            s_test.add(p)
+        s_test.add(bridge)
+        if s_test.check() == z3.unsat:
+            logger.warning(
+                "Gap analysis bridge rejected (inconsistent with premises): %.80s",
+                str(bridge),
+            )
+            continue
+        if q is not None:
+            s_entail = z3.Solver()
+            for p in existing_premises:
+                s_entail.add(p)
+            s_entail.add(bridge)
+            s_entail.add(z3.Not(q))
+            if s_entail.check() == z3.unsat:
+                logger.warning(
+                    "Gap analysis bridge rejected (entails conclusion): %.80s",
+                    str(bridge),
+                )
+                continue
+        consistent.append(bridge)
+    return consistent
+
+
+def _witness_eliminated_by_bridges(bridges: list, model: Any | None) -> bool:
+    """Return True iff any candidate bridge contradicts the given witness model."""
+    if not bridges or model is None:
+        return False
+    import z3
+    for bridge in bridges:
+        try:
+            if z3.is_false(model.evaluate(bridge)):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _rerun_phase4_same_bank(
+    witness_results: list[WitnessCheckResult],
+    sentences: list[str],
+    premises: list,
+    q: object,
+    namespace: dict[str, Any],
+    solver: Z3Solver,
+) -> list[Phase4Result]:
+    """Re-run Phase 4 on the existing witness bank with candidate formulas."""
+    fol_formulas = list(premises) + [q]
+    rechecked: list[Phase4Result] = []
+    for wr in witness_results:
+        rechecked.append(run_phase4(
+            sentences=sentences,
+            fol_formulas=fol_formulas,
+            model=wr.phase2.model,
+            domain=wr.phase2.domain,
+            grounded_formulas=wr.phase3.grounded,
+            solver=solver,
+            namespace=namespace,
+            witness_index=wr.witness_index,
+            witness_side=wr.phase2.witness_side,
+        ))
+    return rechecked
+
+
+def _phase4_violation_keys(
+    phase4_results: list[Phase4Result],
+    eliminated_witness_indices: set[int] | None = None,
+) -> set[tuple[str, int, int, str]]:
+    """Collect per-witness violation keys from Phase 4 results."""
+    eliminated = eliminated_witness_indices or set()
+    keys: set[tuple[str, int, int, str]] = set()
+    for p4 in phase4_results:
+        if p4.witness_index in eliminated:
+            continue
+        for m in p4.mismatches:
+            kind = "phase3_error" if m.is_phase3_error else "mismatch"
+            keys.add((kind, m.sentence_index, p4.witness_index, p4.witness_side))
+        for e in p4.evaluations:
+            if e.grounding_failed or e.error is not None or e.fol_truth is None:
+                keys.add(("unverifiable", e.sentence_index, p4.witness_index, p4.witness_side))
+    return keys
+
+
+def _carried_actionable_violation_keys(
+    actionable_mismatches: list[Mismatch],
+    current_mismatch_indices: set[int],
+    premises: list,
+    q: object,
+    namespace: dict[str, Any],
+    carried_mismatch_models: dict[int, Any] | None = None,
+    bridges: list | None = None,
+) -> set[tuple[str, int]]:
+    """
+    Re-evaluate carried actionable mismatches on their stored witness worlds.
+
+    Current-round mismatches are already represented in the current witness bank
+    Phase 4 results and are intentionally excluded here.
+    """
+    carried_models = carried_mismatch_models or {}
+    keys: set[tuple[str, int]] = set()
+    for m in actionable_mismatches:
+        if m.sentence_index in current_mismatch_indices:
+            continue
+        model = carried_models.get(m.sentence_index)
+        if _witness_eliminated_by_bridges(bridges or [], model):
+            continue
+        formula = _formula_at(m.sentence_index, premises, q)
+        if model is None or formula is None:
+            keys.add(("carried", m.sentence_index))
+            continue
+        fol_truth = _finite_evaluator.evaluate(model, formula, namespace=namespace)
+        if fol_truth is None or fol_truth != m.grounded_truth:
+            keys.add(("carried", m.sentence_index))
+    return keys
 
 
 def _make_serialisable(obj):

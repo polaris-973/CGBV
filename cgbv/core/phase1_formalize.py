@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import z3
@@ -229,15 +230,17 @@ async def run_phase1(
                         "is too weak to constrain the domain."
                     )
                     last_validation_feedback = [
-                        "This happens when a rule's antecedent predicate is never "
-                        "instantiated by any ground fact. Z3 satisfies the rule by "
-                        "setting the predicate False everywhere.",
-                        "Fix: for each rule ForAll([v], Implies(A(v), B(v))), add "
-                        "at least one ground fact asserting a specific named entity "
-                        "has property A — e.g. A(entity_name) listed in `premises`.",
-                        "Do NOT express membership or participation purely as a "
-                        "conditional rule without also adding a ground fact that "
-                        "names the specific entity satisfying the antecedent.",
+                        "This usually means the current code failed to preserve an "
+                        "existing NL grounding or link, so a proof-relevant rule "
+                        "chain never activates and Z3 sets the antecedent predicate "
+                        "False everywhere.",
+                        "Fix only if the original NL already licenses it: rewrite "
+                        "the affected numbered premise or move a general rule into "
+                        "`background_constraints`. Do NOT add a new premise, a new "
+                        "ground fact, or an extra conjunct that is not stated in the NL.",
+                        "If the original NL premise is a plain disjunction, keep it "
+                        "a plain disjunction. Do NOT turn it into patterns like "
+                        "`And(Or(...), extra_fact)` just to satisfy the solver.",
                     ]
                     attempts[-1].validation_error = last_error
                     logger.warning(
@@ -275,6 +278,18 @@ async def run_phase1(
                 prompt_engine=prompt_engine,
                 task_type=task_type,
                 bridge_retries=bridge_retries,
+            )
+
+        # Phase 1.6: identifier canonicalization
+        result = await _run_canonicalization(
+                result=result,
+                premises_nl=premises_nl,
+                llm=llm,
+                solver=solver,
+                prompt_engine=prompt_engine,
+                task_type=task_type,
+                code_exec_timeout=code_exec_timeout,
+                world_assumption=world_assumption,
             )
 
         return result
@@ -356,6 +371,7 @@ async def _run_bridge_check(
             prompt_engine=prompt_engine,
             raw_code=result.raw_code,
             bridge_retries=bridge_retries,
+            solver=solver,
         )
         if linking_axiom is not None:
             # Add as background constraint instead of replacing the original
@@ -439,6 +455,7 @@ async def _repair_bridge_premise(
     prompt_engine: PromptEngine,
     raw_code: str,
     bridge_retries: int = 2,
+    solver: "Z3Solver | None" = None,
 ) -> z3.ExprRef | None:
     """
     Ask the LLM to reformulate a single disconnected premise so its predicate
@@ -453,36 +470,65 @@ async def _repair_bridge_premise(
         if i != idx
     ]
 
-    messages: list[dict] = [{
-        "role": "user",
-        "content": prompt_engine.render(
-            "phase1_bridge.j2",
-            raw_code=raw_code,
-            premise_index=idx,
-            nl_text=nl_text,
-            current_formula=str(current_formula),
-            orphaned_preds=orphaned_preds,
-            connected_preds=sorted(connected_preds),
-            other_premises=other_premises,
-            conclusion_nl=conclusion_nl,
-            conclusion_formula=str(q),
-        ),
-    }]
+    initial_render = prompt_engine.render(
+        "phase1_bridge.j2",
+        raw_code=raw_code,
+        premise_index=idx,
+        nl_text=nl_text,
+        current_formula=str(current_formula),
+        orphaned_preds=orphaned_preds,
+        connected_preds=sorted(connected_preds),
+        other_premises=other_premises,
+        conclusion_nl=conclusion_nl,
+        conclusion_formula=str(q),
+        retry_context=None,
+    )
+    messages: list[dict] = [{"role": "user", "content": initial_render}]
 
     raw_output = ""
+    last_error: str = ""
+    _consistency_rejected = False
+    _rejected_bridge_str: str = ""
+    _rejected_bridge_reason: str = ""
+
     for attempt in range(bridge_retries):
         if attempt > 0:
-            messages = messages + [
-                {"role": "assistant", "content": raw_output},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Error: {last_error}\n\n"
-                        "Output ONLY a valid Z3 boolean expression using identifiers "
-                        "already declared in the code. No imports, no assignments."
-                    ),
-                },
-            ]
+            if _consistency_rejected:
+                # Re-render the full bridge prompt with retry_context so the LLM
+                # has complete context about why the previous bridge was rejected.
+                retry_render = prompt_engine.render(
+                    "phase1_bridge.j2",
+                    raw_code=raw_code,
+                    premise_index=idx,
+                    nl_text=nl_text,
+                    current_formula=str(current_formula),
+                    orphaned_preds=orphaned_preds,
+                    connected_preds=sorted(connected_preds),
+                    other_premises=other_premises,
+                    conclusion_nl=conclusion_nl,
+                    conclusion_formula=str(q),
+                    retry_context={
+                        "rejected_bridge": _rejected_bridge_str,
+                        "reason": _rejected_bridge_reason,
+                    },
+                )
+                messages = messages + [
+                    {"role": "assistant", "content": raw_output},
+                    {"role": "user", "content": retry_render},
+                ]
+                _consistency_rejected = False
+            else:
+                messages = messages + [
+                    {"role": "assistant", "content": raw_output},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Error: {last_error}\n\n"
+                            "Output ONLY a valid Z3 boolean expression using identifiers "
+                            "already declared in the code. No imports, no assignments."
+                        ),
+                    },
+                ]
 
         raw_output = await llm.complete_with_retry(messages)
         expr_str = _strip_fences(raw_output)
@@ -518,6 +564,54 @@ async def _repair_bridge_premise(
             )
             continue
 
+        # Bridge consistency gate: reject axioms that make the premise set UNSAT.
+        # A bridge causing UNSAT would allow Z3 to vacuously derive anything
+        # (ex falso quodlibet), producing a spurious Entailed verdict.
+        if solver is not None:
+            s_test = z3.Solver()
+            for p in all_premises:
+                s_test.add(p)
+            s_test.add(formula)
+            if s_test.check() == z3.unsat:
+                _rejected_bridge_str = str(formula)
+                _rejected_bridge_reason = "inconsistent"
+                _consistency_rejected = True
+                last_error = (
+                    f"CONSISTENCY GATE: bridge `{formula}` combined with existing "
+                    f"premises is UNSAT — this bridge contradicts the premises. "
+                    f"Generate a different bridge that does not conflict."
+                )
+                logger.warning(
+                    "Phase 1.5 idx=%d attempt %d: bridge consistency gate REJECTED "
+                    "(inconsistent with premises): %.80s",
+                    idx, attempt + 1, str(formula),
+                )
+                continue
+
+            # Anti-entailment gate: reject axioms where premises ∪ {bridge} ⊨ q.
+            # A bridge that directly proves the conclusion is false premise injection —
+            # it would force a Entailed verdict even when the premises alone are Uncertain.
+            s_entail = z3.Solver()
+            for p in all_premises:
+                s_entail.add(p)
+            s_entail.add(formula)
+            s_entail.add(z3.Not(q))
+            if s_entail.check() == z3.unsat:
+                _rejected_bridge_str = str(formula)
+                _rejected_bridge_reason = "entails_conclusion"
+                _consistency_rejected = True
+                last_error = (
+                    f"ENTAILMENT GATE: bridge `{formula}` + existing premises directly "
+                    f"entails the conclusion `{q}`. This is conclusion injection — "
+                    f"generate a bridge that does NOT prove the conclusion."
+                )
+                logger.warning(
+                    "Phase 1.5 idx=%d attempt %d: anti-entailment gate REJECTED "
+                    "(bridge proves conclusion): %.80s",
+                    idx, attempt + 1, str(formula),
+                )
+                continue
+
         return formula
 
     return None
@@ -527,7 +621,133 @@ from cgbv.core.gap_analysis import (
     extract_predicate_names as _extract_predicate_names,
     find_disconnected_premises as _find_disconnected_premises,
     get_connected_predicates as _get_connected_predicates,
+    is_ground_fact as _is_ground_fact,
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.6: Identifier canonicalization
+# ---------------------------------------------------------------------------
+
+async def _run_canonicalization(
+    result: Phase1Result,
+    premises_nl: list[str],
+    llm: LLMClient,
+    solver: Z3Solver,
+    prompt_engine: PromptEngine,
+    task_type: str,
+    code_exec_timeout: int,
+    world_assumption: str = "owa",
+) -> Phase1Result:
+    """
+    Phase 1.6: LLM-driven identifier canonicalization.
+
+    Asks the LLM to compare all symbolic identifiers in the Z3 code against the
+    original NL premises and identify any pair of identifiers that refer to the
+    same real-world concept but were assigned different names. If duplicates are
+    found, applies whole-word substitutions, re-executes, and re-solves.
+
+    If re-execution fails or no changes are needed, returns the original result.
+    """
+    user_content = prompt_engine.render(
+        "phase1_canon.j2",
+        premises=premises_nl,
+        raw_code=result.raw_code,
+    )
+    raw = (await llm.complete_with_retry([{"role": "user", "content": user_content}])).strip()
+
+    if not raw or raw.upper().startswith("OK") or not raw.startswith("{"):
+        return result
+
+    try:
+        subst_map: dict[str, str] = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Phase 1.6: failed to parse substitution map: %.100s", raw)
+        return result
+
+    if not subst_map:
+        return result
+
+    # Apply whole-word substitutions to raw code
+    new_code = result.raw_code
+    for old, new_name in subst_map.items():
+        if old == new_name:
+            continue
+        new_code = re.sub(r'\b' + re.escape(old) + r'\b', new_name, new_code)
+
+    if new_code == result.raw_code:
+        return result
+
+    try:
+        ctx = execute_z3_code(new_code, timeout_seconds=code_exec_timeout)
+    except CodeExecutionError as e:
+        logger.warning("Phase 1.6: re-exec failed after canonicalization, reverting: %s", e)
+        return result
+
+    # Tautology guard: reject substitution if any premise became trivially True.
+    # This happens when a premise Implies(A(x), B(x)) exists and A→B was merged,
+    # turning it into Implies(B(x), B(x)) = always True, destroying the inference.
+    for i, prem in enumerate(ctx.get("premises", [])):
+        try:
+            s_check = z3.Solver()
+            s_check.add(z3.Not(prem))
+            if s_check.check() == z3.unsat:
+                logger.warning(
+                    "Phase 1.6: substitution %s created tautological premise[%d], reverting",
+                    subst_map, i,
+                )
+                return result
+        except Exception:
+            pass  # if check fails, continue — don't block on it
+
+    # Rebuild background constraints for the renamed namespace
+    bound_var_names: set[str] = ctx.get("bound_var_names", set())
+    bg = solver.build_distinct_constraints(ctx["namespace"], bound_var_names)
+    user_bg = ctx["namespace"].get("background_constraints")
+    if user_bg and hasattr(user_bg, '__iter__'):
+        for c in user_bg:
+            if isinstance(c, z3.BoolRef):
+                bg.append(c)
+    if world_assumption == "cwa":
+        cwa_axioms = build_cwa_constraints(
+            namespace=ctx["namespace"],
+            premises=list(ctx["premises"]),
+            q=ctx["q"],
+            bound_var_names=bound_var_names,
+        )
+        bg.extend(cwa_axioms)
+
+    solver_premises = list(ctx["premises"]) + bg
+
+    try:
+        if task_type == "three_class":
+            new_verdict, new_model_info, new_model_info_q = solver.check_entailment_three_class(
+                solver_premises, ctx["q"]
+            )
+        else:
+            new_verdict, new_model_info = solver.check_entailment(solver_premises, ctx["q"])
+            new_model_info_q = None
+    except Exception as e:
+        logger.warning("Phase 1.6: solver error after canonicalization, reverting: %s", e)
+        return result
+
+    logger.info(
+        "Phase 1.6: unified %d identifier(s) %s; verdict %s → %s",
+        len(subst_map), list(subst_map.keys()), result.verdict, new_verdict,
+    )
+
+    return replace(
+        result,
+        raw_code=ctx["raw_code"],
+        premises=list(ctx["premises"]),
+        q=ctx["q"],
+        background_constraints=bg,
+        bound_var_names=bound_var_names,
+        namespace=ctx["namespace"],
+        verdict=new_verdict,
+        model_info=new_model_info,
+        model_info_q=new_model_info_q,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -753,8 +973,9 @@ def _validate_output(
 
     Checks (in order):
     1. `premises` is a sized sequence with the correct length
-    2. Every entry in `premises` is a z3.BoolRef
-    3. `q` is a z3.BoolRef
+    2. Every entry in `premises` is a z3.BoolRef without raw/trivial bool literals
+    3. Ground disjunctive premises are not strengthened with extra conjuncts
+    4. `q` is a z3.BoolRef without raw/trivial bool literals
 
     Returns (error_msg, feedback_list) on failure, None on success.
     """
@@ -793,6 +1014,16 @@ def _validate_output(
 
     # --- Check 2: BoolRef for each premise ---
     for i, f in enumerate(premises):
+        if isinstance(f, bool):
+            return (
+                f"Validation error: premises[{i}] is a raw Python boolean "
+                f"(`{f}`), not a Z3 formula.",
+                [
+                    f"premises[{i}] must be a Z3 BoolRef built from declared predicates.",
+                    "Do not assign plain Python `True`/`False` to any premise.",
+                    "Translate the NL premise into a predicate or relation formula instead.",
+                ],
+            )
         if not isinstance(f, z3.BoolRef):
             return (
                 f"Validation error: premises[{i}] is not a Z3 boolean formula "
@@ -806,12 +1037,43 @@ def _validate_output(
                     "Ensure every entry in `premises` is a formula that Z3 treats as Bool.",
                 ],
             )
+        if _contains_boolean_literal(f):
+            return (
+                f"Validation error: premises[{i}] contains a literal boolean "
+                f"constant ({str(f)[:80]}).",
+                [
+                    "Do not use literal `True`/`False` inside premise formulas.",
+                    "Do not encode a premise as a tautology, contradiction, or helper "
+                    "literal such as `True`, `False`, `BoolVal(True)`, or `If(True, ..., ...)`.",
+                    "Use predicates and relations that are explicitly supported by the NL.",
+                ],
+            )
+        if _is_strengthened_disjunctive_premise(premises_nl[i], f):
+            return (
+                f"Validation error: premises[{i}] strengthens a disjunctive NL premise "
+                f"with an extra conjunction ({str(f)[:80]}).",
+                [
+                    "This numbered NL premise is a plain disjunction, not a conjunction.",
+                    "Keep it as a disjunction such as `Or(...)` if the NL only says `or`.",
+                    "Do not repair vacuousness by wrapping a disjunction as "
+                    "`And(Or(...), extra_fact)` or by smuggling extra ground facts into it.",
+                ],
+            )
 
-    # --- Check 3: BoolRef for q ---
+    # --- Check 4: BoolRef for q ---
     if q is None:
         return (
             "Validation error: `q` is not defined.",
             ["Define `q` as the Z3 formula for the conclusion (a BoolRef expression)."],
+        )
+    if isinstance(q, bool):
+        return (
+            f"Validation error: `q` is a raw Python boolean (`{q}`), not a Z3 formula.",
+            [
+                "`q` must be a BoolRef formula for the conclusion.",
+                "Do not assign plain Python `True`/`False` to `q`.",
+                "Translate the conclusion into declared predicates and relations instead.",
+            ],
         )
     if not isinstance(q, z3.BoolRef):
         return (
@@ -822,8 +1084,59 @@ def _validate_output(
                 "Non-boolean function applications cannot be used as `q` directly.",
             ],
         )
+    if _contains_boolean_literal(q):
+        return (
+            f"Validation error: `q` contains a literal boolean constant "
+            f"({str(q)[:80]}).",
+            [
+                "Do not use literal `True`/`False` inside `q`.",
+                "The conclusion must be expressed with declared predicates and relations.",
+            ],
+        )
 
     return None
+
+
+def _contains_boolean_literal(expr: z3.ExprRef) -> bool:
+    """Return True if a Z3 formula contains an explicit True/False literal node."""
+    found = False
+
+    def _walk(node: z3.ExprRef) -> None:
+        nonlocal found
+        if found:
+            return
+        if z3.is_true(node) or z3.is_false(node):
+            found = True
+            return
+        if z3.is_app(node):
+            for child in node.children():
+                _walk(child)
+        elif z3.is_quantifier(node):
+            _walk(node.body())
+
+    _walk(expr)
+    return found
+
+
+def _is_strengthened_disjunctive_premise(
+    premise_nl: str,
+    formula: z3.BoolRef,
+) -> bool:
+    """
+    Detect the specific repair hack `And(Or(...), extra_fact)` for NL premises
+    that are plain disjunctions.
+    """
+    nl = premise_nl.lower()
+    has_disjunction = re.search(r"\b(or|either)\b", nl) is not None
+    has_conjunction = re.search(
+        r"\b(and|both|together with|as well as|but also)\b",
+        nl,
+    ) is not None
+    if not has_disjunction or has_conjunction:
+        return False
+    if not _is_ground_fact(formula) or not z3.is_and(formula):
+        return False
+    return any(z3.is_or(child) for child in formula.children())
 
 
 def _check_model_vacuousness(
@@ -904,6 +1217,13 @@ def _check_model_vacuousness(
             if nb not in reachable:
                 reachable.add(nb)
                 frontier.append(nb)
+
+    # If any conclusion-reachable predicate is already grounded by a concrete
+    # premise, a non-Entailed countermodel may be perfectly legitimate rather
+    # than evidence of an under-formalized proof chain. In that case, skip the
+    # vacuousness retry heuristic instead of pushing the model to invent facts.
+    if reachable & ground_pred_names:
+        return False, []
 
     # Target = conclusion-reachable AND not covered by a ground fact.
     target_pred_names: set[str] = reachable - ground_pred_names

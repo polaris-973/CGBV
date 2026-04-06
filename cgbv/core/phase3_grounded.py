@@ -48,6 +48,8 @@ async def run_phase3(
     prompt_engine: PromptEngine,
     max_retries: int = 2,
     world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+    fol_formula_strs: list[str] | None = None,
 ) -> Phase3Result:
     """
     Phase 3: Grounded Re-Formalization.
@@ -58,7 +60,11 @@ async def run_phase3(
     All sentences are processed in parallel via asyncio.gather.
     """
     tasks = [
-        _formalize_one(idx, sentence, domain_desc_str, domain, llm, prompt_engine, max_retries, world_assumption)
+        _formalize_one(
+            idx, sentence, domain_desc_str, domain, llm, prompt_engine,
+            max_retries, world_assumption, solver,
+            fol_formula_str=fol_formula_strs[idx] if fol_formula_strs else None,
+        )
         for idx, sentence in enumerate(sentences)
     ]
     results: list[GroundedFormula] = await asyncio.gather(*tasks)
@@ -74,8 +80,11 @@ async def _formalize_one(
     prompt_engine: PromptEngine,
     max_retries: int,
     world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+    fol_formula_str: str | None = None,
 ) -> GroundedFormula:
-    messages = _build_messages(sentence, domain_desc_str, prompt_engine, world_assumption)
+    messages = _build_messages(sentence, domain_desc_str, prompt_engine, world_assumption,
+                               fol_formula_str=fol_formula_str)
     last_error: str | None = None
     raw_output = ""
     attempts: list[GroundingAttempt] = []
@@ -111,6 +120,17 @@ async def _formalize_one(
             attempt_record.validation_error = err
             attempts.append(attempt_record)
             logger.debug("Phase 3 idx=%d attempt %d: validation error: %s", idx, attempt + 1, err)
+            continue
+
+        runtime_err = _validate_formula_runtime(formula_code, domain, solver)
+        if runtime_err:
+            last_error = runtime_err
+            attempt_record.validation_error = runtime_err
+            attempts.append(attempt_record)
+            logger.debug(
+                "Phase 3 idx=%d attempt %d: runtime validation error: %s",
+                idx, attempt + 1, runtime_err,
+            )
             continue
 
         attempt_record.accepted = True
@@ -267,12 +287,15 @@ async def reground_with_hint(
     )
 
 
-def _build_messages(sentence: str, domain_desc_str: str, prompt_engine: PromptEngine, world_assumption: str = "owa") -> list[dict]:
+def _build_messages(sentence: str, domain_desc_str: str, prompt_engine: PromptEngine,
+                    world_assumption: str = "owa",
+                    fol_formula_str: str | None = None) -> list[dict]:
     user_content = prompt_engine.render(
         "phase3_grounded.j2",
         sentence=sentence,
         domain_desc=domain_desc_str,
         world_assumption=world_assumption,
+        fol_formula=fol_formula_str,
     )
     return [{"role": "user", "content": user_content}]
 
@@ -410,6 +433,24 @@ def _validate_formula(formula_code: str, domain: dict) -> str | None:
         if fstring_err:
             return fstring_err
 
+    return None
+
+
+def _validate_formula_runtime(
+    formula_code: str,
+    domain: dict,
+    solver: "Z3Solver | None",
+) -> str | None:
+    """Reject grounded formulas that are syntactically valid but not executable."""
+    if solver is None:
+        return None
+    actual_truth = solver.evaluate_grounded_formula(domain, formula_code)
+    if actual_truth is None:
+        return (
+            "Grounded formula is syntactically valid but could not be executed on "
+            "the witness domain. Check generator variable scope, f-string keys, "
+            "and value[]/truth[] references."
+        )
     return None
 
 

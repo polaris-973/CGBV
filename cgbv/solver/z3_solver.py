@@ -109,10 +109,15 @@ class Z3Solver:
             bound_var_names = set()
 
         sort_to_consts: dict[str, list[z3.ExprRef]] = {}
+        seen_ids: set[int] = set()
         for name, obj in namespace.items():
             if name.startswith("_") or name in bound_var_names:
                 continue
             if isinstance(obj, z3.ExprRef) and not isinstance(obj, z3.BoolRef):
+                expr_id = obj.get_id()
+                if expr_id in seen_ids:
+                    continue
+                seen_ids.add(expr_id)
                 sort_key = str(obj.sort())
                 if sort_key not in sort_to_consts:
                     sort_to_consts[sort_key] = []

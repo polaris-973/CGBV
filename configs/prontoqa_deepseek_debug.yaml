@@ -1,9 +1,9 @@
 experiment:
-  id: folio_deepseek_debug
-  description: "Debug run: FOLIO validation, DeepSeek"
+  id: prontoqa_deepseek_debug
+  description: "Debug run: ProntoQA validation, DeepSeek"
 
 dataset:
-  name: folio
+  name: prontoqa
   split: validation
   path: ./datasets
   limit: 100
@@ -22,9 +22,9 @@ llm:
 pipeline:
   num_witnesses: 3
   r_max: 3
-  formalize_retries: 3
+  formalize_retries: 5
   grounding_retries: 3
-  repair_retries: 2
+  repair_retries: 3
   bridge_retries: 2               # Phase 1.5 bridge axiom LLM retries per orphaned premise
   batch_repair_threshold: 2       # deprecated: unified repair always uses joint mode
   min_uncertain_witnesses: 2      # minimum witnesses for Uncertain verdicts

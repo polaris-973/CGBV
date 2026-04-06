@@ -11,61 +11,97 @@ You are fixing a predicate vocabulary connectivity issue in a Z3-Python logical 
 ## Problem: Premise {{ premise_index }} is Structurally Disconnected
 
 **Premise {{ premise_index }}** uses predicate(s) `{{ orphaned_preds | join(", ") }}` that do not
-appear in any universal rule or the conclusion.  This means the premise can **never** contribute
-to deriving the conclusion — the proof chain is broken.
+appear in any universal rule or the conclusion. The premise can **never** contribute to deriving
+the conclusion — the proof chain is broken.
 
-- NL text:       "{{ nl_text }}"
-- Current formula: `{{ current_formula }}`
-- Orphaned predicate(s): {{ orphaned_preds }}
+- NL text:          "{{ nl_text }}"
+- Current formula:  `{{ current_formula }}`
+- Orphaned predicate(s): `{{ orphaned_preds | join(", ") }}`
 
 ---
 
-## Connected Predicate Vocabulary
+{% if retry_context %}
+## Previous Bridge Rejected
 
-The following predicates **do** appear in the proof chain (other premises and conclusion):
+{% if retry_context.reason == "entails_conclusion" %}
+Your previous bridge was rejected because it **directly proves the conclusion** via the existing premises.
 
-**Connected predicates:** {{ connected_preds | join(", ") }}
+- **Rejected bridge**: `{{ retry_context.rejected_bridge }}`
+- **Reason**: `premises ∪ {bridge}` makes `{{ conclusion_formula }}` unavoidable — Z3 confirms
+  the conclusion is forced even before any grounding. This is conclusion injection and must NOT be used.
 
-### Other premises (for context):
+Generate a **different** bridge that:
+1. Does **NOT** entail `{{ conclusion_formula }}` even when combined with ALL existing premises
+2. Still connects `{{ orphaned_preds | join(", ") }}` to the proof chain via a semantically valid link
+3. Does **NOT** contradict any existing premise
+
+{% else %}
+Your previous bridge was rejected because it creates a **logical contradiction** with the existing premises.
+
+- **Rejected bridge**: `{{ retry_context.rejected_bridge }}`
+- **Reason**: Adding this bridge makes the premise set unsatisfiable (Z3 reports UNSAT). This would
+  cause Z3 to vacuously prove any conclusion — it must NOT be used.
+
+Generate a **different** bridge that:
+1. Does **NOT** contradict any existing premise
+2. Still connects `{{ orphaned_preds | join(", ") }}` to the proof chain via a semantically valid link
+3. Does **NOT** directly prove the conclusion `{{ conclusion_formula }}`
+{% endif %}
+
+If no valid alternative exists, output `NONE`.
+
+---
+{% endif %}
+## Proof-Chain Context
+
+**Conclusion to prove:**
+- NL:      "{{ conclusion_nl }}"
+- Formula: `{{ conclusion_formula }}`
+
+**Connected predicates** (appear in connected premises or the conclusion):
+`{{ connected_preds | join(", ") }}`
+
+**Other premises (for context):**
 {% for i, nl, fol in other_premises %}
 Premise {{ i }}: "{{ nl }}"
   → `{{ fol }}`
 {% endfor %}
 
-Conclusion: "{{ conclusion_nl }}"
-  → `{{ conclusion_formula }}`
-
 ---
 
 ## Your Task
 
-Write a **linking axiom** — a universal rule that connects the orphaned predicate(s) to
-the connected predicate vocabulary, thereby bridging the proof chain.
+Write a **linking axiom** — a universally-quantified rule that connects the orphaned
+predicate(s) `{{ orphaned_preds | join(", ") }}` into the connected proof chain, so that
+Premise {{ premise_index }} can participate in deriving the conclusion.
 
-**Guiding question:** What general semantic relationship exists between the orphaned
-predicate(s) `{{ orphaned_preds | join(", ") }}` and the connected predicates
-`{{ connected_preds | join(", ") }}` that would allow Premise {{ premise_index }} to
-participate in deriving the conclusion?
+What general semantic relationship between the orphaned and connected predicates is
+**directly supported by the NL text**?
 
-**Examples of linking axioms:**
-- If orphaned `is_cat(x)` and connected `is_pet(x)`:
+**Examples of valid linking axioms:**
+- Orphaned `is_cat`, connected `is_pet`:
   → `ForAll([x], Implies(is_cat(x), is_pet(x)))`
-- If orphaned `applying_to_take(x, y)` and connected `gre_applicant(x)`:
+- Orphaned `applying_to_take(x, y)`, connected `gre_applicant`:
   → `ForAll([x], Implies(Exists([y], applying_to_take(x, y)), gre_applicant(x)))`
-- If orphaned `is_mature_stock(x)` and connected `is_stock(x)`:
+- Orphaned `is_mature_stock`, connected `is_stock`:
   → `ForAll([x], Implies(is_mature_stock(x), is_stock(x)))`
 
-**Rules:**
-- If no semantically justified linking axiom exists between the orphaned and connected
-  predicates — i.e., the NL text does NOT state or imply a general relationship —
-  output the single word `NONE` (uppercase). Do NOT invent relationships that lack
-  textual support.
-- The axiom MUST be a **universally quantified rule** (ForAll/Exists form).
-  Do NOT output a ground fact (e.g. `is_stock(ko)`) — ground facts replace individual
-  premises rather than bridging the proof chain.
-- Use **ONLY** identifiers (predicates, constants, sorts, bound variables) already declared
-  in the code above.  Do NOT introduce new names.
-- Output **ONLY** the Python expression for the linking axiom (or `NONE`).
-- No imports, no assignments, no comments, no prose.
-- If not `NONE`, the output must be a Z3 boolean expression (BoolRef) that can be evaluated
-  in the same namespace as the original code.
+**When to output `NONE` (uppercase):**
+- The NL text does not state or imply a general relationship between the orphaned and
+  connected predicates — do NOT invent relationships without textual support.
+- The only plausible link would directly target the conclusion predicate `{{ conclusion_formula }}`.
+  A bridge that trivially proves the conclusion bypasses the proof chain and constitutes
+  false premise injection — output `NONE` in this case.
+
+---
+
+## Output Rules
+
+1. **Bridge guard**: Do NOT output a bridge whose consequent directly contains or trivially
+   implies the conclusion formula `{{ conclusion_formula }}`. If the only plausible link leads
+   directly to the conclusion predicate, output `NONE`.
+2. The axiom MUST be universally quantified (`ForAll`/`Exists` form). Do NOT output a ground fact.
+3. Use ONLY identifiers already declared in the code above. Do NOT introduce new names.
+4. Output ONLY the Python expression (or `NONE`). No imports, assignments, comments, or prose.
+5. The output (if not `NONE`) must be a valid Z3 `BoolRef` evaluable in the same namespace
+   as the original code.

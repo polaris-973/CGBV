@@ -1,79 +1,295 @@
-# Few-shot examples for FOLIO dataset (Phase 1 formalization)
+# Few-shot examples
 # Format: premises (list), conclusion (str), code (str)
+# Sources: folio_v2_train.jsonl story_id: 8, 226, 437, 118, 193
+# Each example is annotated with RULE numbers from the phase1_formalize.j2 checklist.
 
+# ── Example 1 ──────────────────────────────────
 - premises:
-    - "All students study hard."
-    - "All students who study hard pass their exams."
-    - "Mary is a student."
-  conclusion: "Mary passes her exams."
+    - "Miroslav Venhoda was a Czech choral conductor who specialized in the performance of Renaissance and Baroque music."
+    - "Any choral conductor is a musician."
+    - "Some musicians love music."
+    - "Miroslav Venhoda published a book in 1946 called Method of Studying Gregorian Chant."
+  conclusion: "Miroslav Venhoda loved music."
   code: |
+    # story_id=8 | label=Uncertain
+    # Key rules: RULE 6, RULE 7, RULE 12, RULE 4(Exists)
     from z3 import *
 
-    Person = DeclareSort('Person')
+    # RULE 6: Only DeclareSort — never IntSort() or StringSort()
+    Entity = DeclareSort('Entity')
 
-    mary = Const('mary', Person)
-    p    = Const('p',    Person)
+    # RULE 1: Every entity is a named Const — no Sort!val!N ever
+    MiroslavVenhoda = Const('MiroslavVenhoda', Entity)
+    Y1946 = Const('Y1946', Entity)  # RULE 6: year 1946 → named Const, NOT IntVal(1946)
 
-    is_student   = Function('is_student',   Person, BoolSort())
-    studies_hard = Function('studies_hard', Person, BoolSort())
-    passes_exams = Function('passes_exams', Person, BoolSort())
+    # Predicates
+    # RULE 7: 'Czech choral conductor who specialized in Renaissance and Baroque music'
+    #         → THREE separate predicates, not one compressed name
+    is_czech = Function('is_czech', Entity, BoolSort())
+    is_choral_conductor = Function('is_choral_conductor', Entity, BoolSort())
+    specialized_renaissance_baroque = Function('specialized_renaissance_baroque', Entity, BoolSort())
+    is_musician = Function('is_musician', Entity, BoolSort())
+    loves_music = Function('loves_music', Entity, BoolSort())
+    published_book_in = Function('published_book_in', Entity, Entity, BoolSort())
 
-    f1 = ForAll([p], Implies(is_student(p), studies_hard(p)))
-    f2 = ForAll([p], Implies(studies_hard(p), passes_exams(p)))
-    f3 = is_student(mary)
-    premises = [f1, f2, f3]
+    # RULE 3: bound variable separate from entity constants
+    x = Const('x', Entity)
 
-    q = passes_exams(mary)
+    # RULE 9: 4 premises in → 4 formulas in premises[]
+    premises = [
+        # P1: RULE 12 — 'was a Czech choral conductor' → type predicates is_czech(x),
+        #     is_choral_conductor(x) — NEVER entity equality like MiroslavVenhoda == conductor
+        # P1: RULE 7 — compound description decomposes into three separate predicates
+        And(is_czech(MiroslavVenhoda),
+            is_choral_conductor(MiroslavVenhoda),
+            specialized_renaissance_baroque(MiroslavVenhoda)),
+        # P2: RULE 4 — 'Any ... is ...' → ForAll + Implies
+        ForAll([x], Implies(is_choral_conductor(x), is_musician(x))),
+        # P3: RULE 4 — 'Some musicians ...' → Exists (not ForAll)
+        # RULE 2 — Exists list [x] is non-empty
+        Exists([x], And(is_musician(x), loves_music(x))),
+        # P4: RULE 6 — year '1946' → Const('Y1946', Entity), never IntVal(1946)
+        published_book_in(MiroslavVenhoda, Y1946),
+    ]
 
+    # label=Uncertain: P3 shows SOME musician loves music but gives no info about Miroslav
+    q = loves_music(MiroslavVenhoda)
+
+# ── Example 2 ─────────────────────────────────────
 - premises:
-    - "Every lawyer represents some client."
-    - "No client is a judge."
-    - "Alice is a lawyer."
-  conclusion: "Alice represents someone who is not a judge."
+    - "William Dickinson was a British politician who sat in the House of Commons."
+    - "William Dickinson attended Westminster school for high school and then the University of Edinburgh."
+    - "The University of Edinburgh is a university located in the United Kingdom."
+    - "William Dickinson supported the Portland Whigs."
+    - "People who supported the Portland Whigs did not get a seat in the Parliament."
+  conclusion: "William Dickinson did not get a seat in Parliament."
   code: |
+    # story_id=226 | label=True
+    # Key rules: RULE 12, RULE 7, RULE 8, RULE 4(ForAll)
     from z3 import *
 
-    Person = DeclareSort('Person')
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
 
-    alice = Const('alice', Person)
-    x     = Const('x',     Person)
-    y     = Const('y',     Person)
+    # RULE 1: every entity is a named Const
+    # RULE 8: 'The University of Edinburgh' → UnivEdinburgh used identically in P2 AND P3
+    WilliamDickinson   = Const('WilliamDickinson', Entity)
+    UnivEdinburgh      = Const('UnivEdinburgh', Entity)   # RULE 8: same Const in P2 and P3
+    WestminsterSchool  = Const('WestminsterSchool', Entity)
+    PortlandWhigs      = Const('PortlandWhigs', Entity)
 
-    is_lawyer     = Function('is_lawyer',     Person, BoolSort())
-    is_client     = Function('is_client',     Person, BoolSort())
-    is_judge      = Function('is_judge',      Person, BoolSort())
-    represents    = Function('represents',    Person, Person, BoolSort())
+    # Predicates
+    # RULE 12: 'was a British politician' → type predicates, NOT WilliamDickinson == politician_entity
+    # RULE 7: 'British politician who sat in the House of Commons' → THREE separate predicates
+    is_british              = Function('is_british', Entity, BoolSort())
+    is_politician           = Function('is_politician', Entity, BoolSort())
+    sat_in_house_of_commons = Function('sat_in_house_of_commons', Entity, BoolSort())
+    attended_highschool     = Function('attended_highschool', Entity, Entity, BoolSort())
+    attended_university     = Function('attended_university', Entity, Entity, BoolSort())
+    is_university           = Function('is_university', Entity, BoolSort())  # RULE 12: type predicate
+    located_in_uk           = Function('located_in_uk', Entity, BoolSort())
+    supported               = Function('supported', Entity, Entity, BoolSort())
+    got_seat_in_parliament  = Function('got_seat_in_parliament', Entity, BoolSort())
 
-    f1 = ForAll([x], Implies(is_lawyer(x), Exists([y], And(is_client(y), represents(x, y)))))
-    f2 = ForAll([x], Implies(is_client(x), Not(is_judge(x))))
-    f3 = is_lawyer(alice)
-    premises = [f1, f2, f3]
+    # RULE 3: bound variable separate from entity constants
+    x = Const('x', Entity)
 
-    q = Exists([y], And(represents(alice, y), Not(is_judge(y))))
+    # RULE 9: 5 premises in → 5 formulas in premises[]
+    premises = [
+        # P1: RULE 12 — 'was a British politician' → type predicates is_british, is_politician
+        #     RULE 7 — 'British politician who sat in House of Commons' → 3 separate predicates
+        And(is_british(WilliamDickinson),
+            is_politician(WilliamDickinson),
+            sat_in_house_of_commons(WilliamDickinson)),
+        # P2: RULE 8 — UnivEdinburgh must match exactly the Const declared above
+        And(attended_highschool(WilliamDickinson, WestminsterSchool),
+            attended_university(WilliamDickinson, UnivEdinburgh)),
+        # P3: RULE 12 — 'is a university' → type predicate is_university(x), not entity equality
+        #     RULE 8 — UnivEdinburgh reused with identical spelling from P2
+        And(is_university(UnivEdinburgh),
+            located_in_uk(UnivEdinburgh)),
+        # P4: ground fact — binary predicate
+        supported(WilliamDickinson, PortlandWhigs),
+        # P5: RULE 4 — 'people who ... did not ...' → ForAll + Implies + Not
+        ForAll([x], Implies(supported(x, PortlandWhigs), Not(got_seat_in_parliament(x)))),
+    ]
 
+    # label=True: P4 + P5 → Not(got_seat_in_parliament(WilliamDickinson))
+    q = Not(got_seat_in_parliament(WilliamDickinson))
+
+# ── Example 3 ─────────────────────────────────────
 - premises:
-    - "All mammals are warm-blooded."
-    - "Whales are mammals."
-    - "Dolphins are mammals."
-    - "No fish is warm-blooded."
-  conclusion: "Whales are not fish."
+    - "Researchers present their work at the conference or provide a tutorial session there."
+    - "Everyone who presents their work at the conference will attend in person."
+    - "Everyone providing a tutorial session at the conference will be invited to join the club."
+    - "Everyone who attends the conference in person is provided with souvenirs."
+    - "Everyone invited to join the club is provided with delicious meals."
+    - "Everyone provided with delicious meals is happy to communicate with each other during the dinner."
+    - "Everyone who is provided with delicious meals is invited to take a photo with the audience."
+    - "It is not true that James both attended the conference in person and was provided with souvenirs."
+  conclusion: "James is invited to take a photo with the audience and is happy to communicate with other guests at the dinner."
   code: |
+    # story_id=437 | label=True
+    # Key rules: RULE 11, RULE 4(ForAll + Or), RULE 2/3
     from z3 import *
 
-    Animal = DeclareSort('Animal')
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
 
-    whale   = Const('whale',   Animal)
-    dolphin = Const('dolphin', Animal)
-    a       = Const('a',       Animal)
+    # RULE 1: named Const for James
+    James = Const('James', Entity)
 
-    is_mammal       = Function('is_mammal',       Animal, BoolSort())
-    is_warm_blooded = Function('is_warm_blooded', Animal, BoolSort())
-    is_fish         = Function('is_fish',         Animal, BoolSort())
+    # Predicates
+    # RULE 11: synonymous NL phrases across premises → THE SAME predicate name.
+    #   'presents their work at the conference' appears in P1 and P2 — use ONE name.
+    #   'attends the conference in person' appears in P2, P4, P8 — use ONE name.
+    #   Using different names for the same action silently breaks inference chains.
+    presents_work_at_conference = Function('presents_work_at_conference', Entity, BoolSort())
+    provides_tutorial           = Function('provides_tutorial', Entity, BoolSort())
+    attends_in_person           = Function('attends_in_person', Entity, BoolSort())  # RULE 11: P2, P4, P8
+    invited_to_club             = Function('invited_to_club', Entity, BoolSort())
+    provided_with_souvenirs     = Function('provided_with_souvenirs', Entity, BoolSort())  # RULE 11: P4, P8
+    provided_with_meals         = Function('provided_with_meals', Entity, BoolSort())
+    happy_to_communicate        = Function('happy_to_communicate', Entity, BoolSort())
+    invited_to_photo            = Function('invited_to_photo', Entity, BoolSort())
 
-    f1 = ForAll([a], Implies(is_mammal(a), is_warm_blooded(a)))
-    f2 = is_mammal(whale)
-    f3 = is_mammal(dolphin)
-    f4 = ForAll([a], Implies(is_fish(a), Not(is_warm_blooded(a))))
-    premises = [f1, f2, f3, f4]
+    # RULE 3: bound variable separate from James
+    x = Const('x', Entity)
 
-    q = Not(is_fish(whale))
+    # RULE 9: 8 premises in → 8 formulas in premises[]
+    premises = [
+        # P1: RULE 4 — disjunctive universal: ForAll + Or
+        #     RULE 11 — presents_work_at_conference defined here; P2 MUST reuse the SAME name
+        ForAll([x], Or(presents_work_at_conference(x), provides_tutorial(x))),
+        # P2: RULE 11 — 'presents their work at the conference' = presents_work_at_conference (P1)
+        #              'attend in person' = attends_in_person (same name used in P4, P8)
+        ForAll([x], Implies(presents_work_at_conference(x), attends_in_person(x))),
+        # P3: ForAll + Implies
+        ForAll([x], Implies(provides_tutorial(x), invited_to_club(x))),
+        # P4: RULE 11 — 'attends the conference in person' = attends_in_person (P2, P8)
+        ForAll([x], Implies(attends_in_person(x), provided_with_souvenirs(x))),
+        # P5-P7: ForAll + Implies chains
+        ForAll([x], Implies(invited_to_club(x), provided_with_meals(x))),
+        ForAll([x], Implies(provided_with_meals(x), happy_to_communicate(x))),
+        ForAll([x], Implies(provided_with_meals(x), invited_to_photo(x))),
+        # P8: RULE 11 — 'attended in person' = attends_in_person (P2, P4)
+        #              'provided with souvenirs' = provided_with_souvenirs (P4)
+        Not(And(attends_in_person(James), provided_with_souvenirs(James))),
+    ]
+
+    # label=True: P8+P4 contrapositive → Not(attends_in_person(James))
+    #   P2 contrapositive → Not(presents_work_at_conference(James))
+    #   P1 → provides_tutorial(James) → P3 → invited_to_club → P5 → provided_with_meals
+    #   P6 → happy_to_communicate; P7 → invited_to_photo
+    q = And(invited_to_photo(James), happy_to_communicate(James))
+
+# ── Example 4 ────────────────────────────────────
+- premises:
+    - "Musicians have very busy lives."
+    - "Singh Kaur is a musician and famous."
+    - "If a musician is not famous, that musician will not make a lot of money."
+    - "A musician can be a singer or a writer."
+  conclusion: "Singh Kaur makes a lot of money."
+  code: |
+    # story_id=118 | label=Uncertain
+    # Key rules: RULE 4 (bare generic), RULE 1, RULE 2, RULE 12, RULE 9
+    from z3 import *
+
+    # RULE 6: DeclareSort only — never IntSort() or StringSort()
+    Entity = DeclareSort('Entity')
+
+    # RULE 1: Every entity is a named Const — no Sort!val!N ever
+    SinghKaur = Const('SinghKaur', Entity)
+
+    # Predicates
+    # RULE 12: 'is a musician' → type predicate is_musician(), NEVER entity equality
+    is_musician         = Function('is_musician', Entity, BoolSort())
+    has_very_busy_life  = Function('has_very_busy_life', Entity, BoolSort())
+    is_famous           = Function('is_famous', Entity, BoolSort())
+    makes_lots_of_money = Function('makes_lots_of_money', Entity, BoolSort())
+    is_singer           = Function('is_singer', Entity, BoolSort())
+    is_writer           = Function('is_writer', Entity, BoolSort())
+
+    # RULE 3: bound variable separate from entity constants
+    x = Const('x', Entity)
+
+    # RULE 9: 4 premises in → 4 formulas in premises[]
+    premises = [
+        # P1: RULE 4 — bare generic: 'Musicians have very busy lives'
+        #     bare plural subject 'Musicians' (no determiner) → ForAll + Implies
+        #     NEVER Exists — bare plurals express universal generalizations
+        ForAll([x], Implies(is_musician(x), has_very_busy_life(x))),
+        # P2: RULE 1 — 'Singh Kaur' → named Const SinghKaur
+        #     RULE 12 — 'is a musician and famous' → two separate type predicates,
+        #               NOT SinghKaur == some_musician_const
+        And(is_musician(SinghKaur), is_famous(SinghKaur)),
+        # P3: 'If a musician is not famous ...' — bare indefinite generic 'a musician'
+        #     equivalent to 'every musician who is not famous' → ForAll + Implies + Not
+        ForAll([x], Implies(And(is_musician(x), Not(is_famous(x))), Not(makes_lots_of_money(x)))),
+        # P4: RULE 4 — 'A musician can be a singer or a writer' → Exists (not ForAll)
+        #     'can be' expresses a possibility for some musicians, not a universal law
+        #     RULE 2 — Exists list [x] is non-empty
+        Exists([x], And(is_musician(x), Or(is_singer(x), is_writer(x)))),
+    ]
+
+    # label=Uncertain: Singh Kaur IS famous (P2) → P3 does not constrain her.
+    # Nothing in P1/P2/P4 proves or disproves makes_lots_of_money(SinghKaur) → Uncertain
+    q = makes_lots_of_money(SinghKaur)
+
+# ── Example 5 ─────────────────────────────────────
+- premises:
+    - "A La Liga soccer team ranks higher than another La Liga soccer team if it receives more points."
+    - "If there are two La Liga soccer teams and neither has more points than the other, then the team which receives more points from the games between the two teams ranks higher."
+    - "Real Madrid and Barcelona are both La Liga soccer teams."
+    - "Real Madrid received more points than Barcelona."
+    - "Neither Real Madrid nor Barcelona received more points from the games between them."
+  conclusion: "Real Madrid ranks higher than Barcelona."
+  code: |
+    # story_id=193 | label=True
+    # Key rules: RULE 10 (comparison predicate asymmetry axiom), RULE 1, RULE 9
+    from z3 import *
+
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+
+    # RULE 1: team names are named Consts — no Sort!val!N
+    RealMadrid = Const('RealMadrid', Entity)
+    Barcelona  = Const('Barcelona', Entity)
+
+    # Predicates
+    is_laliga_team         = Function('is_laliga_team', Entity, BoolSort())
+    ranks_higher           = Function('ranks_higher', Entity, Entity, BoolSort())
+    more_points_than       = Function('more_points_than', Entity, Entity, BoolSort())
+    more_game_points_than  = Function('more_game_points_than', Entity, Entity, BoolSort())
+
+    # RULE 3: bound variables separate from named constants
+    x = Const('x', Entity)
+    y = Const('y', Entity)
+
+    # RULE 9: 5 premises in → 5 formulas in premises[]
+    premises = [
+        # P1: RULE 4 — 'if A then B' → ForAll + Implies
+        ForAll([x, y], Implies(
+            And(is_laliga_team(x), is_laliga_team(y), more_points_than(x, y)),
+            ranks_higher(x, y))),
+        # P2: ForAll + Implies with negative antecedents
+        ForAll([x, y], Implies(
+            And(is_laliga_team(x), is_laliga_team(y),
+                Not(more_points_than(x, y)), Not(more_points_than(y, x)),
+                more_game_points_than(x, y)),
+            ranks_higher(x, y))),
+        # P3: conjunction of two ground type facts
+        And(is_laliga_team(RealMadrid), is_laliga_team(Barcelona)),
+        # P4: ground comparison fact
+        more_points_than(RealMadrid, Barcelona),
+        # P5: neither direction has more game points
+        And(Not(more_game_points_than(RealMadrid, Barcelona)),
+            Not(more_game_points_than(Barcelona, RealMadrid))),
+    ]
+
+    # RULE 10: more_points_than is an uninterpreted comparison predicate — add asymmetry axiom.
+    # Without this, the solver cannot exclude more_points_than(Barcelona, RealMadrid) being
+    # simultaneously true, leading to spurious inferences.
+    background_constraints = [
+        ForAll([x, y], Implies(more_points_than(x, y), Not(more_points_than(y, x)))),
+    ]
+
+    # label=True: P3 + P4 + P1 → ranks_higher(RealMadrid, Barcelona)
+    q = ranks_higher(RealMadrid, Barcelona)

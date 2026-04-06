@@ -1,50 +1,230 @@
-# Few-shot examples for ProntoQA dataset (Phase 1 formalization)
-# ProntoQA uses invented (non-real-world) entity and property names to prevent knowledge shortcuts
+# Few-shot examples for ProntoQA
+# Format: premises (list), conclusion (str), code (str)
 
+# ── Example 1 ──────────────────────────────────
 - premises:
-    - "Every tumpus is large."
-    - "Every large tumpus is a wumpus."
-    - "Fae is a tumpus."
-  conclusion: "Fae is a wumpus."
+    - "Every tumpus is not angry."
+    - "Tumpuses are rompuses."
+    - "Every numpus is not bright."
+    - "Rompuses are not luminous."
+    - "Rompuses are yumpuses."
+    - "Yumpuses are transparent."
+    - "Yumpuses are zumpuses."
+    - "Each zumpus is not bitter."
+    - "Zumpuses are impuses."
+    - "Impuses are red."
+    - "Each impus is a dumpus."
+    - "Every dumpus is happy."
+    - "Each dumpus is a vumpus."
+    - "Vumpuses are bright."
+    - "Every vumpus is a jompus."
+    - "Jompuses are large."
+    - "Each jompus is a wumpus."
+    - "Stella is a yumpus."
+  conclusion: "Stella is bright."
+  code: |
+    from z3 import *
+
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+
+    # RULE 1: every entity is a named Const
+    # Use _e suffix to avoid conflicts with Python built-ins
+    stella_e = Const('stella_e', Entity)
+
+    # Predicates — ProntoQA uses invented vocabulary; all predicates are unary
+    is_tumpus      = Function('is_tumpus', Entity, BoolSort())
+    is_angry       = Function('is_angry', Entity, BoolSort())
+    is_rompus      = Function('is_rompus', Entity, BoolSort())
+    is_numpus      = Function('is_numpus', Entity, BoolSort())
+    is_bright      = Function('is_bright', Entity, BoolSort())
+    is_luminous    = Function('is_luminous', Entity, BoolSort())
+    is_yumpus      = Function('is_yumpus', Entity, BoolSort())
+    is_transparent = Function('is_transparent', Entity, BoolSort())
+    is_zumpus      = Function('is_zumpus', Entity, BoolSort())
+    is_bitter      = Function('is_bitter', Entity, BoolSort())
+    is_impus       = Function('is_impus', Entity, BoolSort())
+    is_red         = Function('is_red', Entity, BoolSort())
+    is_dumpus      = Function('is_dumpus', Entity, BoolSort())
+    is_happy       = Function('is_happy', Entity, BoolSort())
+    is_vumpus      = Function('is_vumpus', Entity, BoolSort())
+    is_jompus      = Function('is_jompus', Entity, BoolSort())
+    is_large       = Function('is_large', Entity, BoolSort())
+    is_wumpus      = Function('is_wumpus', Entity, BoolSort())
+
+    # RULE 3: bound variable separate from named entity constants
+    x = Const('x', Entity)
+
+    # RULE 9: 18 premises in → 18 formulas in premises[]
+    premises = [
+        # P1: RULE 4 — 'Every A is not B' → ForAll + Implies + Not
+        ForAll([x], Implies(is_tumpus(x), Not(is_angry(x)))),
+        # P2-P17: RULE 4 — 'A are B' → ForAll + Implies; 'A are not B' → + Not
+        ForAll([x], Implies(is_tumpus(x), is_rompus(x))),
+        ForAll([x], Implies(is_numpus(x), Not(is_bright(x)))),
+        ForAll([x], Implies(is_rompus(x), Not(is_luminous(x)))),
+        ForAll([x], Implies(is_rompus(x), is_yumpus(x))),
+        ForAll([x], Implies(is_yumpus(x), is_transparent(x))),
+        ForAll([x], Implies(is_yumpus(x), is_zumpus(x))),
+        ForAll([x], Implies(is_zumpus(x), Not(is_bitter(x)))),
+        ForAll([x], Implies(is_zumpus(x), is_impus(x))),
+        ForAll([x], Implies(is_impus(x), is_red(x))),
+        ForAll([x], Implies(is_impus(x), is_dumpus(x))),
+        ForAll([x], Implies(is_dumpus(x), is_happy(x))),
+        ForAll([x], Implies(is_dumpus(x), is_vumpus(x))),
+        ForAll([x], Implies(is_vumpus(x), is_bright(x))),
+        ForAll([x], Implies(is_vumpus(x), is_jompus(x))),
+        ForAll([x], Implies(is_jompus(x), is_large(x))),
+        ForAll([x], Implies(is_jompus(x), is_wumpus(x))),
+        # P18: ground fact for Stella — RULE 1: named Const stella_e
+        is_yumpus(stella_e),
+    ]
+    q = is_bright(stella_e)
+
+# ── Example 2 ─────────────────────────────────────
+- premises:
+    - "Vumpuses are floral."
+    - "Vumpuses are tumpuses."
+    - "Tumpuses are brown."
+    - "Each tumpus is a wumpus."
+    - "Wumpuses are small."
+    - "Each wumpus is a rompus."
+    - "Each zumpus is metallic."
+    - "Every rompus is happy."
+    - "Rompuses are impuses."
+    - "Each impus is amenable."
+    - "Each impus is a dumpus."
+    - "Every dumpus is not metallic."
+    - "Dumpuses are numpuses."
+    - "Each numpus is bitter."
+    - "Each numpus is a jompus."
+    - "Every jompus is cold."
+    - "Each jompus is a yumpus."
+    - "Wren is a tumpus."
+  conclusion: "Wren is not metallic."
   code: |
     from z3 import *
 
     Entity = DeclareSort('Entity')
 
-    fae = Const('fae', Entity)
-    x   = Const('x',   Entity)
+    # RULE 1: _e suffix for entity constants
+    wren_e = Const('wren_e', Entity)
 
-    is_tumpus = Function('is_tumpus', Entity, BoolSort())
-    is_large  = Function('is_large',  Entity, BoolSort())
-    is_wumpus = Function('is_wumpus', Entity, BoolSort())
+    is_vumpus   = Function('is_vumpus', Entity, BoolSort())
+    is_floral   = Function('is_floral', Entity, BoolSort())
+    is_tumpus   = Function('is_tumpus', Entity, BoolSort())
+    is_brown    = Function('is_brown', Entity, BoolSort())
+    is_wumpus   = Function('is_wumpus', Entity, BoolSort())
+    is_small    = Function('is_small', Entity, BoolSort())
+    is_rompus   = Function('is_rompus', Entity, BoolSort())
+    is_zumpus   = Function('is_zumpus', Entity, BoolSort())
+    is_metallic = Function('is_metallic', Entity, BoolSort())
+    is_happy    = Function('is_happy', Entity, BoolSort())
+    is_impus    = Function('is_impus', Entity, BoolSort())
+    is_amenable = Function('is_amenable', Entity, BoolSort())
+    is_dumpus   = Function('is_dumpus', Entity, BoolSort())
+    is_numpus   = Function('is_numpus', Entity, BoolSort())
+    is_bitter   = Function('is_bitter', Entity, BoolSort())
+    is_jompus   = Function('is_jompus', Entity, BoolSort())
+    is_cold     = Function('is_cold', Entity, BoolSort())
+    is_yumpus   = Function('is_yumpus', Entity, BoolSort())
 
-    f1 = ForAll([x], Implies(is_tumpus(x), is_large(x)))
-    f2 = ForAll([x], Implies(And(is_large(x), is_tumpus(x)), is_wumpus(x)))
-    f3 = is_tumpus(fae)
-    premises = [f1, f2, f3]
+    x = Const('x', Entity)
 
-    q = is_wumpus(fae)
+    # RULE 9: 18 premises in → 18 formulas in premises[]
+    premises = [
+        ForAll([x], Implies(is_vumpus(x), is_floral(x))),
+        ForAll([x], Implies(is_vumpus(x), is_tumpus(x))),
+        ForAll([x], Implies(is_tumpus(x), is_brown(x))),
+        ForAll([x], Implies(is_tumpus(x), is_wumpus(x))),
+        ForAll([x], Implies(is_wumpus(x), is_small(x))),
+        ForAll([x], Implies(is_wumpus(x), is_rompus(x))),
+        ForAll([x], Implies(is_zumpus(x), is_metallic(x))),
+        ForAll([x], Implies(is_rompus(x), is_happy(x))),
+        ForAll([x], Implies(is_rompus(x), is_impus(x))),
+        ForAll([x], Implies(is_impus(x), is_amenable(x))),
+        ForAll([x], Implies(is_impus(x), is_dumpus(x))),
+        # P12: RULE 4 — 'every dumpus is not metallic' → ForAll + Implies + Not
+        ForAll([x], Implies(is_dumpus(x), Not(is_metallic(x)))),
+        ForAll([x], Implies(is_dumpus(x), is_numpus(x))),
+        ForAll([x], Implies(is_numpus(x), is_bitter(x))),
+        ForAll([x], Implies(is_numpus(x), is_jompus(x))),
+        ForAll([x], Implies(is_jompus(x), is_cold(x))),
+        ForAll([x], Implies(is_jompus(x), is_yumpus(x))),
+        # P18: ground starting fact
+        is_tumpus(wren_e),
+    ]
+    q = Not(is_metallic(wren_e))
 
+# ── Example 3 ─────────────────────────────────────
 - premises:
-    - "All vumpuses are not zumpuses."
-    - "Every zumpus is a dumpus."
-    - "Max is a vumpus."
-  conclusion: "Max is not a dumpus."
+    - "Every rompus is orange."
+    - "Every rompus is an impus."
+    - "Vumpuses are happy."
+    - "Every impus is spicy."
+    - "Every impus is a wumpus."
+    - "Wumpuses are transparent."
+    - "Wumpuses are numpuses."
+    - "Every numpus is not kind."
+    - "Numpuses are tumpuses."
+    - "Each tumpus is not bright."
+    - "Tumpuses are yumpuses."
+    - "Every yumpus is not liquid."
+    - "Yumpuses are dumpuses."
+    - "Each dumpus is not happy."
+    - "Dumpuses are zumpuses."
+    - "Every zumpus is earthy."
+    - "Each zumpus is a jompus."
+    - "Stella is a wumpus."
+  conclusion: "Stella is happy."
   code: |
     from z3 import *
 
     Entity = DeclareSort('Entity')
 
-    max_e = Const('max_e', Entity)
-    x     = Const('x',     Entity)
+    stella_e = Const('stella_e', Entity)
 
-    is_vumpus = Function('is_vumpus', Entity, BoolSort())
-    is_zumpus = Function('is_zumpus', Entity, BoolSort())
-    is_dumpus = Function('is_dumpus', Entity, BoolSort())
+    is_rompus      = Function('is_rompus', Entity, BoolSort())
+    is_orange      = Function('is_orange', Entity, BoolSort())
+    is_impus       = Function('is_impus', Entity, BoolSort())
+    is_vumpus      = Function('is_vumpus', Entity, BoolSort())
+    is_happy       = Function('is_happy', Entity, BoolSort())
+    is_spicy       = Function('is_spicy', Entity, BoolSort())
+    is_wumpus      = Function('is_wumpus', Entity, BoolSort())
+    is_transparent = Function('is_transparent', Entity, BoolSort())
+    is_numpus      = Function('is_numpus', Entity, BoolSort())
+    is_kind        = Function('is_kind', Entity, BoolSort())
+    is_tumpus      = Function('is_tumpus', Entity, BoolSort())
+    is_bright      = Function('is_bright', Entity, BoolSort())
+    is_yumpus      = Function('is_yumpus', Entity, BoolSort())
+    is_liquid      = Function('is_liquid', Entity, BoolSort())
+    is_dumpus      = Function('is_dumpus', Entity, BoolSort())
+    is_zumpus      = Function('is_zumpus', Entity, BoolSort())
+    is_earthy      = Function('is_earthy', Entity, BoolSort())
+    is_jompus      = Function('is_jompus', Entity, BoolSort())
 
-    f1 = ForAll([x], Implies(is_vumpus(x), Not(is_zumpus(x))))
-    f2 = ForAll([x], Implies(is_zumpus(x), is_dumpus(x)))
-    f3 = is_vumpus(max_e)
-    premises = [f1, f2, f3]
+    x = Const('x', Entity)
 
-    q = Not(is_dumpus(max_e))
+    # RULE 9: 18 premises in → 18 formulas in premises[]
+    premises = [
+        ForAll([x], Implies(is_rompus(x), is_orange(x))),
+        ForAll([x], Implies(is_rompus(x), is_impus(x))),
+        ForAll([x], Implies(is_vumpus(x), is_happy(x))),
+        ForAll([x], Implies(is_impus(x), is_spicy(x))),
+        ForAll([x], Implies(is_impus(x), is_wumpus(x))),
+        ForAll([x], Implies(is_wumpus(x), is_transparent(x))),
+        ForAll([x], Implies(is_wumpus(x), is_numpus(x))),
+        ForAll([x], Implies(is_numpus(x), Not(is_kind(x)))),
+        ForAll([x], Implies(is_numpus(x), is_tumpus(x))),
+        ForAll([x], Implies(is_tumpus(x), Not(is_bright(x)))),
+        ForAll([x], Implies(is_tumpus(x), is_yumpus(x))),
+        ForAll([x], Implies(is_yumpus(x), Not(is_liquid(x)))),
+        ForAll([x], Implies(is_yumpus(x), is_dumpus(x))),
+        # P14: end of chain — dumpus → Not(happy) — makes q = False
+        ForAll([x], Implies(is_dumpus(x), Not(is_happy(x)))),
+        ForAll([x], Implies(is_dumpus(x), is_zumpus(x))),
+        ForAll([x], Implies(is_zumpus(x), is_earthy(x))),
+        ForAll([x], Implies(is_zumpus(x), is_jompus(x))),
+        # P18: ground starting fact
+        is_wumpus(stella_e),
+    ]
+    q = is_happy(stella_e)

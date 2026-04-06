@@ -33,240 +33,56 @@ q = other_pred(entity1)
 
 ## Rules
 
-### RULE 1 — Every domain entity MUST be a named Const
+RULE 1  — Every domain entity MUST be a named `Const`. Never rely on unnamed sort elements; Z3 would assign internal names like `Sort!val!0` that downstream code cannot reference.
 
-```python
-# CORRECT: named constants
-alice = Const('alice', Person)
-bob   = Const('bob',   Person)
+RULE 2  — `ForAll`/`Exists` quantifier list must be non-empty. `ForAll([], expr)` is a runtime error.
 
-# FORBIDDEN: relying on unnamed sort elements
-# If you only declare DeclareSort('Person') without Const declarations,
-# Z3 will use internal names like Person!val!0 that downstream code cannot reference.
-```
+RULE 3  — Bound variable must be a separate `Const` from all entity constants. Declare `v = Const('v', Sort)` (or `x`, `p`, etc.) and use it exclusively inside `ForAll`/`Exists`; never reuse an entity constant as a bound variable.
 
-Declare every named entity that appears (explicitly or implicitly) in the premises and conclusion.
+RULE 4  — Universal claims → `ForAll`; existential → `Exists`; "No X is Y" → `ForAll([v], Not(And(is_X(v), is_Y(v))))`. Conditional "if…then" → `Implies`.
+          Bare generic plurals: a bare plural subject without a determiner ("Vacuums suck", "Dogs bark", "Conductors perform") expresses a universal claim about the category — NOT a fact about a singleton entity named after the category.
+          → `ForAll([v], Implies(is_vacuum(v), sucks(v)))`   ✓
+          → `sucks(Vacuums)`   ← treats the category name as a singleton entity   ✗
+          Quick test: can you rephrase as "every [noun]…"? If yes → `ForAll+Implies`.
 
-### RULE 2 — ForAll / Exists list must NEVER be empty
+RULE 5  — No solver calls, no print statements, no assertions. Only declarations and assignments. Do NOT write `Solver()`, `s.check()`, `print(...)`, or `assert`.
 
-```python
-# CORRECT
-v = Const('v', Person)
-ForAll([v], Implies(is_happy(v), smiles(v)))
+RULE 6  — Only `DeclareSort` is allowed. Never use `IntSort()`, `StringSort()`, `RealSort()`, or `SeqSort()`. Years, counts, and string-valued facts (channel names, titles, numeric quantities) must be modelled as named `Const` of a declared sort.
 
-# FORBIDDEN
-ForAll([], expr)    # empty quantifier list — runtime error
-```
+RULE 7  — One NL property = one predicate. Each independently assertable property must be its own predicate. Never compress "private Ivy League research university" into one opaque predicate name — declare `is_private`, `is_ivy_league`, `is_research` separately.
 
-### RULE 3 — Use a bound variable separate from entity constants
+RULE 8  — Every identifier used in `premises` or `q` must exactly match a previously declared name. Before finishing, verify every identifier inside `premises` and `q` was declared earlier with identical spelling.
 
-```python
-# Good practice: entities are alice/bob, bound variable is p
-alice = Const('alice', Person)
-bob   = Const('bob',   Person)
-p     = Const('p',     Person)   # bound variable for ForAll/Exists
+RULE 9  — `premises` must align one-to-one with the numbered NL premises: N premises in → exactly N top-level formulas in `premises[]`, in the same order. Do not omit, merge, or split numbered premises.
 
-f = ForAll([p], Implies(is_student(p), studies(p)))
-# alice and bob are used as ground constants, p is the quantifier variable
-```
+RULE 10 — Uninterpreted comparison predicates (`more_than`, `equal_to`, `no_more_than`, etc.) require mathematical axioms (asymmetry, transitivity) added as `background_constraints`. Omit `background_constraints` entirely if no comparison predicates are used.
 
-### RULE 4 — Universal rules use ForAll; existential claims use Exists
+RULE 11 — Synonymous NL phrases must map to the SAME predicate name throughout. Different surface forms describing the same action or relation must share one predicate. For example, if P1 says "presents their work at the conference" and P2 refers to the same action, use `presents_work_at_conference` in both — never two separate uninterpreted predicates. Splitting synonymous phrases silently breaks inference chains.
 
-```python
-# "All birds can fly"
-v = Const('v', Animal)
-f = ForAll([v], Implies(is_bird(v), can_fly(v)))
+RULE 12 — "X is a [noun/type]" means a TYPE predicate, never entity equality. Translate "X is a conductor" as `is_conductor(X)`, never as `X == conductor_entity`. Entity equality (`==`) is only correct for explicit identity statements like "X and Y are the same individual."
 
-# "Some birds cannot fly"
-v = Const('v', Animal)
-f = Exists([v], And(is_bird(v), Not(can_fly(v))))
+RULE 13 — De Morgan negation scope: "neither A nor B" / "not A or B" with a SINGLE scoped
+          negation over a disjunction means And(Not(A), Not(B)), NOT Or(Not(A), Not(B)).
 
-# "No cat is a dog"
-v = Const('v', Animal)
-f = ForAll([v], Not(And(is_cat(v), is_dog(v))))
-```
+          - "X is neither a cat nor a dog"  → And(Not(is_cat(X)), Not(is_dog(X)))   ← De Morgan
+          - "X is not a cat, or not a dog"  → Or(Not(is_cat(X)), Not(is_dog(X)))    ← two separate negations
 
-### RULE 5 — No solver calls, no print statements
-
-Only declarations and assignments. The solver is called externally.
-Do NOT write: `s = Solver()`, `s.check()`, `print(...)`, `assert ...`
-
-### RULE 6 — Only DeclareSort is allowed; never use built-in infinite sorts
-
-FORBIDDEN: `StringSort()`, `IntSort()`, `RealSort()`, `SeqSort()`, `StringVal()`, `IntVal()`
-
-All entities — including string-valued facts such as channel names, city names, working titles,
-and numeric quantities — must be modelled as named constants of a declared sort.
-
-```python
-# WRONG — StringSort breaks finite model extraction
-Channel = StringSort()
-f = piloted_on(show, StringVal("BBC Three"))
-
-# CORRECT — use DeclareSort and a named constant
-Channel = DeclareSort('Channel')
-bbc_three = Const('bbc_three', Channel)
-f = piloted_on(show, bbc_three)
-```
-
-### RULE 7 — One NL property = one predicate; no semantic compression
-
-Each independently assertable property in the NL text must be its own predicate.
-Do NOT compress multiple attributes into a single combined predicate name.
-
-```python
-# WRONG — compresses four independent properties into one opaque name
-is_private_ivy_league_research_university = Function(
-    'is_private_ivy_league_research_university', University, BoolSort()
-)
-
-# CORRECT — each property is a separate predicate
-is_private     = Function('is_private',     University, BoolSort())
-is_ivy_league  = Function('is_ivy_league',  University, BoolSort())
-is_research    = Function('is_research',    University, BoolSort())
-# Then: f = And(is_private(u), is_ivy_league(u), is_research(u))
-```
-
-This is critical for cross-granularity verification: each sentence must correspond
-to a separately checkable formula, not a black-box predicate.
-
-### RULE 8 — Every identifier used in `premises` or `q` must exactly match a previously declared name
-
-If you declare `branford_college = Const('branford_college', ResidentialCollege)`,
-then every later use must be exactly `branford_college`.
-
-Forbidden:
-- using a misspelled variant such as `brandford_college`
-- introducing a new identifier at use-site without declaring it first
-- using an entity/predicate/function/sort name in `premises` or `q` that does not
-  appear earlier in the code with exactly the same spelling
-
-Before finishing, verify that every identifier appearing inside `premises` and `q`
-was declared earlier with identical spelling.
-
-### RULE 9 — `premises` must align one-to-one with the numbered NL premises
-
-If the task gives N numbered premises, then `premises` must contain exactly N
-top-level formulas in the same order.
-
-- Do not omit any numbered premise.
-- Do not merge multiple numbered premises into one `premises` entry.
-- If one numbered premise is internally conjunctive or disjunctive, keep that
-  structure inside a single formula instead of splitting it into multiple entries.
-
-### RULE 10 — Comparison predicates require mathematical axioms
-
-When the formalization uses uninterpreted comparison predicates (`equal_to`,
-`more_than`, `no_more_than`, `less_than`, etc.), you MUST add their mathematical
-axioms as **additional `background_constraints`**. These are mathematical facts —
-they hold regardless of world assumption.
-
-```python
-# Transitivity: more_than(a,b) ∧ more_than(b,c) → more_than(a,c)
-x = Const('x', Amount)
-y = Const('y', Amount)
-z = Const('z', Amount)
-f_trans = ForAll([x, y, z], Implies(And(more_than(x, y), more_than(y, z)),
-                                    more_than(x, z)))
-# Antisymmetry: more_than(a,b) → ¬equal_to(a,b) ∧ ¬no_more_than(a,b)
-f_antisym = ForAll([x, y], Implies(more_than(x, y),
-                                   And(Not(equal_to(x, y)),
-                                       Not(no_more_than(x, y)))))
-# Equivalence: equal_to(a,b) → no_more_than(a,b) ∧ no_more_than(b,a)
-f_eq_nm = ForAll([x, y], Implies(equal_to(x, y),
-                                  And(no_more_than(x, y),
-                                      no_more_than(y, x))))
-background_constraints = [f_trans, f_antisym, f_eq_nm]
-```
-
-If none of these predicates appear, omit `background_constraints` entirely.
+          Test: is there ONE "not" scoping over "A or B"?
+            Yes → And(Not(A), Not(B)).
+            No, each clause carries its own negation → Or(Not(A), Not(B)).
 
 ---
-
-## Worked Example
-
-**Premises:**
-1. All managed buildings allow pets.
-2. The Olive Garden is a managed building.
-3. Pine Court is a managed building.
-
-**Conclusion:** Pets are allowed in The Olive Garden.
-
-```python
-from z3 import *
-
-# Sort
-Building = DeclareSort('Building')
-
-# Entities — every named entity must be a Const
-olive_garden = Const('olive_garden', Building)
-pine_court   = Const('pine_court',   Building)
-
-# Predicates
-is_managed  = Function('is_managed',  Building, BoolSort())
-allows_pets = Function('allows_pets', Building, BoolSort())
-
-# Bound variable for ForAll
-b = Const('b', Building)
-
-# Premises
-f1 = ForAll([b], Implies(is_managed(b), allows_pets(b)))
-f2 = is_managed(olive_garden)
-f3 = is_managed(pine_court)
-premises = [f1, f2, f3]
-
-# Conclusion
-q = allows_pets(olive_garden)
-```
-
----
-{% if not few_shot_examples %}
-## Second Example (binary predicate, multiple sorts)
-
-**Premises:**
-1. Every person who likes someone is happy.
-2. Alice likes Bob.
-
-**Conclusion:** Alice is happy.
-
-```python
-from z3 import *
-
-# Sorts
-Person = DeclareSort('Person')
-
-# Entities
-alice = Const('alice', Person)
-bob   = Const('bob',   Person)
-
-# Predicates
-likes = Function('likes', Person, Person, BoolSort())
-happy = Function('happy', Person, BoolSort())
-
-# Bound variables
-x = Const('x', Person)
-y = Const('y', Person)
-
-# Premises
-f1 = ForAll([x, y], Implies(likes(x, y), happy(x)))
-f2 = likes(alice, bob)
-premises = [f1, f2]
-
-# Conclusion
-q = happy(alice)
-```
-
----
-{% endif %}
 {% if few_shot_examples %}
-## Dataset-Specific Examples
+## Examples
+
+The following examples use real dataset samples. Rule numbers in comments correspond to the Rules checklist above.
 
 {% for ex in few_shot_examples %}
 ### Example {{ loop.index }}
 
 Premises:
 {% for p in ex.premises %}
-- {{ p }}
+{{ loop.index }}. {{ p }}
 {% endfor %}
 Conclusion: {{ ex.conclusion }}
 
@@ -279,59 +95,20 @@ Conclusion: {{ ex.conclusion }}
 {% endif %}
 {% if world_assumption == "cwa" %}
 
----
+## Closed-World Assumption
 
-## Closed-World Assumption (CWA) Rules
+Under CWA, any fact not stated or derivable from the premises is **false**.
 
-The following additional rules apply under the Closed-World Assumption. What is not stated or
-derivable from the premises is assumed to be **false**.
+CWA RULE 1 — Explicit type-subsumption axioms are required.
+  NL "bees are insects, insects are animals" → you MUST add BOTH:
+  `ForAll([v], Implies(is_bee(v), is_insect(v)))` and
+  `ForAll([v], Implies(is_insect(v), is_animal(v)))`.
+  Under CWA, stating `is_bee(x)` does NOT automatically make `is_animal(x)` true without these chains.
 
-### CWA RULE 1 — Exclusive Disjunction (XOR)
+CWA RULE 2 — After writing all formulas, audit for implicit type links.
+  For every type predicate pair (is_X, is_Y): if the NL implies "every X is a Y" but no
+  `ForAll([v], Implies(is_X(v), is_Y(v)))` exists → add it.
 
-When the NL says "either A or B" for category membership or properties, model as **exclusive or**
-(exactly one holds):
-
-```python
-# "A bee is either a honey bee or a bumble bee"
-v = Const('v', Bee)
-f = ForAll([v], And(Or(is_honey_bee(v), is_bumble_bee(v)),
-                    Not(And(is_honey_bee(v), is_bumble_bee(v)))))
-```
-
-Under CWA, "either...or" means exactly one category applies, not possibly both.
-
-### CWA RULE 2 — Type Subsumption Axioms
-
-When a type hierarchy is implied (e.g., "bees are insects", "insects are animals"), add **explicit
-upward-closure axioms** so that membership propagates through the chain:
-
-```python
-# "Bees are insects" + "Insects are animals" → need BOTH rules:
-v = Const('v', Entity)
-f_sub1 = ForAll([v], Implies(is_bee(v), is_insect(v)))
-f_sub2 = ForAll([v], Implies(is_insect(v), is_animal(v)))
-```
-
-Under CWA, an entity stated to be a "bee" is NOT independently recognized as an "animal" unless
-the complete chain of subsumption axioms is present.
-
-### CWA RULE 3 — Comparison Predicates: Explicit Assertions Under CWA
-
-Predicates like `equal_to`, `more_than`, `no_more_than` must be **explicitly asserted** for all
-needed entity pairs. Under CWA, unasserted comparisons evaluate to false.
-
-(Mathematical axioms for these predicates — transitivity, antisymmetry — are handled by
-RULE 10 above.)
-
-### CWA RULE 4 — Post-Generation Subsumption Audit
-
-After writing all premises, review the NL text for implicit type hierarchies:
-1. List every type predicate (`is_X`) used in the code.
-2. For each pair (is_X, is_Y), check: does the NL state or imply "every X is a Y"?
-   - Patterns: "X is a Y", "X are Y", "X is a type/kind of Y", "X such as Y and Z"
-3. If yes AND no `ForAll([v], Implies(is_X(v), is_Y(v)))` exists → ADD it as an extra premise.
-4. The system will automatically close transitive chains (X→Y + Y→Z ⇒ X→Z),
-   but each direct link MUST be explicitly present.
 {% endif %}
 
 ## Your Task
@@ -342,3 +119,14 @@ Premises:
 {% endfor %}
 
 Conclusion: {{ conclusion }}
+
+## Self-Check (before outputting)
+
+- All entities are named `Const`; no `Sort!val!N` in any formula (RULE 1).
+- Every `ForAll`/`Exists` has a non-empty list; bound variable is separate from entity constants (RULES 2, 3).
+- Bare plural subjects ("Vacuums suck", "Dogs bark") use `ForAll+Implies`, not ground facts on a category-named constant (RULE 4).
+- Only `DeclareSort` is used; no `IntSort`, `StringSort`, `RealSort` (RULE 6).
+- Synonymous NL phrases reuse the SAME predicate name — no new synonym predicate was introduced (RULE 11).
+- "X is a [type]" uses a type predicate `is_type(X)`, never entity equality `X == type_entity` (RULE 12).
+- For any clause of the form "not A or B" / "neither A nor B": verify `And(Not(A), Not(B))` was used — not `Or(Not(A), Not(B))`. (RULE 13)
+- VOCABULARY SCAN: scan all predicate names across all premises. If two predicates describe the same NL action/property used in different premises, unify to one name before outputting. (RULE 11)

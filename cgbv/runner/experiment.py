@@ -147,6 +147,28 @@ class ExperimentRunner:
             output_dir=cfg.output_dir,
         )
 
+        sample_id_audit = metrics.get("sample_id_audit", {})
+        error_ids = sample_id_audit.get("error_sample_ids", [])
+        reasoning_error_ids = sample_id_audit.get("reasoning_error_sample_ids", [])
+        phase1_wrong_final_correct_ids = sample_id_audit.get(
+            "phase1_wrong_but_final_correct_sample_ids", []
+        )
+        logger.info(
+            "Error sample IDs (%d): %s",
+            len(error_ids),
+            ", ".join(error_ids) if error_ids else "-",
+        )
+        logger.info(
+            "Reasoning-error sample IDs (%d): %s",
+            len(reasoning_error_ids),
+            ", ".join(reasoning_error_ids) if reasoning_error_ids else "-",
+        )
+        logger.info(
+            "Phase1-wrong but final-correct sample IDs (%d): %s",
+            len(phase1_wrong_final_correct_ids),
+            ", ".join(phase1_wrong_final_correct_ids) if phase1_wrong_final_correct_ids else "-",
+        )
+
         logger.info(
             "Experiment [bold]%s[/] run [bold]%s[/] complete. Metrics: %s",
             cfg.experiment_id, cfg.run_id, metrics,
