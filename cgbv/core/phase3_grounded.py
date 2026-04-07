@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -40,116 +39,27 @@ class Phase3Result:
     grounded: list[GroundedFormula]  # one per NL sentence (premises + conclusion)
 
 
-async def run_phase3(
-    sentences: list[str],       # [P1, P2, ..., Pn, C]  — premises + conclusion
-    domain_desc_str: str,
-    domain: dict,               # structured domain (for validation)
-    llm: LLMClient,
-    prompt_engine: PromptEngine,
-    max_retries: int = 2,
-    world_assumption: str = "owa",
-    solver: "Z3Solver | None" = None,
-    fol_formula_strs: list[str] | None = None,
-) -> Phase3Result:
+@dataclass
+class GroundingTemplate:
+    """A reusable grounded formula template (witness-independent).
+
+    Generated once from the domain schema (no truth values) and NL sentence.
+    Can be evaluated on any witness's truth table via eval() without further
+    LLM calls, ensuring all witnesses use the same logical structure.
     """
-    Phase 3: Grounded Re-Formalization.
-
-    For each NL sentence, LLM writes a quantifier-free propositional formula
-    on the finite domain of the boundary witness.
-
-    All sentences are processed in parallel via asyncio.gather.
-    """
-    tasks = [
-        _formalize_one(
-            idx, sentence, domain_desc_str, domain, llm, prompt_engine,
-            max_retries, world_assumption, solver,
-            fol_formula_str=fol_formula_strs[idx] if fol_formula_strs else None,
-        )
-        for idx, sentence in enumerate(sentences)
-    ]
-    results: list[GroundedFormula] = await asyncio.gather(*tasks)
-    return Phase3Result(grounded=list(results))
+    sentence_index: int
+    nl_sentence: str
+    template_code: str          # Python bool expr using truth[]/value[]
+    failed: bool = False
+    attempts: list[GroundingAttempt] = field(default_factory=list)
+    error: str | None = None
 
 
-async def _formalize_one(
-    idx: int,
-    sentence: str,
-    domain_desc_str: str,
-    domain: dict,
-    llm: LLMClient,
-    prompt_engine: PromptEngine,
-    max_retries: int,
-    world_assumption: str = "owa",
-    solver: "Z3Solver | None" = None,
-    fol_formula_str: str | None = None,
-) -> GroundedFormula:
-    messages = _build_messages(sentence, domain_desc_str, prompt_engine, world_assumption,
-                               fol_formula_str=fol_formula_str)
-    last_error: str | None = None
-    raw_output = ""
-    attempts: list[GroundingAttempt] = []
-    max_attempts = max_retries + 1
+@dataclass
+class Phase3TemplateResult:
+    """Phase 3 Step 1 output: one reusable formula template per sentence."""
+    templates: list[GroundingTemplate]
 
-    for attempt in range(max_attempts):
-        if attempt > 0:
-            messages = messages + [
-                {"role": "assistant", "content": raw_output},
-                _build_retry_message(
-                    sentence=sentence,
-                    domain_desc_str=domain_desc_str,
-                    previous_output=_normalise_output_for_prompt(raw_output),
-                    last_error=last_error or "Unknown error",
-                    attempt_num=attempt + 1,
-                    max_attempts=max_attempts,
-                    prompt_engine=prompt_engine,
-                    world_assumption=world_assumption,
-                ),
-            ]
-        attempt_record = GroundingAttempt(
-            attempt_num=attempt + 1,
-            messages=_snapshot_messages(messages),
-        )
-        raw_output = await llm.complete_with_retry(messages)
-        attempt_record.raw_output = raw_output
-        formula_code = _extract_formula(raw_output)
-        attempt_record.extracted_formula = formula_code
-
-        err = _validate_formula(formula_code, domain)
-        if err:
-            last_error = err
-            attempt_record.validation_error = err
-            attempts.append(attempt_record)
-            logger.debug("Phase 3 idx=%d attempt %d: validation error: %s", idx, attempt + 1, err)
-            continue
-
-        runtime_err = _validate_formula_runtime(formula_code, domain, solver)
-        if runtime_err:
-            last_error = runtime_err
-            attempt_record.validation_error = runtime_err
-            attempts.append(attempt_record)
-            logger.debug(
-                "Phase 3 idx=%d attempt %d: runtime validation error: %s",
-                idx, attempt + 1, runtime_err,
-            )
-            continue
-
-        attempt_record.accepted = True
-        attempts.append(attempt_record)
-        return GroundedFormula(
-            sentence_index=idx,
-            nl_sentence=sentence,
-            formula_code=formula_code,
-            attempts=attempts,
-        )
-
-    return GroundedFormula(
-        sentence_index=idx,
-        nl_sentence=sentence,
-        formula_code="",
-        failed=True,
-        attempts=attempts,
-        error=f"Grounding failed after {max_retries + 1} attempts. Last error: {last_error}",
-    )
 
 
 async def reground_with_hint(
@@ -166,21 +76,16 @@ async def reground_with_hint(
     solver: "Z3Solver | None" = None,
 ) -> GroundedFormula:
     """
+    DEPRECATED — use retemplate_with_hint() instead.
+
     Re-ground a sentence when Phase 4 detected a structural Phase 3 semantic error.
-
-    Unlike _formalize_one (which starts blind), this function pre-seeds the LLM
-    conversation with the wrong formula and a semantic error explaining what the
-    formula should evaluate to.  This gives the LLM direct signal about the
-    comparison direction or quantifier structure error without consuming an extra
-    "blind" generation.
-
-    Args:
-        current_formula: The Phase 3 formula that Phase 4 found to be incorrect.
-        expected_truth:  What the formula should evaluate to on this witness
-                         (False for ¬q witness, True for q witness).
-        solver:          If provided, used for in-loop semantic validation
-                         (evaluate formula on witness to check truth value).
+    This function uses phase3_grounded.j2 (with truth values), which breaks the
+    Template-Once invariant. Kept for backward compatibility but should not be
+    called in new code paths.
     """
+    logger.warning(
+        "reground_with_hint is DEPRECATED — use retemplate_with_hint instead (idx=%d)", idx,
+    )
     semantic_hint = (
         f"Your formula evaluated to {not expected_truth} but must evaluate to "
         f"{expected_truth} on this domain. "
@@ -287,15 +192,131 @@ async def reground_with_hint(
     )
 
 
+async def retemplate_with_hint(
+    idx: int,
+    sentence: str,
+    domain_schema_str: str,
+    domain: dict,
+    current_template: str,
+    hint: str,
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int = 2,
+    world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+) -> GroundingTemplate:
+    """
+    Re-generate a template when Phase 4 mismatch indicates a Phase 3 error.
+
+    Unlike reground_with_hint (deprecated), this uses phase3_template.j2 (no truth values),
+    preserving the Template-Once invariant: the re-generated template is witness-independent
+    and works across all witnesses.
+
+    The conversation is pre-seeded with the old (wrong) template and a semantic hint
+    explaining what went wrong, giving the LLM direct signal about the structural issue.
+
+    Args:
+        current_template: The Phase 3 template that was found incorrect.
+        hint: Semantic hint explaining what went wrong (e.g. "conditional should use implication, not conjunction").
+        solver: If provided, used for runtime validation (syntax + eval check).
+    """
+    base_messages = _build_template_messages(sentence, domain_schema_str, prompt_engine, world_assumption)
+    messages = base_messages + [
+        {"role": "assistant", "content": current_template},
+        _build_template_retry_message(
+            sentence=sentence,
+            domain_schema_str=domain_schema_str,
+            previous_output=current_template,
+            last_error=hint,
+            attempt_num=1,
+            max_attempts=max_retries + 1,
+            prompt_engine=prompt_engine,
+            world_assumption=world_assumption,
+        ),
+    ]
+
+    last_error: str | None = hint
+    raw_output: str = ""
+    attempts: list[GroundingAttempt] = []
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                _build_template_retry_message(
+                    sentence=sentence,
+                    domain_schema_str=domain_schema_str,
+                    previous_output=_normalise_output_for_prompt(raw_output),
+                    last_error=last_error or "Unknown error",
+                    attempt_num=attempt + 1,
+                    max_attempts=max_retries + 1,
+                    prompt_engine=prompt_engine,
+                    world_assumption=world_assumption,
+                ),
+            ]
+
+        attempt_record = GroundingAttempt(
+            attempt_num=attempt + 1,
+            messages=_snapshot_messages(messages),
+        )
+        raw_output = await llm.complete_with_retry(messages)
+        attempt_record.raw_output = raw_output
+        formula_code = _extract_formula(raw_output)
+        attempt_record.extracted_formula = formula_code
+
+        err = _validate_formula(formula_code, domain)
+        if err:
+            last_error = err
+            attempt_record.validation_error = err
+            attempts.append(attempt_record)
+            logger.debug(
+                "retemplate_with_hint idx=%d attempt %d: validation error: %s",
+                idx, attempt + 1, err,
+            )
+            continue
+
+        runtime_err = _validate_formula_runtime(formula_code, domain, solver)
+        if runtime_err:
+            last_error = runtime_err
+            attempt_record.validation_error = runtime_err
+            attempts.append(attempt_record)
+            logger.debug(
+                "retemplate_with_hint idx=%d attempt %d: runtime error: %s",
+                idx, attempt + 1, runtime_err,
+            )
+            continue
+
+        attempt_record.accepted = True
+        attempts.append(attempt_record)
+        logger.info("retemplate_with_hint idx=%d: succeeded on attempt %d", idx, attempt + 1)
+        return GroundingTemplate(
+            sentence_index=idx,
+            nl_sentence=sentence,
+            template_code=formula_code,
+            attempts=attempts,
+        )
+
+    logger.warning(
+        "retemplate_with_hint idx=%d: failed after %d attempts. Last error: %s",
+        idx, max_retries + 1, last_error,
+    )
+    return GroundingTemplate(
+        sentence_index=idx,
+        nl_sentence=sentence,
+        template_code="",
+        failed=True,
+        attempts=attempts,
+        error=f"Template re-generation failed after {max_retries + 1} attempts. Last error: {last_error}",
+    )
+
+
 def _build_messages(sentence: str, domain_desc_str: str, prompt_engine: PromptEngine,
-                    world_assumption: str = "owa",
-                    fol_formula_str: str | None = None) -> list[dict]:
+                    world_assumption: str = "owa") -> list[dict]:
     user_content = prompt_engine.render(
         "phase3_grounded.j2",
         sentence=sentence,
         domain_desc=domain_desc_str,
         world_assumption=world_assumption,
-        fol_formula=fol_formula_str,
     )
     return [{"role": "user", "content": user_content}]
 
@@ -718,3 +739,395 @@ def _parse_fstring_pred_args(
             arg_vars.append(None)          # constant or ambiguous — skip loop check
 
     return pred_name, arg_vars
+
+
+# ---------------------------------------------------------------------------
+# Template-Once: Phase 3 Step 1 — generate formula templates (no truth values)
+# ---------------------------------------------------------------------------
+
+async def generate_templates(
+    sentences: list[str],
+    domain_schema_str: str,         # from format_domain_schema() — NO truth values
+    domain: dict,                   # full domain dict (for validation only)
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int = 2,
+    world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+    batch_size: int = 0,            # 0 = all sentences in one batch
+) -> Phase3TemplateResult:
+    """
+    Phase 3 Step 1: Generate witness-independent formula templates.
+
+    Inputs: NL sentences + domain SCHEMA (no truth values).
+    Output: one GroundingTemplate per sentence — a Python bool expression
+    that can be evaluated on any witness's truth table without further LLM calls.
+
+    This preserves structural independence from Phase 1 (Proposal Proposition 3):
+    Phase 3 translates directly from NL, without seeing Phase 1's FOL formulas.
+    Truth-value contamination (sample 547 XOR/OR inconsistency) is eliminated
+    because the LLM never sees what is True or False in any particular world.
+
+    batch_size=0: all N+1 sentences in one LLM call.
+    batch_size=B: sentences split into groups of B, each a separate LLM call.
+    """
+    n = len(sentences)
+    if batch_size <= 0:
+        batch_size = n  # one batch for all
+
+    all_templates: list[GroundingTemplate] = []
+    offset = 0
+    for i in range(0, n, batch_size):
+        batch = sentences[i:i + batch_size]
+        templates = await _generate_batch(
+            sentences=batch,
+            start_index=offset,
+            domain_schema_str=domain_schema_str,
+            domain=domain,
+            llm=llm,
+            prompt_engine=prompt_engine,
+            max_retries=max_retries,
+            world_assumption=world_assumption,
+            solver=solver,
+        )
+        all_templates.extend(templates)
+        offset += len(batch)
+
+    return Phase3TemplateResult(templates=all_templates)
+
+
+async def generate_templates_partial(
+    indices: set[int],
+    sentences: list[str],
+    domain_schema_str: str,
+    domain: dict,
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int = 2,
+    world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+) -> list[GroundingTemplate]:
+    """Generate formula templates for a SUBSET of sentence indices.
+
+    Used by template cache to regenerate only modified sentences.
+    Each index is generated independently via _template_one().
+    Returns templates only for the requested indices (not all sentences).
+    """
+    templates: list[GroundingTemplate] = []
+    for idx in sorted(indices):
+        if idx < 0 or idx >= len(sentences):
+            continue
+        tmpl = await _template_one(
+            idx=idx,
+            sentence=sentences[idx],
+            domain_schema_str=domain_schema_str,
+            domain=domain,
+            llm=llm,
+            prompt_engine=prompt_engine,
+            max_retries=max_retries,
+            world_assumption=world_assumption,
+            solver=solver,
+        )
+        templates.append(tmpl)
+    return templates
+
+
+async def _generate_batch(
+    sentences: list[str],
+    start_index: int,
+    domain_schema_str: str,
+    domain: dict,
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int,
+    world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+) -> list[GroundingTemplate]:
+    """Generate templates for a batch of sentences in a single LLM call.
+
+    Falls back to per-sentence generation for any sentence that fails validation
+    after exhausting retries.
+    """
+    if len(sentences) == 1:
+        # Avoid the extra batch-parsing overhead for a single sentence
+        return [await _template_one(
+            idx=start_index,
+            sentence=sentences[0],
+            domain_schema_str=domain_schema_str,
+            domain=domain,
+            llm=llm,
+            prompt_engine=prompt_engine,
+            max_retries=max_retries,
+            world_assumption=world_assumption,
+            solver=solver,
+        )]
+
+    messages = _build_template_batch_messages(
+        sentences=sentences,
+        domain_schema_str=domain_schema_str,
+        prompt_engine=prompt_engine,
+        world_assumption=world_assumption,
+    )
+
+    accepted: dict[int, str] = {}   # formulas that passed validation (locked in)
+    errors: dict[int, str] = {}
+    raw_output = ""
+
+    for attempt in range(max_retries + 1):
+        if attempt > 0 and errors:
+            # Build retry message listing ONLY the errored formulas
+            error_lines = "\n".join(
+                f"[{i + 1}] Error: {e}" for i, e in sorted(errors.items())
+            )
+            errored_sentence_lines = "\n".join(
+                f"[{i + 1}] \"{sentences[i]}\"" for i in sorted(errors.keys())
+            )
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                {
+                    "role": "user",
+                    "content": (
+                        f"The following {len(errors)} formula(s) have errors. "
+                        f"Fix ONLY these — the other formulas are correct and locked in.\n\n"
+                        f"Errors:\n{error_lines}\n\n"
+                        f"Sentences to fix:\n{errored_sentence_lines}\n\n"
+                        f"Output ONLY the fixed formulas as [N] expression lines "
+                        f"(use the original sentence numbers)."
+                    ),
+                },
+            ]
+
+        raw_output = await llm.complete_with_retry(messages)
+        parsed = _parse_batch_output(raw_output, len(sentences))
+
+        # On retry: merge new results without overwriting already-accepted formulas
+        if attempt > 0:
+            for i, formula in parsed.items():
+                if i not in accepted:
+                    accepted[i] = formula  # tentative — will be re-validated below
+        else:
+            # First attempt: all parsed formulas are candidates
+            accepted.update(parsed)
+
+        # Validate all non-accepted formulas + newly parsed ones
+        errors = {}
+        for i in range(len(sentences)):
+            if i in accepted:
+                # Re-validate even accepted formulas on first attempt;
+                # on retries, only validate newly added ones
+                if attempt > 0 and i not in parsed:
+                    continue  # already validated and locked in
+                err = _validate_formula(accepted[i], domain)
+                if err:
+                    errors[i] = err
+                    del accepted[i]  # un-accept: validation failed
+                    continue
+                if solver is not None:
+                    runtime_err = _validate_formula_runtime(accepted[i], domain, solver)
+                    if runtime_err:
+                        errors[i] = runtime_err
+                        del accepted[i]
+            else:
+                errors[i] = f"Missing formula — no [{i + 1}] line found"
+
+        if not errors:
+            return [
+                GroundingTemplate(
+                    sentence_index=start_index + i,
+                    nl_sentence=sentences[i],
+                    template_code=accepted[i],
+                )
+                for i in range(len(sentences))
+            ]
+
+        logger.debug(
+            "_generate_batch attempt %d/%d: %d/%d errors, %d accepted",
+            attempt + 1, max_retries + 1, len(errors), len(sentences), len(accepted),
+        )
+
+    # Exhausted retries — return successes, fall back to per-sentence for failures
+    logger.warning(
+        "_generate_batch: %d/%d sentences still failing after %d attempts; "
+        "falling back to per-sentence generation",
+        len(errors), len(sentences), max_retries + 1,
+    )
+    templates: list[GroundingTemplate] = []
+    for i in range(len(sentences)):
+        if i in accepted and i not in errors:
+            templates.append(GroundingTemplate(
+                sentence_index=start_index + i,
+                nl_sentence=sentences[i],
+                template_code=accepted[i],
+            ))
+        else:
+            tmpl = await _template_one(
+                idx=start_index + i,
+                sentence=sentences[i],
+                domain_schema_str=domain_schema_str,
+                domain=domain,
+                llm=llm,
+                prompt_engine=prompt_engine,
+                max_retries=max_retries,
+                world_assumption=world_assumption,
+                solver=solver,
+            )
+            templates.append(tmpl)
+    return templates
+
+
+async def _template_one(
+    idx: int,
+    sentence: str,
+    domain_schema_str: str,
+    domain: dict,
+    llm: LLMClient,
+    prompt_engine: PromptEngine,
+    max_retries: int,
+    world_assumption: str = "owa",
+    solver: "Z3Solver | None" = None,
+) -> GroundingTemplate:
+    """Generate a formula template for a single sentence (no truth values)."""
+    messages = _build_template_messages(sentence, domain_schema_str, prompt_engine, world_assumption)
+    last_error: str | None = None
+    raw_output = ""
+    attempts: list[GroundingAttempt] = []
+    max_attempts = max_retries + 1
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            messages = messages + [
+                {"role": "assistant", "content": raw_output},
+                _build_template_retry_message(
+                    sentence=sentence,
+                    domain_schema_str=domain_schema_str,
+                    previous_output=_normalise_output_for_prompt(raw_output),
+                    last_error=last_error or "Unknown error",
+                    attempt_num=attempt + 1,
+                    max_attempts=max_attempts,
+                    prompt_engine=prompt_engine,
+                    world_assumption=world_assumption,
+                ),
+            ]
+
+        attempt_record = GroundingAttempt(
+            attempt_num=attempt + 1,
+            messages=_snapshot_messages(messages),
+        )
+        raw_output = await llm.complete_with_retry(messages)
+        attempt_record.raw_output = raw_output
+        formula_code = _extract_formula(raw_output)
+        attempt_record.extracted_formula = formula_code
+
+        err = _validate_formula(formula_code, domain)
+        if err:
+            last_error = err
+            attempt_record.validation_error = err
+            attempts.append(attempt_record)
+            logger.debug("_template_one idx=%d attempt %d: validation error: %s", idx, attempt + 1, err)
+            continue
+
+        runtime_err = _validate_formula_runtime(formula_code, domain, solver)
+        if runtime_err:
+            last_error = runtime_err
+            attempt_record.validation_error = runtime_err
+            attempts.append(attempt_record)
+            logger.debug(
+                "_template_one idx=%d attempt %d: runtime error: %s", idx, attempt + 1, runtime_err
+            )
+            continue
+
+        attempt_record.accepted = True
+        attempts.append(attempt_record)
+        return GroundingTemplate(
+            sentence_index=idx,
+            nl_sentence=sentence,
+            template_code=formula_code,
+            attempts=attempts,
+        )
+
+    return GroundingTemplate(
+        sentence_index=idx,
+        nl_sentence=sentence,
+        template_code="",
+        failed=True,
+        attempts=attempts,
+        error=f"Template generation failed after {max_retries + 1} attempts. Last error: {last_error}",
+    )
+
+
+def _build_template_messages(
+    sentence: str,
+    domain_schema_str: str,
+    prompt_engine: PromptEngine,
+    world_assumption: str = "owa",
+) -> list[dict]:
+    user_content = prompt_engine.render(
+        "phase3_template.j2",
+        sentence=sentence,
+        domain_schema=domain_schema_str,
+        world_assumption=world_assumption,
+    )
+    return [{"role": "user", "content": user_content}]
+
+
+def _build_template_batch_messages(
+    sentences: list[str],
+    domain_schema_str: str,
+    prompt_engine: PromptEngine,
+    world_assumption: str = "owa",
+) -> list[dict]:
+    user_content = prompt_engine.render(
+        "phase3_template_batch.j2",
+        sentences=sentences,
+        domain_schema=domain_schema_str,
+        world_assumption=world_assumption,
+    )
+    return [{"role": "user", "content": user_content}]
+
+
+def _build_template_retry_message(
+    sentence: str,
+    domain_schema_str: str,
+    previous_output: str,
+    last_error: str,
+    attempt_num: int,
+    max_attempts: int,
+    prompt_engine: PromptEngine,
+    world_assumption: str = "owa",
+) -> dict[str, str]:
+    user_content = prompt_engine.render(
+        "phase3_template_retry.j2",
+        sentence=sentence,
+        domain_schema=domain_schema_str,
+        previous_output=previous_output,
+        last_error=last_error,
+        attempt_num=attempt_num,
+        max_attempts=max_attempts,
+        world_assumption=world_assumption,
+    )
+    return {"role": "user", "content": user_content}
+
+
+def _parse_batch_output(raw: str, num_sentences: int) -> dict[int, str]:
+    """Parse batch output of the form '[N] expression' into {0-based-index: formula}.
+
+    Handles:
+    - Optional markdown code fences around the entire output
+    - Inline backticks around individual formulas
+    - 1-based indices in the output mapped to 0-based in the result
+    """
+    # Strip outer markdown fences if present
+    text = re.sub(r'^```(?:python)?\s*\n', '', raw.strip(), flags=re.MULTILINE)
+    text = re.sub(r'\n```\s*$', '', text, flags=re.MULTILINE).strip()
+
+    result: dict[int, str] = {}
+    pattern = re.compile(r'^\[(\d+)\]\s*(.+)$', re.MULTILINE)
+    for m in pattern.finditer(text):
+        idx_1based = int(m.group(1))
+        formula_raw = m.group(2).strip()
+        if 1 <= idx_1based <= num_sentences:
+            formula = _extract_formula(formula_raw)
+            if formula:
+                result[idx_1based - 1] = formula  # convert to 0-based
+    return result
+

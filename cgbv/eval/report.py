@@ -26,6 +26,7 @@ _METRIC_LABELS = {
     "repair_verdict_recovery_rate": "Repair Verdict Recovery Rate",
     "repair_regression_rate": "Repair Regression Rate",
     "cgbv_repair_recovery_rate": "CGBV Repair Recovery Rate",
+    "cgbv_regression_rate": "CGBV Regression Rate (phase1-correct→final-wrong)",
     "phase3_reground_rate": "Phase 3 Re-grounding Resolution Rate",
     "underformalized_rate": "Underformalized Rate",
     "semantic_instability_rate": "Semantic Instability Rate",
@@ -140,5 +141,10 @@ def write_report(
                 f"- Phase1-wrong but final-correct samples "
                 f"({sample_id_audit.get('phase1_wrong_but_final_correct_count', 0)}): "
                 f"{', '.join(sample_id_audit.get('phase1_wrong_but_final_correct_sample_ids', [])) or '-'}\n"
+            )
+            f.write(
+                f"- Phase1-correct but final-wrong samples (CGBV regression) "
+                f"({sample_id_audit.get('phase1_correct_but_final_wrong_count', 0)}): "
+                f"{', '.join(sample_id_audit.get('phase1_correct_but_final_wrong_sample_ids', [])) or '-'}\n"
             )
     logger.info("Markdown report written to %s", md_path)

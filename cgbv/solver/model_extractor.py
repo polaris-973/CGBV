@@ -402,6 +402,70 @@ def format_domain_desc(domain: dict) -> str:
     return "\n".join(lines)
 
 
+def format_domain_schema(domain: dict) -> str:
+    """
+    Format a domain description WITHOUT truth values — only structural information.
+
+    Outputs: sorts + entity lists, predicate signatures, function signatures,
+    canonical entity IDs. Intentionally omits the Ground atoms section.
+
+    Used by Phase 3 Template Generation (Template-Once design) so the LLM
+    writes formulas based solely on NL meaning + domain schema, without being
+    biased by specific truth values in any particular witness world.
+    This preserves structural independence from Phase 1 (Proposition 3).
+    """
+    lines = []
+
+    # Sort-grouped entity lists
+    sorts: dict[str, list[str]] = domain.get("sorts", {})
+    if sorts:
+        lines.append("Entities by sort:")
+        for sort_name, entities in sorts.items():
+            lines.append(f"  {sort_name}: {entities}")
+    else:
+        lines.append(f"Domain entities: {domain.get('entities', [])}")
+
+    lines.append("")
+
+    # Predicate signatures (bool predicates)
+    pred_sigs: dict[str, list[str]] = domain.get("predicate_signatures", {})
+    if pred_sigs:
+        bool_sigs = {k: v for k, v in pred_sigs.items() if not k.endswith("_is")}
+        func_sigs  = {k: v for k, v in pred_sigs.items() if k.endswith("_is")}
+
+        if bool_sigs:
+            lines.append("Predicate signatures (use these names exactly):")
+            for pred_name, arg_sorts in bool_sigs.items():
+                lines.append(f"  {pred_name}({', '.join(arg_sorts)}) → bool")
+
+        if func_sigs:
+            lines.append("")
+            lines.append("Function-value signatures (access via value[\"fname(entity)\"]):")
+            for pred_name, arg_sorts in func_sigs.items():
+                func_name = pred_name.removesuffix("_is")
+                arg_part = ", ".join(arg_sorts[:-1])
+                ret_part = arg_sorts[-1]
+                lines.append(f"  {func_name}({arg_part}) → {ret_part}")
+
+    lines.append("")
+
+    # Raw function signatures (for value[...] access)
+    raw_func_sigs: dict[str, list[str]] = domain.get("raw_function_signatures", {})
+    if raw_func_sigs and not pred_sigs:
+        lines.append("Function signatures:")
+        for fname, arg_sorts in raw_func_sigs.items():
+            lines.append(f"  {fname}({', '.join(arg_sorts)}) → value")
+        lines.append("")
+
+    # Canonical entity IDs
+    all_entities = domain.get("entities", [])
+    if all_entities:
+        lines.append(f"Canonical entity IDs (use these EXACTLY as truth[...] keys):")
+        lines.append(f"  {', '.join(all_entities)}")
+
+    return "\n".join(lines)
+
+
 def format_filtered_domain_desc(
     domain: dict,
     relevant_predicates: set[str],

@@ -143,6 +143,9 @@ class ExperimentRunner:
         phase1_wrong_final_correct_ids = sample_id_audit.get(
             "phase1_wrong_but_final_correct_sample_ids", []
         )
+        phase1_correct_final_wrong_ids = sample_id_audit.get(
+            "phase1_correct_but_final_wrong_sample_ids", []
+        )
         logger.info(
             "Error sample IDs (%d): %s",
             len(error_ids),
@@ -157,6 +160,11 @@ class ExperimentRunner:
             "Phase1-wrong but final-correct sample IDs (%d): %s",
             len(phase1_wrong_final_correct_ids),
             ", ".join(phase1_wrong_final_correct_ids) if phase1_wrong_final_correct_ids else "-",
+        )
+        logger.info(
+            "Phase1-correct but final-wrong (CGBV regression) sample IDs (%d): %s",
+            len(phase1_correct_final_wrong_ids),
+            ", ".join(phase1_correct_final_wrong_ids) if phase1_correct_final_wrong_ids else "-",
         )
 
         logger.info(

@@ -152,6 +152,7 @@ def compute_sample_id_audit(
     error_details: list[dict] = []
     reasoning_error_sample_ids: list[str] = []
     phase1_wrong_but_final_correct_sample_ids: list[str] = []
+    phase1_correct_but_final_wrong_sample_ids: list[str] = []
 
     for sample in samples:
         result = result_map.get(sample.id)
@@ -176,6 +177,11 @@ def compute_sample_id_audit(
         if v_pre != label and v_final == label:
             phase1_wrong_but_final_correct_sample_ids.append(sample.id)
 
+        # Samples where Phase 1 first verdict was correct but CGBV processing
+        # degraded it to the wrong final verdict (CGBV introduced a regression).
+        if v_pre == label and v_final != label:
+            phase1_correct_but_final_wrong_sample_ids.append(sample.id)
+
     return {
         "error_count": len(error_sample_ids),
         "error_sample_ids": error_sample_ids,
@@ -184,6 +190,8 @@ def compute_sample_id_audit(
         "reasoning_error_sample_ids": reasoning_error_sample_ids,
         "phase1_wrong_but_final_correct_count": len(phase1_wrong_but_final_correct_sample_ids),
         "phase1_wrong_but_final_correct_sample_ids": phase1_wrong_but_final_correct_sample_ids,
+        "phase1_correct_but_final_wrong_count": len(phase1_correct_but_final_wrong_sample_ids),
+        "phase1_correct_but_final_wrong_sample_ids": phase1_correct_but_final_wrong_sample_ids,
     }
 
 
@@ -442,6 +450,10 @@ def compute_metrics(
         "repair_verdict_recovery_rate": safe_div(repair_recovery_correct, repair_recovery_attempted),
         "repair_regression_rate": safe_div(repair_regressions, repair_regression_attempted),
         "cgbv_repair_recovery_rate": cgbv_repair_audit["cgbv_repair_recovery_rate"],
+        # CGBV regression: Phase 1 was initially correct but CGBV processing changed it to wrong
+        "cgbv_regression_rate": safe_div(
+            sample_id_audit.get("phase1_correct_but_final_wrong_count", 0), total
+        ),
         # Phase 3 re-grounding metrics
         "phase3_reground_rate": safe_div(phase3_reground_success, phase3_errors_detected),
         # Acceptance / adequacy diagnostics
@@ -487,6 +499,7 @@ def compute_metrics(
             "obligation_resolution_success": obligation_resolution_success,
             "uncertain_correct": uncertain_correct,
             "uncertain_total": uncertain_total,
+            "cgbv_regression_count": sample_id_audit.get("phase1_correct_but_final_wrong_count", 0),
         },
     }
 

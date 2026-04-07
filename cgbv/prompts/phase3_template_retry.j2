@@ -1,0 +1,67 @@
+You are a logic translator working with a specific finite domain.
+
+A previous grounded boolean expression template for the sentence below was invalid. Repair it
+so that it is a single valid Python boolean expression **template** that can be evaluated against
+ANY truth table on this domain to determine if the sentence holds.
+
+---
+
+## Retry Context
+
+This is attempt {{ attempt_num }} of {{ max_attempts }}.
+
+## Previous Output
+
+```python
+{{ previous_output }}
+```
+
+## Observed Error
+
+{{ last_error }}
+
+---
+
+## Output Format
+
+Write a **single Python boolean expression**. Use:
+- `truth["PredName(entity)"]` — look up a ground atom's truth value
+- `value["fname(entity)"]` — look up a function's numeric value (for comparisons)
+- `and`, `or`, `not` — boolean connectives
+- `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
+- `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
+
+**Critical rules:**
+1. Use predicate names **exactly as they appear** in the domain schema (matching capitalisation).
+2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort.
+   Never mix entities from different sorts in the same loop.
+3. If the sort already determines the type, do **not** add a redundant `if truth["is_X(e)"]`
+   guard — only add one when the NL explicitly conditions on an additional predicate.
+4. Do **not** invent entity names. Use only the canonical IDs listed in the domain below.
+5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
+   Access predicates via `truth[...]` subscripts only — never call them directly.
+6. Do **not** iterate over booleanised `_is` predicates when `value[...]` entries are available.
+   For comparisons, use `value[...]` directly.
+7. Repair the previous output with the smallest change that fixes the error while preserving
+   the sentence's full meaning.
+8. Output ONLY the expression — no imports, no assignments, no prose.
+
+---
+
+{% if world_assumption == "cwa" %}
+## Closed-World Assumption
+
+Under the Closed-World Assumption: any property not explicitly asserted for an entity is **False**.
+For "either A or B" patterns, model as exclusive: `truth["A(e)"] != truth["B(e)"]`.
+
+---
+{% endif %}
+
+## Your Task
+
+**Domain Schema:**
+{{ domain_schema }}
+
+**Sentence:** "{{ sentence }}"
+
+Write the repaired grounded boolean expression template:

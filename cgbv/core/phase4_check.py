@@ -50,10 +50,14 @@ class Mismatch:
     grounded_formula: str    # the truth-table expression (for repair prompt)
     witness_index: int = 0   # which witness produced this mismatch
     witness_side: str = "not_q"
-    # Structural Phase 3 error: strengthening on the conclusion from a ¬q witness.
-    # By construction, FOL(conclusion)=False on every ¬q witness; if grounded=True
-    # it is definitively a Phase 3 grounding error — Phase 5 cannot fix it by
-    # tweaking the FOL formula (making FOL=True would contradict Z3's model).
+    # Conclusion mismatch hint (NOT a hard routing decision).
+    # True when this mismatch is on the conclusion AND the mismatch direction
+    # aligns with the witness construction expectation.  This is a HINT that
+    # the template may be wrong, but it does NOT prove the FOL side is correct
+    # — the witness is constructed to make FOL(q) match its expected value by
+    # definition, so FOL correctness on the witness is tautological.
+    # Pipeline uses this to try retemplate first, then escalates to Phase 5 /
+    # run_phase1_targeted if retemplate fails.
     is_phase3_error: bool = False
     # Quantifier layout of the original FOL formula, computed once from the Z3
     # object at Mismatch creation time so Phase 5 can avoid string heuristics.
@@ -231,18 +235,19 @@ def run_phase4(
             mismatch_type = (
                 MISMATCH_WEAKENING if fol_truth else MISMATCH_STRENGTHENING
             )
-            # Detect structural Phase 3 errors on the conclusion.
+            # Conclusion mismatch detection (hint flag, NOT a definitive error attribution).
             # The witness is constructed so that the conclusion has a specific
             # expected truth value: False on a ¬q witness, True on a q witness.
-            # When the FOL side matches that expected value (i.e. it is correct
-            # by Z3 construction) but the grounded side disagrees, the error is
-            # definitively in Phase 3 grounding — Phase 5 cannot fix it by
-            # tweaking the FOL formula.
+            # When the FOL side matches that expected value but the grounded side
+            # disagrees, the template MAY be wrong — but the FOL MAY ALSO be wrong
+            # (FOL matching the witness is tautological by construction, not evidence
+            # of FOL correctness).  The pipeline uses this as a hint to try
+            # retemplate first, then escalates to Phase 5 / theory rewrite.
             #
             #   ¬q witness: expected conclusion = False
-            #     → FOL=False (correct) + grounded=True = strengthening → Phase 3
+            #     → FOL=False (by construction) + grounded=True = strengthening
             #   q  witness: expected conclusion = True
-            #     → FOL=True  (correct) + grounded=False = weakening    → Phase 3
+            #     → FOL=True  (by construction) + grounded=False = weakening
             n_sentences = len(sentences)
             is_p3_error = (
                 idx == n_sentences - 1  # conclusion is the last sentence

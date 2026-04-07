@@ -1,12 +1,13 @@
 You are a logic translator working with a specific finite domain.
 
 You are given:
-1. A **domain description** listing entities grouped by sort, predicate signatures, and the truth
-   value of every ground atom in a specific world.
+1. A **domain SCHEMA** listing entities grouped by sort and predicate/function signatures.
+   **You are NOT given truth values** — you do not know what is true or false in any world.
 2. A **natural language sentence**.
 
-Your task: write a Python boolean expression that evaluates to `True` if the sentence holds in
-this world, and `False` otherwise.
+Your task: write a Python boolean expression **template** that can be evaluated against ANY
+truth table on this domain to determine if the sentence holds. Base your translation solely
+on the natural language meaning of the sentence.
 
 ---
 
@@ -20,14 +21,12 @@ Write a **single Python boolean expression**. Use:
 - `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
 
 **Critical rules:**
-1. Use `truth[...]` keys **exactly as they appear** in the Ground atoms section (exact predicate
-   name and entity IDs, matching capitalisation and spacing).
+1. Use predicates names **exactly as they appear** in the domain schema (matching capitalisation).
 2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort of
    that predicate's argument. Never mix entities from different sorts in the same loop.
 3. If the sort already determines the type (e.g., all entities in the `Stock` sort ARE stocks),
-   do **not** add a redundant `if truth["is_stock(e)"]` guard — it creates a semantic gap with
-   the FOL formula. Only add an `if truth[...]` guard when the NL explicitly conditions on an
-   additional predicate.
+   do **not** add a redundant `if truth["is_stock(e)"]` guard — it creates a semantic gap. Only
+   add an `if truth[...]` guard when the NL explicitly conditions on an additional predicate.
 4. Do **not** invent entity names. Use only the canonical IDs listed under "Canonical entity IDs".
 5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
 6. Output ONLY the expression — no imports, no assignments, no prose.
@@ -48,8 +47,9 @@ Given sort `Person` with entities `['alice', 'bob', 'carol']`:
 | "Alice likes Bob." | `truth["likes(alice, bob)"]` |
 | "Alice likes someone." | `any(truth[f"likes(alice, {e})"] for e in ["alice","bob","carol"])` |
 | "Everyone who studies passes." | `all(truth[f"passes({e})"] for e in ["alice","bob","carol"] if truth[f"studies({e})"])` |
-| "If Alice studies, she passes." (conditional/Implies conclusion) | `not truth["studies(alice)"] or truth["passes(alice)"]` |
-| "Alice is happy or sad, but not both." (XOR conclusion) | `truth["happy(alice)"] != truth["sad(alice)"]` |
+| "If Alice studies, she passes." (conditional/Implies) | `not truth["studies(alice)"] or truth["passes(alice)"]` |
+| "Alice is happy or sad, but not both." (XOR) | `truth["happy(alice)"] != truth["sad(alice)"]` |
+| "If Alice is happy or sad (but not both), she passes." (Implies + XOR) | `not (truth["happy(alice)"] != truth["sad(alice)"]) or truth["passes(alice)"]` |
 
 **Multi-sort example** — sort `Person: ['alice']`, sort `Book: ['walden']`:
 
@@ -66,7 +66,7 @@ entities. Never mix them.
 
 ## Worked Example
 
-**Domain:**
+**Domain Schema (no truth values):**
 ```
 Entities by sort:
   Animal: ['tweety', 'sam', 'Animal!val!0']
@@ -76,17 +76,9 @@ Predicate signatures:
   can_fly(Animal) → bool
 
 Canonical entity IDs: tweety, sam, Animal!val!0
-
-Ground atoms:
-  is_bird(tweety) = True
-  is_bird(sam) = False
-  is_bird(Animal!val!0) = False
-  can_fly(tweety) = True
-  can_fly(sam) = False
-  can_fly(Animal!val!0) = False
 ```
 
-| Sentence | Output |
+| Sentence | Template output |
 |---|---|
 | "Tweety can fly." | `truth["can_fly(tweety)"]` |
 | "Tweety cannot fly." | `not truth["can_fly(tweety)"]` |
@@ -94,22 +86,22 @@ Ground atoms:
 | "Some bird cannot fly." | `any(not truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
 | "Tweety is a bird that can fly." | `truth["is_bird(tweety)"] and truth["can_fly(tweety)"]` |
 
+Note: these templates work on **any** assignment of truth values to the predicates — you
+don't need to know what is_bird(tweety) is True or False to write the correct template.
+
 ---
 
 ## Numeric Comparison (Function-value predicates)
 
-When the domain lists `Function values` entries like `value["score(alice)"] = 42`, use the
-`value[...]` lookup directly — do **not** iterate over booleanised `_is` predicates.
+When the domain lists function signatures like `score(Person) → int`, use `value[...]`
+lookup for comparisons:
 
-| Natural language | Grounded expression |
+| Natural language | Template expression |
 |---|---|
 | "Alice's score is less than Bob's." | `value["score(alice)"] < value["score(bob)"]` |
 | "Bob has the highest score." | `all(value[f"score({e})"] < value["score(bob)"] for e in SORT_LIST if e != "bob")` |
 | "Alice and Bob have equal scores." | `value["score(alice)"] == value["score(bob)"]` |
 | "Alice's score is at most 100." | `value["score(alice)"] <= 100` |
-
-For f-string access over a sort, write `value[f"score({e})"]` where `e` iterates over the
-correct sort list from the domain.
 
 **Operator must exactly match the NL meaning:**
 - "less / smaller / lower" → `<`
@@ -123,18 +115,17 @@ correct sort list from the domain.
 ## Closed-World Assumption
 
 Under the Closed-World Assumption: any property not explicitly asserted for an entity in the
-witness domain is **False**. For "either A or B" patterns, model as exclusive (exactly one is
+domain is **False**. For "either A or B" patterns, model as exclusive (exactly one is
 true): use `truth["A(e)"] != truth["B(e)"]`. Do not assume unmentioned relationships hold.
 
 ---
 {% endif %}
 
-
 ## Your Task
 
-**Domain:**
-{{ domain_desc }}
+**Domain Schema:**
+{{ domain_schema }}
 
 **Sentence:** "{{ sentence }}"
 
-Write the grounded boolean expression:
+Write the grounded boolean expression template:

@@ -58,6 +58,7 @@ class PipelineConfig:
     max_exec_workers: int = 8     # max concurrent code execution threads
     world_assumption: str = "owa"  # "owa" (open world) | "cwa" (closed world)
     enable_phase1_bridge: bool = True  # Phase 1.5 bridge axiom injection
+    batch_grounding_size: int = 0  # Phase 3 batch size: 0 = all sentences in one LLM call
 
 
 @dataclass

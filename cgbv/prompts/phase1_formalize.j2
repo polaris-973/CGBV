@@ -71,6 +71,12 @@ RULE 13 — De Morgan negation scope: "neither A nor B" / "not A or B" with a SI
             Yes → And(Not(A), Not(B)).
             No, each clause carries its own negation → Or(Not(A), Not(B)).
 
+RULE 14 — The conclusion predicate(s) must NOT appear as sub-expressions inside any
+          premise formula. If `q = pred(X)`, then no premise should contain `pred(X)` as
+          a nested conjunct that makes `q` trivially true whenever the premise holds.
+          Embedding the conclusion inside a premise is a formalization error that makes
+          the entailment trivially true and prevents meaningful verification.
+
 ---
 {% if few_shot_examples %}
 ## Examples
@@ -129,4 +135,9 @@ Conclusion: {{ conclusion }}
 - Synonymous NL phrases reuse the SAME predicate name — no new synonym predicate was introduced (RULE 11).
 - "X is a [type]" uses a type predicate `is_type(X)`, never entity equality `X == type_entity` (RULE 12).
 - For any clause of the form "not A or B" / "neither A nor B": verify `And(Not(A), Not(B))` was used — not `Or(Not(A), Not(B))`. (RULE 13)
+- CONCLUSION-IN-PREMISES CHECK: verify that the conclusion's predicate(s) do NOT appear as nested sub-expressions in any premise formula. If `q = pred(X)`, scan every premise for `pred(X)` as a conjunct — this likely embeds the conclusion, making entailment trivial. (RULE 14)
+- QUANTIFIER CHECK for conclusion `q`:
+  - "A [type]..." / "[Types] are..." / "Every..." → `ForAll` + `Implies`
+  - "Some [type]..." / "There exists..." → `Exists`
+  - Count the independently assertable predicates in the NL conclusion — each should appear in `q`. Missing any = structural over-simplification.
 - VOCABULARY SCAN: scan all predicate names across all premises. If two predicates describe the same NL action/property used in different premises, unify to one name before outputting. (RULE 11)

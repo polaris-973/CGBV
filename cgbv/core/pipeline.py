@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import cgbv.logging as cgbv_log
+import z3 as _z3_module  # for premise consistency SAT check (Fix C)
 from cgbv.config.settings import ExperimentConfig
 from cgbv.core.gap_analysis import compute_gap_analysis
 from cgbv.core.multi_witness import MultiWitnessResult, WitnessCheckResult, run_multi_witness
 from cgbv.core.phase1_formalize import Phase1Result, run_phase1, run_phase1_targeted
-from cgbv.core.phase3_grounded import Phase3Result, reground_with_hint
+from cgbv.core.phase3_grounded import Phase3Result, retemplate_with_hint
 from cgbv.core.semantic_stability import SemanticAuditResult, audit_semantic_stability
-from cgbv.solver.model_extractor import format_domain_desc
+from cgbv.solver.model_extractor import format_domain_schema
 from cgbv.solver.code_executor import configure_max_workers
 from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
 from cgbv.core.phase5_repair import Phase5Result, run_phase5
@@ -278,6 +279,17 @@ class CGBVPipeline:
         #                         correct world, not a different-round witness.
         open_issues: dict[int, tuple] = {}
 
+        # Template cache: reuse Phase 3 templates across rounds.
+        # Only sentences whose FOL was repaired need regeneration.
+        # Cleared entirely on theory rewrite (run_phase1_targeted).
+        template_cache: list | None = None  # list[GroundingTemplate] | None
+        regenerate_indices: set[int] | None = None  # filled from Phase 5 repairs
+
+        # Revert counter: tracks how many times Phase 5 repairs for a sentence
+        # have been reverted by the semantic audit. Used by the pre-Phase5
+        # re-grounding gate (§5) to redirect to template re-generation.
+        revert_counts: dict[int, int] = {}
+
         # ----------------------------------------------------------------
         # Repair loop (up to R_max rounds)
         # ----------------------------------------------------------------
@@ -327,7 +339,13 @@ class CGBVPipeline:
                 num_witnesses=effective_k,
                 grounding_retries=self.config.pipeline.grounding_retries,
                 world_assumption=self.config.pipeline.world_assumption,
+                batch_grounding_size=self.config.pipeline.batch_grounding_size,
+                prev_templates=template_cache,
+                regenerate_indices=regenerate_indices,
             )
+            # Update template cache from this round's templates
+            template_cache = mw.templates if mw.templates else None
+            regenerate_indices = None  # reset for next round
             self._write_json(
                 out_dir / f"round{round_num}_witness.json",
                 _mw_to_dict(mw),
@@ -431,71 +449,41 @@ class CGBVPipeline:
                     else None
                 )
                 if gap is None or not gap.missing_links:
-                    semantic_audit = await audit_semantic_stability(
-                        sentences=sentences,
-                        premises=premises,
-                        q=q,
-                        namespace=namespace,
-                        raw_code=p1.raw_code,
+                    action, semantic_audit, p1_new = await self._try_verify_via_audit(
+                        sentences=sentences, premises=premises, q=q,
+                        namespace=namespace, raw_code=p1.raw_code,
                         witness_results=mw.witness_results,
-                        llm=self.llm,
-                        prompt_engine=self.prompt_engine,
+                        sample=sample, round_num=round_num, out_dir=out_dir,
                     )
-                    self._write_json(
-                        out_dir / f"round{round_num}_semantic_audit.json",
-                        _semantic_audit_to_dict(semantic_audit),
-                    )
-                    if not semantic_audit.stable:
-                        logger.warning(
-                            "Pipeline sample=%s round=%d: semantic stability audit "
-                            "flagged %d issue(s); triggering targeted re-formalization",
-                            sample.id, round_num, len(semantic_audit.issues),
+                    if action == "failed":
+                        rounds.append(round_record)
+                        final_gap = compute_gap_analysis(premises, q, [], background_constraints)
+                        result = PipelineResult(
+                            sample_id=sample.id,
+                            dataset=sample.dataset,
+                            label=sample.label,
+                            verdict=verdict,
+                            verdict_pre_bridge=verdict_pre_bridge,
+                            verdict_post_bridge=verdict_post_bridge,
+                            verified=False,
+                            num_rounds=round_num,
+                            rounds=rounds,
+                            phase1_raw_code=p1.raw_code,
+                            phase1_repeated_failure=p1.repeated_failure,
+                            acceptance_state="needs_repair",
+                            diagnostic_tags=["semantic_unstable"],
+                            semantic_stable=False,
+                            initial_obligation_count=initial_obligation_count,
+                            final_obligation_count=final_gap.obligation_count,
+                            execution_status="success",
+                            verification_status="semantic_unstable",
+                            verification_confidence="low",
+                            error="Semantic stability audit rejected an otherwise clean witness bank.",
                         )
-                        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
-                        p1_new = await run_phase1_targeted(
-                            original_code=p1.raw_code,
-                            failed_repairs=[
-                                (issue, "Semantic stability audit diverged on the current witness bank.")
-                                for issue in semantic_audit.issues
-                            ],
-                            premises_nl=sample.premises,
-                            conclusion_nl=sample.conclusion,
-                            llm=self.llm,
-                            solver=self.solver,
-                            prompt_engine=self.prompt_engine,
-                            task_type=sample.task_type,
-                            code_exec_timeout=self.config.pipeline.code_exec_timeout,
-                            world_assumption=self.config.pipeline.world_assumption,
-                            max_retries=self.config.pipeline.formalize_retries,
-                        )
-                        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
-                            rounds.append(round_record)
-                            final_gap = compute_gap_analysis(premises, q, [], background_constraints)
-                            result = PipelineResult(
-                                sample_id=sample.id,
-                                dataset=sample.dataset,
-                                label=sample.label,
-                                verdict=verdict,
-                                verdict_pre_bridge=verdict_pre_bridge,
-                                verdict_post_bridge=verdict_post_bridge,
-                                verified=False,
-                                num_rounds=round_num,
-                                rounds=rounds,
-                                phase1_raw_code=p1.raw_code,
-                                phase1_repeated_failure=p1.repeated_failure,
-                                acceptance_state="needs_repair",
-                                diagnostic_tags=["semantic_unstable"],
-                                semantic_stable=False,
-                                initial_obligation_count=initial_obligation_count,
-                                final_obligation_count=final_gap.obligation_count,
-                                execution_status="success",
-                                verification_status="semantic_unstable",
-                                verification_confidence="low",
-                                error="Semantic stability audit rejected an otherwise clean witness bank.",
-                            )
-                            self._write_json(out_dir / "result.json", asdict(result))
-                            return result
+                        self._write_json(out_dir / "result.json", asdict(result))
+                        return result
 
+                    if action == "reformalized":
                         premises = list(p1_new.premises)
                         q = p1_new.q
                         background_constraints = list(p1_new.background_constraints)
@@ -505,10 +493,13 @@ class CGBVPipeline:
                         model_info = p1_new.model_info
                         model_info_q = p1_new.model_info_q
                         p1 = p1_new
+                        template_cache = None  # theory rewrite → invalidate all templates
+                        revert_counts.clear()  # stale revert history invalid after rewrite
                         round_record.verdict_after = verdict
                         rounds.append(round_record)
                         continue
 
+                    # action == "verified"
                     final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
@@ -660,35 +651,22 @@ class CGBVPipeline:
             # Effective mismatches for repair = current witness + carried issues.
             effective_mismatches: list[Mismatch] = list(mw.mismatches) + carried
 
-            # Split Phase 3 structural errors from actionable (Phase 1 FOL) mismatches.
-            # A mismatch on the conclusion that contradicts the witness's expected truth
-            # value is definitively a Phase 3 grounding error (see phase4_check.py for
-            # the exact symmetric rule).  Phase 5 cannot fix these — patching the FOL
-            # formula would change the verdict, not fix the grounding.
-            phase3_errors: list[Mismatch] = [m for m in effective_mismatches if m.is_phase3_error]
+            # Conclusion mismatches: is_phase3_error is a HINT (not a definitive
+            # attribution).  We try retemplate first; unresolved conclusion mismatches
+            # are escalated to Phase 5 / run_phase1_targeted — never dead-ended.
+            conclusion_mismatches: list[Mismatch] = [m for m in effective_mismatches if m.is_phase3_error]
             actionable_mismatches: list[Mismatch] = [m for m in effective_mismatches if not m.is_phase3_error]
-            # num_mismatches tracks only actionable (Phase 5-eligible) mismatches so
-            # that repair_local_fix_rate = num_local_validated / num_mismatches reflects
-            # the actual Phase 5 workload.  Phase 3 errors are excluded because they are
-            # never sent to Phase 5 and would artificially deflate the rate.
-            round_record.num_mismatches = len(actionable_mismatches)
+            # num_mismatches tracks all mismatches for logging purposes.
+            round_record.num_mismatches = len(effective_mismatches)
 
-            # --- Targeted Phase 3 re-grounding for structural errors ---
-            # For each detected Phase 3 error, attempt a targeted re-grounding pass
-            # using the semantic mismatch as the error hint.  This avoids exhausting
-            # R_max on the same grounding error without ever giving Phase 3 the signal
-            # it needs to correct the comparison direction / quantifier structure.
-            # Snapshot the original detected count BEFORE re-grounding overwrites phase3_errors.
-            # num_phase3_errors (set after re-grounding) records the remaining count;
-            # num_phase3_detected records the total detected — the correct denominator for
-            # phase3_reground_rate = num_phase3_reground_success / num_phase3_detected.
-            round_record.num_phase3_detected = len(phase3_errors)
+            # --- Targeted Phase 3 re-grounding for conclusion mismatches ---
+            # For each detected conclusion mismatch, attempt a targeted re-grounding
+            # using a NEUTRAL hint (no target truth value — symmetric distrust).
+            # Unresolved conclusion mismatches are escalated to Phase 5 / theory rewrite.
+            round_record.num_phase3_detected = len(conclusion_mismatches)
 
-            # Persist Phase 3 errors in open_issues so they survive across rounds.
-            # Without this, a structural grounding error detected in round N can
-            # "disappear" in round N+1 (different witness / fallback formula) and
-            # cause a false verification — the "whitewashing" bug.
-            for m in phase3_errors:
+            # Persist conclusion mismatches in open_issues so they survive across rounds.
+            for m in conclusion_mismatches:
                 wm, wd = _pick_world_for_issue(
                     m, current_mismatch_indices,
                     open_issues, witness_models, witness_domains,
@@ -697,23 +675,19 @@ class CGBVPipeline:
                     m, _formula_str(m.sentence_index, premises, q), wm, wd,
                 )
 
-            if phase3_errors:
+            if conclusion_mismatches:
                 logger.warning(
-                    "Pipeline sample=%s round=%d: %d structural Phase 3 grounding error(s) "
-                    "detected (conclusion mismatch contradicts witness construction) — "
-                    "attempting targeted re-grounding: %s",
-                    sample.id, round_num, len(phase3_errors),
+                    "Pipeline sample=%s round=%d: %d conclusion mismatch(es) "
+                    "detected — attempting neutral re-grounding before escalation: %s",
+                    sample.id, round_num, len(conclusion_mismatches),
                     [(m.witness_side, m.mismatch_type, m.grounded_formula[:40])
-                     for m in phase3_errors],
+                     for m in conclusion_mismatches],
                 )
                 cgbv_log.update_phase("phase3", f"re-grounding round {round_num}")
                 still_broken: list[Mismatch] = []
                 reground_records: list[dict] = []
-                for m in phase3_errors:
+                for m in conclusion_mismatches:
                     expected_truth = (m.witness_side == "q")  # q→True, not_q→False
-                    # For carried mismatches, witness_index refers to a *previous round*
-                    # where indices were renumbered — use the stored domain instead.
-                    # For current-round mismatches, use this round's witness domain.
                     idx_key = m.sentence_index
                     if idx_key in open_issues and idx_key not in current_mismatch_indices:
                         stored = open_issues[idx_key]
@@ -723,13 +697,24 @@ class CGBVPipeline:
                     if witness_domain is None:
                         still_broken.append(m)
                         continue
-                    new_gf = await reground_with_hint(
+                    # NEUTRAL hint: do NOT specify target truth value (symmetric distrust).
+                    # The template or the FOL could be wrong — let the LLM re-derive
+                    # purely from the NL sentence meaning.
+                    hint = (
+                        f"Your previous template `{m.grounded_formula}` disagrees with "
+                        f"the FOL formula on a boundary witness. One of them may be wrong. "
+                        f"Re-derive the template purely from the natural language meaning: "
+                        f"'{sentences[m.sentence_index]}'. "
+                        f"Do NOT try to match any specific truth value."
+                    )
+                    schema_str = format_domain_schema(witness_domain)
+                    new_tmpl = await retemplate_with_hint(
                         idx=m.sentence_index,
                         sentence=sentences[m.sentence_index],
-                        domain_desc_str=format_domain_desc(witness_domain),
+                        domain_schema_str=schema_str,
                         domain=witness_domain,
-                        current_formula=m.grounded_formula,
-                        expected_truth=expected_truth,
+                        current_template=m.grounded_formula,
+                        hint=hint,
                         llm=self.llm,
                         prompt_engine=self.prompt_engine,
                         max_retries=self.config.pipeline.grounding_retries,
@@ -737,46 +722,54 @@ class CGBVPipeline:
                         solver=self.solver,
                     )
                     resolved = False
-                    if not new_gf.failed:
+                    if not new_tmpl.failed:
                         new_truth = self.solver.evaluate_grounded_formula(
-                            witness_domain, new_gf.formula_code
+                            witness_domain, new_tmpl.template_code
                         )
                         if new_truth == expected_truth:
                             logger.info(
-                                "Pipeline sample=%s round=%d: re-grounding resolved "
+                                "Pipeline sample=%s round=%d: re-templating resolved "
                                 "sentence %d (%s→%s)",
                                 sample.id, round_num, m.sentence_index,
-                                m.grounded_formula[:40], new_gf.formula_code[:40],
+                                m.grounded_formula[:40], new_tmpl.template_code[:40],
                             )
                             resolved = True
                             # Remove resolved Phase 3 error from open_issues
                             open_issues.pop(m.sentence_index, None)
+                            # Update template cache with corrected template
+                            if template_cache is not None and m.sentence_index < len(template_cache):
+                                template_cache[m.sentence_index] = new_tmpl
                     reground_records.append({
                         "sentence_index": m.sentence_index,
                         "witness_side": m.witness_side,
                         "old_formula": m.grounded_formula,
-                        "new_formula": new_gf.formula_code if not new_gf.failed else "",
+                        "new_formula": new_tmpl.template_code if not new_tmpl.failed else "",
                         "resolved": resolved,
-                        "error": new_gf.error if new_gf.failed else None,
+                        "error": new_tmpl.error if new_tmpl.failed else None,
                     })
                     if not resolved:
                         still_broken.append(m)
 
-                resolved_count = len(phase3_errors) - len(still_broken)
+                resolved_count = len(conclusion_mismatches) - len(still_broken)
                 round_record.num_phase3_reground_success = resolved_count
-                phase3_errors = still_broken
+                conclusion_mismatches = still_broken
                 self._write_json(
                     out_dir / f"round{round_num}_phase3_reground.json",
                     {"resolved": resolved_count, "attempts": reground_records},
                 )
 
-            round_record.num_phase3_errors = len(phase3_errors)
-            if phase3_errors:
-                logger.warning(
-                    "Pipeline sample=%s round=%d: %d Phase 3 error(s) remain unresolved "
-                    "after targeted re-grounding; skipping Phase 5 for these.",
-                    sample.id, round_num, len(phase3_errors),
+            round_record.num_phase3_errors = len(conclusion_mismatches)
+            if conclusion_mismatches:
+                # Escalation: unresolved conclusion mismatches are promoted to
+                # actionable_mismatches so they can reach Phase 5 / theory rewrite.
+                # This breaks the old dead-end where conclusion mismatches could
+                # never be repaired.
+                logger.info(
+                    "Pipeline sample=%s round=%d: %d conclusion mismatch(es) remain "
+                    "after re-grounding — escalating to Phase 5 / theory rewrite.",
+                    sample.id, round_num, len(conclusion_mismatches),
                 )
+                actionable_mismatches.extend(conclusion_mismatches)
 
             # --- Post-reground verified check ---
             # If targeted re-grounding resolved ALL Phase 3 errors AND there are no
@@ -791,7 +784,7 @@ class CGBVPipeline:
                     if verdict == VERDICT_UNCERTAIN
                     else None
                 )
-                if (gap_post is None or not gap_post.missing_links) and not phase3_errors:
+                if (gap_post is None or not gap_post.missing_links) and not conclusion_mismatches:
                     round_record.all_passed = True
                     # Drop the resolved Phase 3 entries from the mismatches snapshot —
                     # they are no longer errors and should not appear in the final record.
@@ -799,71 +792,41 @@ class CGBVPipeline:
                         m for m in round_record.mismatches
                         if not m.get("is_phase3_error", False)
                     ]
-                    semantic_audit = await audit_semantic_stability(
-                        sentences=sentences,
-                        premises=premises,
-                        q=q,
-                        namespace=namespace,
-                        raw_code=p1.raw_code,
+                    action, semantic_audit, p1_new = await self._try_verify_via_audit(
+                        sentences=sentences, premises=premises, q=q,
+                        namespace=namespace, raw_code=p1.raw_code,
                         witness_results=mw.witness_results,
-                        llm=self.llm,
-                        prompt_engine=self.prompt_engine,
+                        sample=sample, round_num=round_num, out_dir=out_dir,
                     )
-                    self._write_json(
-                        out_dir / f"round{round_num}_semantic_audit.json",
-                        _semantic_audit_to_dict(semantic_audit),
-                    )
-                    if not semantic_audit.stable:
-                        logger.warning(
-                            "Pipeline sample=%s round=%d: semantic stability audit "
-                            "flagged %d issue(s) after re-grounding; triggering targeted re-formalization",
-                            sample.id, round_num, len(semantic_audit.issues),
+                    if action == "failed":
+                        rounds.append(round_record)
+                        final_gap = compute_gap_analysis(premises, q, [], background_constraints)
+                        result = PipelineResult(
+                            sample_id=sample.id,
+                            dataset=sample.dataset,
+                            label=sample.label,
+                            verdict=verdict,
+                            verdict_pre_bridge=verdict_pre_bridge,
+                            verdict_post_bridge=verdict_post_bridge,
+                            verified=False,
+                            num_rounds=round_num,
+                            rounds=rounds,
+                            phase1_raw_code=p1.raw_code,
+                            phase1_repeated_failure=p1.repeated_failure,
+                            acceptance_state="needs_repair",
+                            diagnostic_tags=["semantic_unstable"],
+                            semantic_stable=False,
+                            initial_obligation_count=initial_obligation_count,
+                            final_obligation_count=final_gap.obligation_count,
+                            execution_status="success",
+                            verification_status="semantic_unstable",
+                            verification_confidence="low",
+                            error="Semantic stability audit rejected an otherwise clean witness bank.",
                         )
-                        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
-                        p1_new = await run_phase1_targeted(
-                            original_code=p1.raw_code,
-                            failed_repairs=[
-                                (issue, "Semantic stability audit diverged on the current witness bank.")
-                                for issue in semantic_audit.issues
-                            ],
-                            premises_nl=sample.premises,
-                            conclusion_nl=sample.conclusion,
-                            llm=self.llm,
-                            solver=self.solver,
-                            prompt_engine=self.prompt_engine,
-                            task_type=sample.task_type,
-                            code_exec_timeout=self.config.pipeline.code_exec_timeout,
-                            world_assumption=self.config.pipeline.world_assumption,
-                            max_retries=self.config.pipeline.formalize_retries,
-                        )
-                        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
-                            rounds.append(round_record)
-                            final_gap = compute_gap_analysis(premises, q, [], background_constraints)
-                            result = PipelineResult(
-                                sample_id=sample.id,
-                                dataset=sample.dataset,
-                                label=sample.label,
-                                verdict=verdict,
-                                verdict_pre_bridge=verdict_pre_bridge,
-                                verdict_post_bridge=verdict_post_bridge,
-                                verified=False,
-                                num_rounds=round_num,
-                                rounds=rounds,
-                                phase1_raw_code=p1.raw_code,
-                                phase1_repeated_failure=p1.repeated_failure,
-                                acceptance_state="needs_repair",
-                                diagnostic_tags=["semantic_unstable"],
-                                semantic_stable=False,
-                                initial_obligation_count=initial_obligation_count,
-                                final_obligation_count=final_gap.obligation_count,
-                                execution_status="success",
-                                verification_status="semantic_unstable",
-                                verification_confidence="low",
-                                error="Semantic stability audit rejected an otherwise clean witness bank.",
-                            )
-                            self._write_json(out_dir / "result.json", asdict(result))
-                            return result
+                        self._write_json(out_dir / "result.json", asdict(result))
+                        return result
 
+                    if action == "reformalized":
                         premises = list(p1_new.premises)
                         q = p1_new.q
                         background_constraints = list(p1_new.background_constraints)
@@ -873,10 +836,13 @@ class CGBVPipeline:
                         model_info = p1_new.model_info
                         model_info_q = p1_new.model_info_q
                         p1 = p1_new
+                        template_cache = None  # theory rewrite → invalidate all templates
+                        revert_counts.clear()  # stale revert history invalid after rewrite
                         round_record.verdict_after = verdict
                         rounds.append(round_record)
                         continue
 
+                    # action == "verified"
                     final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
@@ -916,7 +882,7 @@ class CGBVPipeline:
                         "Pipeline sample=%s round=%d: %d missing link(s) found "
                         "after Phase 3/4 — entering bridge-only Phase 5%s",
                         sample.id, round_num, len(gap_post.missing_links),
-                        " (Phase 3 errors present)" if phase3_errors else "",
+                        " (conclusion mismatches present)" if conclusion_mismatches else "",
                     )
                     first_wr = mw.witness_results[0] if mw.witness_results else None
                     first_witness_domain = first_wr.phase2.domain if first_wr else {}
@@ -1015,14 +981,93 @@ class CGBVPipeline:
                     )
                     rounds.append(round_record)
                     continue
-                # else: phase3_errors remain but no structural gap → fall through
+                # else: conclusion mismatches remain but no structural gap → fall through
+
+            # Use the first witness for repair prompt context (fallback domain)
+            first_wr = mw.witness_results[0] if mw.witness_results else None
+            first_witness_domain = first_wr.phase2.domain if first_wr else {}
 
             if actionable_mismatches:
-                # Use the first witness for repair prompt context (fallback domain)
-                first_wr = mw.witness_results[0] if mw.witness_results else None
-                first_witness_domain = first_wr.phase2.domain if first_wr else {}
+                # -----------------------------------------------------------
+                # Pre-Phase5 re-grounding gate (§5 dead-loop breaker)
+                # For mismatches that were previously reverted by semantic audit,
+                # try re-generating the template BEFORE sending to Phase 5.
+                # If the template was wrong (not the FOL), fixing it here avoids
+                # the Phase5→audit-revert→loop cycle.
+                # -----------------------------------------------------------
+                revert_candidates = [
+                    m for m in actionable_mismatches
+                    if revert_counts.get(m.sentence_index, 0) >= 1
+                ]
+                if revert_candidates:
+                    logger.info(
+                        "Pipeline sample=%s round=%d: %d mismatch(es) have prior "
+                        "revert(s) — attempting Phase 3 re-templating before Phase 5: %s",
+                        sample.id, round_num, len(revert_candidates),
+                        [m.sentence_index for m in revert_candidates],
+                    )
+                    retemplate_resolved: list[int] = []
+                    for m in revert_candidates:
+                        expected_truth = (m.witness_side == "q")
+                        idx_key = m.sentence_index
+                        if idx_key in open_issues and idx_key not in current_mismatch_indices:
+                            stored = open_issues[idx_key]
+                            w_domain = stored[3] if len(stored) >= 4 else None
+                        else:
+                            w_domain = witness_domains.get(m.witness_index)
+                        if w_domain is None:
+                            continue
+                        hint = (
+                            f"Your previous template `{m.grounded_formula}` led to a "
+                            f"mismatch that was repaired at the FOL level but reverted "
+                            f"by semantic audit ({revert_counts[m.sentence_index]} time(s)). "
+                            f"This suggests the TEMPLATE is wrong, not the FOL. "
+                            f"Re-examine the logical structure of the sentence."
+                        )
+                        schema_str = format_domain_schema(w_domain)
+                        new_tmpl = await retemplate_with_hint(
+                            idx=m.sentence_index,
+                            sentence=sentences[m.sentence_index],
+                            domain_schema_str=schema_str,
+                            domain=w_domain,
+                            current_template=m.grounded_formula,
+                            hint=hint,
+                            llm=self.llm,
+                            prompt_engine=self.prompt_engine,
+                            max_retries=self.config.pipeline.grounding_retries,
+                            world_assumption=self.config.pipeline.world_assumption,
+                            solver=self.solver,
+                        )
+                        if not new_tmpl.failed:
+                            new_truth = self.solver.evaluate_grounded_formula(
+                                w_domain, new_tmpl.template_code
+                            )
+                            if new_truth == expected_truth:
+                                logger.info(
+                                    "Pipeline sample=%s round=%d: pre-Phase5 re-templating "
+                                    "resolved sentence %d (revert_count=%d)",
+                                    sample.id, round_num, m.sentence_index,
+                                    revert_counts[m.sentence_index],
+                                )
+                                retemplate_resolved.append(m.sentence_index)
+                                open_issues.pop(m.sentence_index, None)
+                                revert_counts.pop(m.sentence_index, None)
+                                if template_cache is not None and m.sentence_index < len(template_cache):
+                                    template_cache[m.sentence_index] = new_tmpl
+                    # Remove resolved mismatches from actionable list
+                    if retemplate_resolved:
+                        actionable_mismatches = [
+                            m for m in actionable_mismatches
+                            if m.sentence_index not in retemplate_resolved
+                        ]
+                        logger.info(
+                            "Pipeline sample=%s round=%d: pre-Phase5 re-templating resolved "
+                            "%d mismatch(es); %d remain for Phase 5",
+                            sample.id, round_num, len(retemplate_resolved),
+                            len(actionable_mismatches),
+                        )
 
-                # Compute gap analysis for unified repair
+            if actionable_mismatches:
                 gap = compute_gap_analysis(premises, q, actionable_mismatches, background_constraints)
 
                 cgbv_log.update_phase("phase5", f"round {round_num}/{self.config.pipeline.r_max}")
@@ -1076,6 +1121,101 @@ class CGBVPipeline:
 
                     premises = p5.repaired_premises
                     q = p5.repaired_q
+
+                    # Fix C: Premise consistency check (Principle 5).
+                    # After repair, verify the premise set is still satisfiable.
+                    # A contradictory premise set lets Z3 prove anything (ex falso
+                    # quodlibet), producing a spurious Entailed verdict.
+                    _sat_check_solver = _z3_module.Solver()
+                    for _p in premises:
+                        _sat_check_solver.add(_p)
+                    for _bc in background_constraints:
+                        _sat_check_solver.add(_bc)
+                    if _sat_check_solver.check() == _z3_module.unsat:
+                        logger.warning(
+                            "Pipeline sample=%s round=%d: repaired premises are UNSAT — "
+                            "contradiction detected, rejecting repair and escalating",
+                            sample.id, round_num,
+                        )
+                        # Revert repair
+                        premises = old_premises
+                        q = old_q
+                        round_record.verdict_after = old_verdict
+                        round_record.repair_reverted = True
+                        round_record.repair_success = False
+                        # Escalation: trigger targeted re-formalization immediately
+                        cgbv_log.update_phase("phase1", f"contradiction-escalation round {round_num}")
+                        contradiction_hint = (
+                            f"Phase 5 repair created a contradiction in the premise set "
+                            f"(premises are UNSAT after modifying sentences "
+                            f"{[r.sentence_index for r in p5.repairs if r.success]}). "
+                            f"The formalization has structural errors that cannot be "
+                            f"patched. Rewrite the full theory."
+                        )
+                        p1_new = await run_phase1_targeted(
+                            original_code=p1.raw_code,
+                            failed_repairs=[
+                                (
+                                    Mismatch(
+                                        sentence_index=r.sentence_index,
+                                        nl_sentence=sentences[r.sentence_index] if r.sentence_index < len(sentences) else "",
+                                        mismatch_type="strengthening",
+                                        fol_truth=False,
+                                        grounded_truth=True,
+                                        fol_formula_str="",
+                                        grounded_formula="",
+                                    ),
+                                    contradiction_hint,
+                                )
+                                for r in p5.repairs if r.success
+                            ],
+                            premises_nl=sample.premises,
+                            conclusion_nl=sample.conclusion,
+                            llm=self.llm,
+                            solver=self.solver,
+                            prompt_engine=self.prompt_engine,
+                            task_type=sample.task_type,
+                            code_exec_timeout=self.config.pipeline.code_exec_timeout,
+                            world_assumption=self.config.pipeline.world_assumption,
+                            max_retries=self.config.pipeline.formalize_retries,
+                        )
+                        if p1_new is not None:
+                            old_is_unknown = (verdict == VERDICT_UNKNOWN)
+                            if p1_new.verdict == VERDICT_UNKNOWN and not old_is_unknown:
+                                logger.warning(
+                                    "Pipeline sample=%s round=%d: contradiction escalation "
+                                    "degraded solver to Unknown; keeping old theory",
+                                    sample.id, round_num,
+                                )
+                            else:
+                                premises = list(p1_new.premises)
+                                q = p1_new.q
+                                background_constraints = list(p1_new.background_constraints)
+                                bound_var_names = p1_new.bound_var_names
+                                namespace = p1_new.namespace
+                                verdict = p1_new.verdict
+                                model_info = p1_new.model_info
+                                model_info_q = p1_new.model_info_q
+                                p1 = p1_new
+                                template_cache = None
+                                revert_counts.clear()
+                                open_issues.clear()
+                                round_record.verdict_after = verdict
+                        self._write_json(
+                            out_dir / f"round{round_num}_contradiction_escalation.json",
+                            {
+                                "triggered": True,
+                                "reformalize_success": p1_new is not None,
+                                "new_verdict": p1_new.verdict if p1_new else None,
+                            },
+                        )
+                        # Skip rest of repair processing for this round
+                        self._write_json(
+                            out_dir / f"round{round_num}_repair.json",
+                            _phase5_to_dict(p5, accepted_bridges=[]),
+                        )
+                        rounds.append(round_record)
+                        continue
 
                     # Per-bridge filter: only commit bridges that strictly reduce
                     # unresolved obligations. Bridges that don't improve theory
@@ -1165,26 +1305,67 @@ class CGBVPipeline:
                                 if str(old_f) != str(new_f)
                             ]
                             if changed_indices:
-                                semantic_audit = await audit_semantic_stability(
-                                    sentences=sentences,
-                                    premises=premises,
-                                    q=q,
-                                    namespace=namespace,
-                                    raw_code=p1.raw_code,
-                                    witness_results=mw.witness_results,
-                                    llm=self.llm,
-                                    prompt_engine=self.prompt_engine,
-                                    indices=changed_indices,
-                                )
-                                self._write_json(
-                                    out_dir / f"round{round_num}_semantic_audit.json",
-                                    _semantic_audit_to_dict(semantic_audit),
-                                )
-                                if not semantic_audit.stable:
-                                    reject_reason = (
-                                        "semantic stability audit rejected the candidate patch "
-                                        f"({len(semantic_audit.issues)} issue(s))"
+                                # Deterministic gate: if template_cache is available,
+                                # compare repaired FOL against cached templates on all
+                                # witnesses.  This avoids the LLM re-generation randomness
+                                # that caused correct repairs to be rejected (Violation 2).
+                                all_new = list(premises) + [q]
+                                if template_cache is not None:
+                                    for idx in changed_indices:
+                                        if reject_reason is not None:
+                                            break
+                                        if idx >= len(template_cache) or template_cache[idx] is None:
+                                            continue  # no cache for this index → skip (conservative accept)
+                                        cached_tmpl = template_cache[idx]
+                                        if cached_tmpl.failed:
+                                            continue
+                                        for wr in mw.witness_results:
+                                            if wr.phase2.model is None or wr.phase2.domain is None:
+                                                continue
+                                            fol_val = _finite_evaluator.evaluate(
+                                                wr.phase2.model, all_new[idx], namespace=namespace,
+                                            )
+                                            tmpl_val = self.solver.evaluate_grounded_formula(
+                                                wr.phase2.domain, cached_tmpl.template_code,
+                                            )
+                                            if fol_val is not None and tmpl_val is not None and fol_val != tmpl_val:
+                                                reject_reason = (
+                                                    f"Repaired FOL for sentence {idx} disagrees with "
+                                                    f"cached template on witness {wr.witness_index} "
+                                                    f"(FOL={fol_val}, template={tmpl_val})"
+                                                )
+                                                break
+                                    self._write_json(
+                                        out_dir / f"round{round_num}_semantic_audit.json",
+                                        {
+                                            "audit_type": "deterministic_template_cache",
+                                            "changed_indices": changed_indices,
+                                            "stable": reject_reason is None,
+                                            "reject_reason": reject_reason,
+                                        },
                                     )
+                                else:
+                                    # No template cache (first round) → fall back to LLM audit
+                                    semantic_audit = await audit_semantic_stability(
+                                        sentences=sentences,
+                                        premises=premises,
+                                        q=q,
+                                        namespace=namespace,
+                                        raw_code=p1.raw_code,
+                                        witness_results=mw.witness_results,
+                                        llm=self.llm,
+                                        prompt_engine=self.prompt_engine,
+                                        indices=changed_indices,
+                                    )
+                                    self._write_json(
+                                        out_dir / f"round{round_num}_semantic_audit.json",
+                                        _semantic_audit_to_dict(semantic_audit),
+                                    )
+                                    if not semantic_audit.stable:
+                                        reject_reason = (
+                                            "semantic stability audit rejected the candidate patch "
+                                            f"({len(semantic_audit.issues)} issue(s))"
+                                        )
 
                     if reject_reason is not None:
                         logger.warning(
@@ -1197,14 +1378,17 @@ class CGBVPipeline:
                         round_record.verdict_after = old_verdict
                         round_record.repair_reverted = True
                         round_record.repair_success = False
+                        regenerate_indices = None  # revert → FOL unchanged, templates still valid
 
                         # Revert accepted bridge axioms committed this round
                         for _ in accepted_bridges:
                             if background_constraints:
                                 background_constraints.pop()
 
-                        # Repair reverted — persist all actionable mismatches.
+                        # Repair reverted — persist all actionable mismatches
+                        # and increment revert count for dead-loop detection.
                         for m in actionable_mismatches:
+                            revert_counts[m.sentence_index] = revert_counts.get(m.sentence_index, 0) + 1
                             wm, wd = _pick_world_for_issue(
                                 m, current_mismatch_indices,
                                 open_issues, witness_models, witness_domains,
@@ -1262,6 +1446,9 @@ class CGBVPipeline:
                         repaired_indices = {
                             r.sentence_index for r in p5.repairs if r.success
                         }
+                        # Template cache: mark repaired indices for regeneration
+                        # in the next round (their FOL changed, template may need updating)
+                        regenerate_indices = repaired_indices if repaired_indices else None
                         for r in p5.repairs:
                             if r.success:
                                 open_issues.pop(r.sentence_index, None)
@@ -1533,6 +1720,8 @@ class CGBVPipeline:
                             model_info_q = p1_new.model_info_q
                             sentences = sample.premises + [sample.conclusion]
                             p1 = p1_new
+                            template_cache = None  # theory rewrite → invalidate all templates
+                            revert_counts.clear()  # stale revert history invalid after rewrite
                             round_record.verdict_after = verdict
                             # Clear all open_issues — the theory has been fully
                             # rewritten, so all fingerprints are stale.
@@ -1555,7 +1744,8 @@ class CGBVPipeline:
                         },
                     )
             else:
-                # No actionable mismatches to repair (only Phase 3 errors remain).
+                # No actionable mismatches remain (all resolved via re-grounding
+                # or no mismatches were detected at this stage).
                 pass
 
             rounds.append(round_record)
@@ -1622,6 +1812,74 @@ class CGBVPipeline:
             sample.id, self.config.pipeline.r_max,
         )
         return result
+
+    async def _try_verify_via_audit(
+        self,
+        sentences: list[str],
+        premises: list,
+        q: object,
+        namespace: dict,
+        raw_code: str,
+        witness_results: list,
+        sample: DataSample,
+        round_num: int,
+        out_dir: Path,
+    ) -> tuple[str, SemanticAuditResult, Phase1Result | None]:
+        """Run semantic audit and, if unstable, attempt targeted re-formalization.
+
+        Returns:
+            (action, audit, p1_new) where action is one of:
+              - "verified": audit passed, caller should return verified result
+              - "reformalized": audit failed but re-formalization succeeded;
+                caller should update state from p1_new and continue loop
+              - "failed": audit failed and re-formalization failed/degraded;
+                caller should return semantic_unstable result
+        """
+        semantic_audit = await audit_semantic_stability(
+            sentences=sentences,
+            premises=premises,
+            q=q,
+            namespace=namespace,
+            raw_code=raw_code,
+            witness_results=witness_results,
+            llm=self.llm,
+            prompt_engine=self.prompt_engine,
+        )
+        self._write_json(
+            out_dir / f"round{round_num}_semantic_audit.json",
+            _semantic_audit_to_dict(semantic_audit),
+        )
+
+        if semantic_audit.stable:
+            return "verified", semantic_audit, None
+
+        logger.warning(
+            "Pipeline sample=%s round=%d: semantic stability audit "
+            "flagged %d issue(s); triggering targeted re-formalization",
+            sample.id, round_num, len(semantic_audit.issues),
+        )
+        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
+        p1_new = await run_phase1_targeted(
+            original_code=raw_code,
+            failed_repairs=[
+                (issue, "Semantic stability audit diverged on the current witness bank.")
+                for issue in semantic_audit.issues
+            ],
+            premises_nl=sample.premises,
+            conclusion_nl=sample.conclusion,
+            llm=self.llm,
+            solver=self.solver,
+            prompt_engine=self.prompt_engine,
+            task_type=sample.task_type,
+            code_exec_timeout=self.config.pipeline.code_exec_timeout,
+            world_assumption=self.config.pipeline.world_assumption,
+            max_retries=self.config.pipeline.formalize_retries,
+        )
+
+        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
+            return "failed", semantic_audit, None
+
+        return "reformalized", semantic_audit, p1_new
 
     @staticmethod
     def _write_json(path: Path, data: dict) -> None:

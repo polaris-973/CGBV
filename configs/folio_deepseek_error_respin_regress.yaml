@@ -6,7 +6,8 @@ dataset:
   name: folio
   split: validation
   path: ./datasets
-  only_ids: [476, 1367, 370, 372, 527, 389, 1329, 803, 1033]
+  # only_ids: [476, 1367, 370, 372, 527, 389, 1329, 803, 1033]
+  only_ids: [478, 361, 819, 173, 547, 476, 372, 527, 529, 440]
 
 llm:
   provider: deepseek

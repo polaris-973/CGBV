@@ -129,6 +129,37 @@ async def run_phase1(
         raw_code = await llm.complete_with_retry(messages)
         attempt_record.raw_output = raw_code
 
+        # Fix D: AST-based sort consistency check (before execution).
+        # Catches sort mismatches statically, providing precise diagnostics
+        # that guide the retry instead of opaque Z3 runtime errors.
+        sort_error = check_z3_sort_consistency(raw_code)
+        if sort_error:
+            last_error = sort_error
+            last_validation_feedback = []
+            last_name_error_hint = sort_error  # inject as specific diagnosis
+            attempt_record.code_exec_error = sort_error
+            last_diagnostic = _build_phase1_diagnostic(
+                raw_code=raw_code,
+                failure_stage="sort_check",
+                raw_error=sort_error,
+                validation_feedback=[],
+                name_error_hint=sort_error,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
+            )
+            repeated_failure_detected = bool(
+                failure_fingerprints
+                and failure_fingerprints[-1] == last_diagnostic.attempt_fingerprint
+            )
+            failure_fingerprints.append(last_diagnostic.attempt_fingerprint)
+            attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
+            attempts.append(attempt_record)
+            logger.warning(
+                "Phase 1 attempt %d/%d: static sort mismatch: %s",
+                attempt + 1, max_retries, sort_error[:200],
+            )
+            continue
+
         try:
             ctx = execute_z3_code(raw_code, timeout_seconds=code_exec_timeout)
         except CodeExecutionError as e:
@@ -1532,3 +1563,102 @@ def _snapshot_messages(messages: list[dict]) -> list[dict[str, str]]:
         }
         for m in messages
     ]
+
+
+def check_z3_sort_consistency(code: str) -> str | None:
+    """Parse Phase 1 code (AST only) and detect Z3 sort mismatches statically.
+
+    Detects: a Function declared as returning BoolSort() being passed as an
+    argument to another Function that expects a custom Sort parameter.
+
+    Returns None if no error found, or a diagnostic string describing the
+    sort mismatch.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None  # let execute_z3_code handle syntax errors
+
+    # Pass 1: collect Function declarations and their sort signatures.
+    # Function('name', SortA, SortB, BoolSort()) → name: [SortA, SortB, BoolSort]
+    func_sorts: dict[str, list[str]] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            value = node.value
+            # Function('name', Sort1, Sort2, ..., BoolSort())
+            if (isinstance(target, ast.Name)
+                and isinstance(value, ast.Call)
+                and _ast_call_name(value) == "Function"):
+                args = value.args
+                if len(args) >= 2:
+                    sort_names = []
+                    for a in args[1:]:
+                        sort_names.append(_ast_sort_name(a))
+                    func_sorts[target.id] = sort_names
+
+    if not func_sorts:
+        return None
+
+    # Pass 2: find Function calls where a BoolSort-returning function is
+    # passed as argument to a slot that expects a custom Sort.
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        caller_name = _ast_call_name(node)
+        if caller_name not in func_sorts:
+            continue
+        caller_sig = func_sorts[caller_name]
+        # caller_sig[-1] is the return sort; caller_sig[:-1] are parameter sorts
+        param_sorts = caller_sig[:-1]
+        for i, arg in enumerate(node.args):
+            if i >= len(param_sorts):
+                break
+            expected_sort = param_sorts[i]
+            if expected_sort == "BoolSort":
+                continue  # BoolSort parameter — any bool expression is fine
+            # Check if the arg is a call to a function that returns BoolSort
+            if isinstance(arg, ast.Call):
+                arg_func_name = _ast_call_name(arg)
+                if (arg_func_name in func_sorts
+                    and func_sorts[arg_func_name][-1] == "BoolSort"):
+                    lineno = getattr(node, 'lineno', '?')
+                    errors.append(
+                        f"line {lineno}: `{arg_func_name}(...)` returns BoolSort, "
+                        f"but is passed to `{caller_name}(...)` parameter {i+1} "
+                        f"which expects {expected_sort}"
+                    )
+
+    if errors:
+        return (
+            "Z3 Sort mismatch detected (static check):\n"
+            + "\n".join(f"  - {e}" for e in errors)
+            + "\n\nFunctions returning BoolSort (predicates) cannot be used "
+            "as arguments where a custom Sort (entity) is expected. "
+            "Use a separate predicate or restructure the formula."
+        )
+    return None
+
+
+def _ast_call_name(node: ast.Call) -> str:
+    """Extract the function name from an AST Call node."""
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return ""
+
+
+def _ast_sort_name(node: ast.expr) -> str:
+    """Extract a sort name from an AST node used in Function() declaration.
+
+    Handles: SortName (ast.Name), BoolSort() (ast.Call), IntSort() (ast.Call).
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Call):
+        name = _ast_call_name(node)
+        return name if name else "Unknown"
+    return "Unknown"

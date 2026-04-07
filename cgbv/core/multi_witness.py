@@ -7,10 +7,14 @@ from typing import Any
 
 import cgbv.logging as cgbv_log
 from cgbv.core.phase2_witness import Phase2Result, run_phase2
-from cgbv.core.phase3_grounded import Phase3Result, run_phase3
+from cgbv.core.phase3_grounded import (
+    GroundedFormula, GroundingTemplate, Phase3Result,
+    generate_templates, generate_templates_partial,
+)
 from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
 from cgbv.llm.base import LLMClient
 from cgbv.prompts.prompt_engine import PromptEngine
+from cgbv.solver.model_extractor import format_domain_schema
 from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNCERTAIN
 
 logger = logging.getLogger(__name__)
@@ -35,6 +39,8 @@ class MultiWitnessResult:
     all_passed: bool = True
     # Number of witnesses successfully constructed
     num_witnesses_constructed: int = 0
+    # Templates used for this round (for pipeline template cache)
+    templates: list[GroundingTemplate] = field(default_factory=list)
 
 
 async def run_multi_witness(
@@ -53,18 +59,26 @@ async def run_multi_witness(
     num_witnesses: int = 1,
     grounding_retries: int = 2,
     world_assumption: str = "owa",
+    batch_grounding_size: int = 0,      # Phase 3 batch size (0 = all sentences in one call)
+    prev_templates: list[GroundingTemplate] | None = None,
+    regenerate_indices: set[int] | None = None,  # None or empty → reuse all prev_templates
 ) -> MultiWitnessResult:
     """
     Multi-Witness coordinator: Phase 2 + Phase 3 + Phase 4 across K witnesses.
 
+    Template-Once design (Proposal-v2 improvement):
+      Phase 3 generates formula templates ONCE from the domain schema (no truth values),
+      then instantiates them on each witness via cheap Python eval — no per-witness LLM calls.
+      This eliminates cross-witness inconsistency (sample 547) and truth-value contamination,
+      and reduces Phase 3 LLM calls from O(K×N) to O(N/batch_size).
+
     For Uncertain verdict (P1.1): constructs K witnesses on the ¬q side PLUS exactly
-      1 additional witness on the q side, regardless of K. This guarantees q-side
-      coverage even when K=1 (the common default), without reducing ¬q coverage.
-      Total witnesses = K + 1 for Uncertain with model_info_q available.
+      1 additional witness on the q side, regardless of K.
     For other verdicts: all K witnesses use the standard ¬q / MaxSAT path.
 
     Phase 2 (witness construction) is serial (block clause chain per side).
-    Phase 3+4 runs in parallel across all witnesses via asyncio.gather.
+    Phase 3 template generation happens ONCE after all witnesses are constructed.
+    Phase 4 runs in parallel across all witnesses via asyncio.gather.
     """
     fol_formulas = list(premises) + [q]
 
@@ -151,20 +165,108 @@ async def run_multi_witness(
         )
 
     # ----------------------------------------------------------------
-    # Phase 3+4: Parallel execution across all witnesses
+    # Phase 3 Step 1: Template Generation (once, using first witness schema)
+    # Templates are generated from domain schema WITHOUT truth values,
+    # ensuring all witnesses use the same logical structure (Template-Once design).
+    #
+    # Template cache: if prev_templates is provided, only regenerate the
+    # indices in regenerate_indices (e.g. sentences whose FOL was repaired).
+    # This eliminates stochastic regression on already-correct templates.
+    # ----------------------------------------------------------------
+    cgbv_log.update_phase("phase3")
+    first_witness = witnesses[0]
+    domain_schema_str = format_domain_schema(first_witness.domain)
+
+    if prev_templates is not None:
+        # Schema compatibility check: same entity set and predicate signatures
+        prev_schema = getattr(prev_templates[0], '_source_schema', None) if prev_templates else None
+        schema_compatible = (prev_schema == domain_schema_str) if prev_schema else True
+
+        if schema_compatible and len(prev_templates) == len(sentences):
+            if regenerate_indices:
+                logger.info(
+                    "Multi-Witness: template cache hit — regenerating %d/%d indices: %s",
+                    len(regenerate_indices), len(sentences), sorted(regenerate_indices),
+                )
+                partial = await generate_templates_partial(
+                    indices=regenerate_indices,
+                    sentences=sentences,
+                    domain_schema_str=domain_schema_str,
+                    domain=first_witness.domain,
+                    llm=llm,
+                    prompt_engine=prompt_engine,
+                    max_retries=grounding_retries,
+                    world_assumption=world_assumption,
+                    solver=solver,
+                )
+                # Merge: replace only regenerated indices, keep rest from cache
+                partial_by_idx = {t.sentence_index: t for t in partial}
+                merged_templates = [
+                    partial_by_idx.get(t.sentence_index, t)
+                    for t in prev_templates
+                ]
+                templates = merged_templates
+            else:
+                logger.info(
+                    "Multi-Witness: template cache hit — no indices to regenerate, reusing all %d templates",
+                    len(prev_templates),
+                )
+                templates = list(prev_templates)
+        else:
+            logger.info(
+                "Multi-Witness: template cache invalidated — schema mismatch or length change "
+                "(prev=%d, curr=%d); regenerating all",
+                len(prev_templates), len(sentences),
+            )
+            templates_result = await generate_templates(
+                sentences=sentences,
+                domain_schema_str=domain_schema_str,
+                domain=first_witness.domain,
+                llm=llm,
+                prompt_engine=prompt_engine,
+                max_retries=grounding_retries,
+                world_assumption=world_assumption,
+                solver=solver,
+                batch_size=batch_grounding_size,
+            )
+            templates = templates_result.templates
+    else:
+        # First round or no cache: generate all templates
+        templates_result = await generate_templates(
+            sentences=sentences,
+            domain_schema_str=domain_schema_str,
+            domain=first_witness.domain,
+            llm=llm,
+            prompt_engine=prompt_engine,
+            max_retries=grounding_retries,
+            world_assumption=world_assumption,
+            solver=solver,
+            batch_size=batch_grounding_size,
+        )
+        templates = templates_result.templates
+
+    # Stamp source schema on templates for future cache compatibility checks
+    for t in templates:
+        t._source_schema = domain_schema_str  # type: ignore[attr-defined]
+
+    logger.debug(
+        "Multi-Witness: %d templates ready (batch_size=%d, %d witnesses)",
+        len(templates), batch_grounding_size, len(witnesses),
+    )
+
+    # ----------------------------------------------------------------
+    # Phase 3 Step 2 + Phase 4: Parallel eval + check across all witnesses
+    # eval() is cheap Python — no LLM calls per witness.
     # ----------------------------------------------------------------
     tasks = [
-        _run_phase3_and_4(
+        _run_eval_and_phase4(
             witness_index=k,
             p2=witnesses[k],
+            templates=templates,
             sentences=sentences,
             fol_formulas=fol_formulas,
             namespace=namespace,
             solver=solver,
-            llm=llm,
-            prompt_engine=prompt_engine,
-            grounding_retries=grounding_retries,
-            world_assumption=world_assumption,
         )
         for k in range(len(witnesses))
     ]
@@ -188,36 +290,41 @@ async def run_multi_witness(
         mismatches=all_mismatches,
         all_passed=(len(all_mismatches) == 0 and all(wr.phase4.all_passed for wr in witness_results)),
         num_witnesses_constructed=len(witnesses),
+        templates=templates,
     )
 
 
-async def _run_phase3_and_4(
+async def _run_eval_and_phase4(
     witness_index: int,
     p2: Phase2Result,
+    templates: list[GroundingTemplate],
     sentences: list[str],
     fol_formulas: list,
     namespace: dict,
     solver: Z3Solver,
-    llm: LLMClient,
-    prompt_engine: PromptEngine,
-    grounding_retries: int,
-    world_assumption: str = "owa",
 ) -> WitnessCheckResult:
-    """Run Phase 3 + Phase 4 for a single witness."""
-    cgbv_log.update_phase("phase3")
-    p3 = await run_phase3(
-        sentences=sentences,
-        domain_desc_str=p2.domain_desc_str,
-        domain=p2.domain,
-        llm=llm,
-        prompt_engine=prompt_engine,
-        max_retries=grounding_retries,
-        world_assumption=world_assumption,
-        solver=solver,
-        fol_formula_strs=[str(f) for f in fol_formulas] if fol_formulas else None,
-    )
+    """Phase 3 Step 2 + Phase 4 for a single witness (no LLM calls).
 
+    Converts witness-independent GroundingTemplates to GroundedFormula objects,
+    then runs Phase 4 which evaluates each formula on this witness's truth table.
+    """
     cgbv_log.update_phase("phase4")
+
+    # Convert templates to GroundedFormula for Phase 4 compatibility.
+    # Phase 4 will eval template_code on p2.domain via evaluate_grounded_formula().
+    grounded_formulas = [
+        GroundedFormula(
+            sentence_index=tmpl.sentence_index,
+            nl_sentence=tmpl.nl_sentence,
+            formula_code=tmpl.template_code,
+            failed=tmpl.failed,
+            attempts=tmpl.attempts,
+            error=tmpl.error,
+        )
+        for tmpl in templates
+    ]
+    p3 = Phase3Result(grounded=grounded_formulas)
+
     p4 = run_phase4(
         sentences=sentences,
         fol_formulas=fol_formulas,
