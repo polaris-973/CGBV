@@ -11,7 +11,7 @@ from cgbv.core.phase4_check import Mismatch
 from cgbv.llm.base import LLMClient
 from cgbv.prompts.prompt_engine import PromptEngine
 from cgbv.solver.finite_evaluator import FiniteModelEvaluator
-from cgbv.solver.model_extractor import format_domain_desc, format_filtered_domain_desc
+from cgbv.solver.model_extractor import format_domain_desc, format_filtered_domain_desc, format_sparse_domain_desc
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ class RepairEntry:
     success: bool
     witness_index: int = 0
     witness_side: str = "not_q"
-    local_validated: bool = False  # True if repaired formula resolved the mismatch locally
+    local_validated: bool = False  # True if repaired formula resolved the mismatch on its seed witness
     attempts: list[RepairAttempt] = field(default_factory=list)
     error: str | None = None
 
@@ -205,6 +205,7 @@ async def run_phase5(
     world_assumption: str = "owa",
     batch_repair_threshold: int = 2,  # deprecated, ignored
     gap_analysis: Any = None,         # GapAnalysisResult from gap_analysis.py
+    sparse_witness_format: bool = False,  # use sparse positive witness format (True atoms only)
 ) -> Phase5Result:
     """
     Phase 5: Diagnosis & Targeted Repair (Unified).
@@ -235,6 +236,13 @@ async def run_phase5(
 
     has_gap = bool(gap_data)
 
+    for m in mismatches:
+        if m.fol_truth is None or m.grounded_truth is None:
+            raise ValueError(
+                "Phase 5 received a non-concrete mismatch. "
+                "Only concrete truth disagreements are repair targets."
+            )
+
     # Single mismatch without gap signals → lightweight per-mismatch path
     if len(mismatches) == 1 and not has_gap:
         return await _run_single_mismatch(
@@ -253,6 +261,7 @@ async def run_phase5(
             mismatch_domains=mismatch_domains,
             solver=solver,
             world_assumption=world_assumption,
+            sparse_witness_format=sparse_witness_format,
         )
 
     # Unified path: present all mismatches jointly with gap analysis
@@ -273,6 +282,7 @@ async def run_phase5(
         solver=solver,
         world_assumption=world_assumption,
         gap_analysis=gap_data,
+        sparse_witness_format=sparse_witness_format,
     )
 
 
@@ -292,6 +302,7 @@ async def _run_single_mismatch(
     mismatch_domains: dict[int, dict] | None,
     solver: Any,
     world_assumption: str,
+    sparse_witness_format: bool = False,
 ) -> Phase5Result:
     """Lightweight single-mismatch path (delegates to _repair_one)."""
     n = len(premises)
@@ -300,7 +311,7 @@ async def _run_single_mismatch(
 
     repaired_premises: list = list(premises)
     repaired_q: object = q
-    fallback_desc = format_domain_desc(domain)
+    fallback_desc = format_sparse_domain_desc(domain) if sparse_witness_format else format_domain_desc(domain)
 
     local_domain, local_model = _resolve_domain_model(
         mismatch, domain, models, domains, mismatch_models, mismatch_domains,
@@ -328,7 +339,11 @@ async def _run_single_mismatch(
 
     if repaired_entry.success and repaired_entry.repaired_formula is not None:
         if is_conclusion:
-            repaired_q = repaired_entry.repaired_formula
+            logger.warning(
+                "Phase 5: mismatch on conclusion index (idx=%d) should have been "
+                "routed to run_phase1_targeted upstream — skipping conclusion modification.",
+                idx,
+            )
         else:
             repaired_premises[idx] = repaired_entry.repaired_formula
         logger.info(
@@ -402,13 +417,12 @@ async def _run_unified_repair(
     solver: Any = None,
     world_assumption: str = "owa",
     gap_analysis: Any = None,
+    sparse_witness_format: bool = False,
 ) -> Phase5Result:
     """Unified repair: present all mismatches + gap analysis jointly to the LLM."""
     n = len(premises)
     repaired_premises: list = list(premises)
     repaired_q: object = q
-
-    fallback_desc = format_domain_desc(domain)
 
     # Build per-mismatch witness descriptions and detect if all share the same domain
     mismatch_witness_descs: dict[int, str] = {}
@@ -577,7 +591,11 @@ async def _run_unified_repair(
         if idx in best_parsed:
             expr_str, formula, local_validated = best_parsed[idx]
             if is_conclusion:
-                repaired_q = formula
+                logger.warning(
+                    "Phase 5: mismatch on conclusion index (idx=%d) should have been "
+                    "routed to run_phase1_targeted upstream — skipping conclusion modification.",
+                    idx,
+                )
             else:
                 repaired_premises[idx] = formula
 
@@ -614,7 +632,7 @@ async def _run_unified_repair(
             ))
             logger.warning("Phase 5 unified idx=%d: failed", idx)
 
-    all_repaired = all(r.success for r in repairs)
+    all_repaired = bool(repairs) and all(r.success for r in repairs)
     num_local_validated = sum(1 for r in repairs if r.local_validated)
     return Phase5Result(
         repaired_premises=repaired_premises,

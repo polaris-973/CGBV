@@ -23,7 +23,7 @@
   code: |
     from z3 import *
 
-    Thing = DeclareSort('Thing')  # RULE 6: DeclareSort only
+    Thing = DeclareSort('Thing')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     # RULE 1: every entity is a named Const
     anne  = Const('anne', Thing)

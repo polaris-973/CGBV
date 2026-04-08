@@ -20,7 +20,8 @@ dependencies = [
 
 [project.scripts]
 cgbv = "cgbv.main:main"
+naive-llm = "naive_llm.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cgbv*"]
+include = ["cgbv*", "naive_llm*"]

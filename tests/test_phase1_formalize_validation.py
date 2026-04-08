@@ -1,6 +1,10 @@
 import z3
 
-from cgbv.core.phase1_formalize import _check_model_vacuousness, _validate_output
+from cgbv.core.phase1_formalize import (
+    _check_model_vacuousness,
+    _validate_output,
+    check_z3_sort_consistency,
+)
 
 
 def test_validate_output_rejects_raw_python_bool_premise() -> None:
@@ -70,6 +74,30 @@ def test_validate_output_allows_plain_disjunction() -> None:
     )
 
     assert err is None
+
+
+def test_sort_check_detects_bool_predicate_used_as_entity_even_with_fences() -> None:
+    code = """```python
+from z3 import *
+
+Entity = DeclareSort('Entity')
+x = Const('x', Entity)
+y = Const('y', Entity)
+
+security_deposit_at = Function('security_deposit_at', Entity, Entity, BoolSort())
+equal_to = Function('equal_to', Entity, Entity, BoolSort())
+
+premises = [
+    ForAll([x, y], equal_to(security_deposit_at(x, y), y))
+]
+q = equal_to(y, y)
+```"""
+
+    err = check_z3_sort_consistency(code)
+
+    assert err is not None
+    assert "security_deposit_at" in err
+    assert "equal_to" in err
 
 
 def test_vacuous_check_skips_when_reachable_ground_fact_exists() -> None:

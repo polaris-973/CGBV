@@ -402,6 +402,74 @@ def format_domain_desc(domain: dict) -> str:
     return "\n".join(lines)
 
 
+def format_sparse_domain_desc(domain: dict) -> str:
+    """
+    Format domain description using sparse positive format.
+
+    Only lists atoms that are True in this witness world.
+    All unlisted atoms are False by Z3's else=False semantics.
+
+    Produces shorter prompts for Phase 5 on large witnesses,
+    while remaining informationally equivalent to format_domain_desc().
+    """
+    lines = []
+
+    # Sort-grouped entity lists (always shown)
+    sorts: dict[str, list[str]] = domain.get("sorts", {})
+    if sorts:
+        lines.append("Entities by sort:")
+        for sort_name, entities in sorts.items():
+            lines.append(f"  {sort_name}: {entities}")
+    else:
+        lines.append(f"Domain entities: {domain['entities']}")
+    lines.append("")
+
+    # Predicate signatures
+    pred_sigs: dict[str, list[str]] = domain.get("predicate_signatures", {})
+    if pred_sigs:
+        bool_sigs = {k: v for k, v in pred_sigs.items() if not k.endswith("_is")}
+        if bool_sigs:
+            lines.append("Predicate signatures (use these names exactly):")
+            for pred_name, arg_sorts in bool_sigs.items():
+                lines.append(f"  {pred_name}({', '.join(arg_sorts)}) → bool")
+        lines.append("")
+
+    # Canonical entity IDs
+    all_entities = domain.get("entities", [])
+    if all_entities:
+        lines.append(f"Canonical entity IDs (use these EXACTLY as truth[...] keys):")
+        lines.append(f"  {', '.join(all_entities)}")
+    lines.append("")
+
+    # Function values
+    function_values: dict = domain.get("function_values", {})
+    if function_values:
+        lines.append(
+            "Function values (use value[\"fname(entity)\"] for comparisons):"
+        )
+        for fval_key, fval in function_values.items():
+            lines.append(f"  value[\"{fval_key}\"] = {fval}")
+        lines.append("")
+
+    # Sparse True atoms only
+    lines.append(
+        "True ground atoms (sparse positive format — "
+        "all atoms NOT listed below are False by Z3 else=False semantics):"
+    )
+    pred_interp: dict = domain.get("predicates", {})
+    has_any_true = False
+    for pred_name, interp in pred_interp.items():
+        for args, val in interp.items():
+            if val:
+                args_str = ", ".join(args)
+                lines.append(f"  {pred_name}({args_str}) = True")
+                has_any_true = True
+    if not has_any_true:
+        lines.append("  (no true atoms in this world)")
+
+    return "\n".join(lines)
+
+
 def format_domain_schema(domain: dict) -> str:
     """
     Format a domain description WITHOUT truth values — only structural information.

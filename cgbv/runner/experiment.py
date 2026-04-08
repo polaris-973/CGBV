@@ -30,7 +30,7 @@ class ExperimentRunner:
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self.checkpoint = CheckpointManager(
-            results_dir=config.runner.results_dir,
+            results_dir=config.results_root,
             run_id=config.run_id,
         )
 

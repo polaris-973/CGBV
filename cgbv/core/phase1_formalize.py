@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 import ast
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 import z3
@@ -377,16 +376,11 @@ async def run_phase1(
                 bridge_retries=bridge_retries,
             )
 
-        # Phase 1.6: identifier canonicalization
-        result = await _run_canonicalization(
-                result=result,
-                premises_nl=premises_nl,
-                llm=llm,
-                solver=solver,
-                prompt_engine=prompt_engine,
-                task_type=task_type,
-                code_exec_timeout=code_exec_timeout,
-                world_assumption=world_assumption,
+        # Phase 1.6: AST structural sanity check (replaces LLM-based canonicalization)
+        structural_hint = _run_structural_sanity_check(result)
+        if structural_hint:
+            logger.warning(
+                "Phase 1 structural sanity check: %s", structural_hint,
             )
 
         return result
@@ -701,128 +695,130 @@ from cgbv.core.gap_analysis import (
 
 
 # ---------------------------------------------------------------------------
-# Phase 1.6: Identifier canonicalization
+# Phase 1.6 replacement: AST-based structural sanity check (no LLM, no auto-fix)
 # ---------------------------------------------------------------------------
 
-async def _run_canonicalization(
-    result: Phase1Result,
-    premises_nl: list[str],
-    llm: LLMClient,
-    solver: Z3Solver,
-    prompt_engine: PromptEngine,
-    task_type: str,
-    code_exec_timeout: int,
-    world_assumption: str = "owa",
-) -> Phase1Result:
+def _run_structural_sanity_check(result: "Phase1Result") -> str | None:
     """
-    Phase 1.6: LLM-driven identifier canonicalization.
+    Mechanical AST check of the generated Z3 code.
 
-    Asks the LLM to compare all symbolic identifiers in the Z3 code against the
-    original NL premises and identify any pair of identifiers that refer to the
-    same real-world concept but were assigned different names. If duplicates are
-    found, applies whole-word substitutions, re-executes, and re-solves.
+    Detects structural problems that indicate formalization errors:
+      - Entity constants declared but never referenced in premises or q
+      - Two Python variables binding to the same Z3 name string (duplicate declaration)
+      - Two Function declarations sharing the same Z3 name string
 
-    If re-execution fails or no changes are needed, returns the original result.
+    Returns a hint string describing the problem if one is found, else None.
+    The original result is NEVER modified — this function is purely diagnostic.
     """
-    user_content = prompt_engine.render(
-        "phase1_canon.j2",
-        premises=premises_nl,
-        raw_code=result.raw_code,
-    )
-    raw = (await llm.complete_with_retry([{"role": "user", "content": user_content}])).strip()
+    import ast as _ast
 
-    if not raw or raw.upper().startswith("OK") or not raw.startswith("{"):
-        return result
-
+    code = result.raw_code
     try:
-        subst_map: dict[str, str] = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        logger.warning("Phase 1.6: failed to parse substitution map: %.100s", raw)
-        return result
+        tree = _ast.parse(code)
+    except SyntaxError as e:
+        logger.debug("Structural sanity check: AST parse failed (%s) — skipping", e)
+        return None
 
-    if not subst_map:
-        return result
+    # --- Collect all Const('name', sort) and Function('name', ...) call nodes ---
+    const_z3names: dict[str, str] = {}   # python_var → z3_name_string
+    func_z3names: dict[str, str] = {}    # python_var → z3_name_string
 
-    # Apply whole-word substitutions to raw code
-    new_code = result.raw_code
-    for old, new_name in subst_map.items():
-        if old == new_name:
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Assign):
             continue
-        new_code = re.sub(r'\b' + re.escape(old) + r'\b', new_name, new_code)
+        # Only handle simple assignments: var = Call(...)
+        if len(node.targets) != 1 or not isinstance(node.targets[0], _ast.Name):
+            continue
+        py_var = node.targets[0].id
+        call = node.value
+        if not isinstance(call, _ast.Call):
+            continue
+        func_name = ""
+        if isinstance(call.func, _ast.Name):
+            func_name = call.func.id
+        elif isinstance(call.func, _ast.Attribute):
+            func_name = call.func.attr
 
-    if new_code == result.raw_code:
-        return result
+        if func_name == "Const" and call.args and isinstance(call.args[0], _ast.Constant):
+            z3_name = str(call.args[0].value)
+            const_z3names[py_var] = z3_name
+        elif func_name == "Function" and call.args and isinstance(call.args[0], _ast.Constant):
+            z3_name = str(call.args[0].value)
+            func_z3names[py_var] = z3_name
 
-    try:
-        ctx = execute_z3_code(new_code, timeout_seconds=code_exec_timeout)
-    except CodeExecutionError as e:
-        logger.warning("Phase 1.6: re-exec failed after canonicalization, reverting: %s", e)
-        return result
-
-    # Tautology guard: reject substitution if any premise became trivially True.
-    # This happens when a premise Implies(A(x), B(x)) exists and A→B was merged,
-    # turning it into Implies(B(x), B(x)) = always True, destroying the inference.
-    for i, prem in enumerate(ctx.get("premises", [])):
-        try:
-            s_check = z3.Solver()
-            s_check.add(z3.Not(prem))
-            if s_check.check() == z3.unsat:
-                logger.warning(
-                    "Phase 1.6: substitution %s created tautological premise[%d], reverting",
-                    subst_map, i,
-                )
-                return result
-        except Exception:
-            pass  # if check fails, continue — don't block on it
-
-    # Rebuild background constraints for the renamed namespace
-    bound_var_names: set[str] = ctx.get("bound_var_names", set())
-    bg = solver.build_distinct_constraints(ctx["namespace"], bound_var_names)
-    user_bg = ctx["namespace"].get("background_constraints")
-    if user_bg and hasattr(user_bg, '__iter__'):
-        for c in user_bg:
-            if isinstance(c, z3.BoolRef):
-                bg.append(c)
-    if world_assumption == "cwa":
-        cwa_axioms = build_cwa_constraints(
-            namespace=ctx["namespace"],
-            premises=list(ctx["premises"]),
-            q=ctx["q"],
-            bound_var_names=bound_var_names,
+    # --- Check 1: duplicate Z3 name strings across Const declarations ---
+    z3name_to_vars: dict[str, list[str]] = {}
+    for py_var, z3_name in const_z3names.items():
+        z3name_to_vars.setdefault(z3_name, []).append(py_var)
+    duplicates = {n: vs for n, vs in z3name_to_vars.items() if len(vs) > 1}
+    if duplicates:
+        pairs = "; ".join(
+            f"variables {vs} all bind to Z3 name '{n}'"
+            for n, vs in duplicates.items()
         )
-        bg.extend(cwa_axioms)
+        return (
+            f"Duplicate Z3 Const name detected: {pairs}. "
+            f"Each entity must have a unique Z3 name string in Const('name', Sort). "
+            f"Check Const declarations for overwrites caused by synonym merging."
+        )
 
-    solver_premises = list(ctx["premises"]) + bg
+    # --- Check 2: duplicate Z3 name strings across Function declarations ---
+    funcname_to_vars: dict[str, list[str]] = {}
+    for py_var, z3_name in func_z3names.items():
+        funcname_to_vars.setdefault(z3_name, []).append(py_var)
+    func_duplicates = {n: vs for n, vs in funcname_to_vars.items() if len(vs) > 1}
+    if func_duplicates:
+        pairs = "; ".join(
+            f"variables {vs} both declare Function('{n}', ...)"
+            for n, vs in func_duplicates.items()
+        )
+        return (
+            f"Duplicate Function name detected: {pairs}. "
+            f"Each predicate must be declared exactly once. "
+            f"Remove duplicate Function declarations."
+        )
 
-    try:
-        if task_type == "three_class":
-            new_verdict, new_model_info, new_model_info_q = solver.check_entailment_three_class(
-                solver_premises, ctx["q"]
-            )
-        else:
-            new_verdict, new_model_info = solver.check_entailment(solver_premises, ctx["q"])
-            new_model_info_q = None
-    except Exception as e:
-        logger.warning("Phase 1.6: solver error after canonicalization, reverting: %s", e)
-        return result
+    # --- Check 3: declared Const vars never referenced in premises/q assignments ---
+    # Find all names referenced in any assignment to premises or q
+    referenced_names: set[str] = set()
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Assign):
+            continue
+        targets = node.targets
+        if not targets:
+            continue
+        # Track assignments to "premises" or "q"
+        if any(
+            isinstance(t, _ast.Name) and t.id in ("premises", "q", "background_constraints")
+            for t in targets
+        ):
+            for sub in _ast.walk(node.value):
+                if isinstance(sub, _ast.Name):
+                    referenced_names.add(sub.id)
 
-    logger.info(
-        "Phase 1.6: unified %d identifier(s) %s; verdict %s → %s",
-        len(subst_map), list(subst_map.keys()), result.verdict, new_verdict,
-    )
+    # Also track names used in any Call inside premises/q (transitively covered above)
+    # Bound variable names: those declared as Const but also used as ForAll/Exists args
+    # are legitimate even if not in premises directly
+    # Check entity constants (not Functions, not bound vars) that are never referenced
+    # Heuristic: bound variables are typically single chars or short names, but we detect
+    # them by checking if they appear inside ForAll/Exists node lists — skip that for now.
+    # Simple check: any Const py_var not in referenced_names is suspicious.
+    # Exception: sort declarations (DeclareSort results) are SortRef not Const — already excluded.
 
-    return replace(
-        result,
-        raw_code=ctx["raw_code"],
-        premises=list(ctx["premises"]),
-        q=ctx["q"],
-        background_constraints=bg,
-        bound_var_names=bound_var_names,
-        namespace=ctx["namespace"],
-        verdict=new_verdict,
-        model_info=new_model_info,
-        model_info_q=new_model_info_q,
-    )
+    missing_refs = []
+    for py_var in const_z3names:
+        if py_var not in referenced_names:
+            missing_refs.append(py_var)
+
+    if missing_refs:
+        return (
+            f"Entity constant(s) declared but never referenced in premises or q: "
+            f"{missing_refs}. "
+            f"This may indicate entity loss caused by identifier merging. "
+            f"Ensure every declared entity appears in at least one premise."
+        )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +901,15 @@ async def run_phase1_targeted(
             ]
 
         raw_code = await llm.complete_with_retry(messages)
+
+        sort_error = check_z3_sort_consistency(raw_code)
+        if sort_error:
+            last_error = sort_error
+            logger.warning(
+                "Phase 1 targeted re-formalization attempt %d/%d: static sort mismatch: %s",
+                attempt + 1, max_retries, sort_error[:200],
+            )
+            continue
 
         try:
             ctx = execute_z3_code(raw_code, timeout_seconds=code_exec_timeout)
@@ -1507,6 +1512,13 @@ def _has_repeated_phase1_failure(attempts: list[Phase1Attempt]) -> bool:
 
 def _normalise_code_for_prompt(raw_code: str) -> str:
     code = raw_code.strip()
+    fenced = re.search(
+        r"```(?:python)?\s*\n(.*?)\n```",
+        code,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        return fenced.group(1).strip()
     if code.startswith("```"):
         first_newline = code.find("\n")
         code = "" if first_newline < 0 else code[first_newline + 1:]
@@ -1517,8 +1529,17 @@ def _normalise_code_for_prompt(raw_code: str) -> str:
 
 def _strip_fences(raw: str) -> str:
     """Strip markdown fences and inline backticks from LLM output."""
-    raw = re.sub(r'^```(?:python)?\s*\n', '', raw.strip(), flags=re.MULTILINE)
-    raw = re.sub(r'\n```\s*$', '', raw, flags=re.MULTILINE)
+    raw = raw.strip()
+    fenced = re.search(
+        r"```(?:python)?\s*\n(.*?)\n```",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        raw = fenced.group(1)
+    else:
+        raw = re.sub(r'^```(?:python)?\s*\n', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\n```\s*$', '', raw, flags=re.MULTILINE)
     raw = raw.strip()
     if raw.startswith('`') and raw.endswith('`') and len(raw) > 1:
         raw = raw[1:-1].strip()
@@ -1574,6 +1595,8 @@ def check_z3_sort_consistency(code: str) -> str | None:
     Returns None if no error found, or a diagnostic string describing the
     sort mismatch.
     """
+    code = _strip_fences(code)
+
     try:
         tree = ast.parse(code)
     except SyntaxError:

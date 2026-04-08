@@ -59,6 +59,7 @@ class PipelineConfig:
     world_assumption: str = "owa"  # "owa" (open world) | "cwa" (closed world)
     enable_phase1_bridge: bool = True  # Phase 1.5 bridge axiom injection
     batch_grounding_size: int = 0  # Phase 3 batch size: 0 = all sentences in one LLM call
+    sparse_witness_format: bool = False  # Phase 5: use sparse positive witness format (True atoms only)
 
 
 @dataclass
@@ -66,6 +67,7 @@ class RunnerConfig:
     max_concurrency: int = 10
     checkpoint: bool = True
     results_dir: str = "./results"
+    results_subdir: str = "cgbv"
 
 
 @dataclass
@@ -87,8 +89,12 @@ class ExperimentConfig:
     run_timestamp: str = ""
 
     @property
+    def results_root(self) -> Path:
+        return Path(self.runner.results_dir) / self.runner.results_subdir
+
+    @property
     def output_dir(self) -> Path:
-        return Path(self.runner.results_dir) / self.run_id
+        return self.results_root / self.run_id
 
 
 _PIPELINE_RUN_ID_FIELDS: tuple[tuple[str, str], ...] = (
@@ -151,6 +157,16 @@ def _parse_sample_index_range(raw: Any) -> tuple[int, int] | None:
     return (start, end)
 
 
+def _default_api_key_env(provider: str) -> str:
+    mapping = {
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "qwen": "DASHSCOPE_API_KEY",
+        "glm": "ZAI_API_KEY",
+    }
+    return mapping.get(provider.lower(), "OPENAI_API_KEY")
+
+
 def load_config(config_path: str | Path) -> ExperimentConfig:
     with open(config_path) as f:
         raw = yaml.safe_load(f)
@@ -167,6 +183,7 @@ def load_config(config_path: str | Path) -> ExperimentConfig:
     experiment_id = exp.get("id", "exp_default")
     run_timestamp = str(exp.get("run_timestamp") or _make_run_timestamp())
     run_id = str(exp.get("run_id") or _build_run_id(experiment_id, pipeline_cfg, run_timestamp))
+    provider = llm_raw["provider"]
 
     return ExperimentConfig(
         experiment_id=experiment_id,
@@ -180,9 +197,9 @@ def load_config(config_path: str | Path) -> ExperimentConfig:
             only_ids=dataset_raw.get("only_ids"),
         ),
         llm=LLMConfig(
-            provider=llm_raw["provider"],
+            provider=provider,
             model=llm_raw["model"],
-            api_key_env=llm_raw.get("api_key_env", "OPENAI_API_KEY"),
+            api_key_env=llm_raw.get("api_key_env") or _default_api_key_env(provider),
             base_url=llm_raw.get("base_url"),
             extra_body=llm_raw.get("extra_body"),
             max_parallel_requests=llm_raw.get("max_parallel_requests"),

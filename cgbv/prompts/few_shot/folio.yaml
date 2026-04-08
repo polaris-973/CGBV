@@ -15,16 +15,16 @@
     # Key rules: RULE 6, RULE 7, RULE 12, RULE 4(Exists)
     from z3 import *
 
-    # RULE 6: Only DeclareSort — never IntSort() or StringSort()
+    # RULE 6: ONE Entity sort for ALL domain entities — persons, years, books alike
     Entity = DeclareSort('Entity')
 
-    # RULE 1: Every entity is a named Const — no Sort!val!N ever
+    # RULE 1: Every entity is a named Const of the Entity sort
     MiroslavVenhoda = Const('MiroslavVenhoda', Entity)
-    Y1946 = Const('Y1946', Entity)  # RULE 6: year 1946 → named Const, NOT IntVal(1946)
+    Y1946 = Const('Y1946', Entity)  # RULE 6: year 1946 → Const of Entity sort, never IntVal(1946)
 
-    # Predicates
+    # Predicates — unary or binary, all over Entity sort
     # RULE 7: 'Czech choral conductor who specialized in Renaissance and Baroque music'
-    #         → THREE separate predicates, not one compressed name
+    #         → THREE separate predicates for each independently assertable property
     is_czech = Function('is_czech', Entity, BoolSort())
     is_choral_conductor = Function('is_choral_conductor', Entity, BoolSort())
     specialized_renaissance_baroque = Function('specialized_renaissance_baroque', Entity, BoolSort())
@@ -32,21 +32,19 @@
     loves_music = Function('loves_music', Entity, BoolSort())
     published_book_in = Function('published_book_in', Entity, Entity, BoolSort())
 
-    # RULE 3: bound variable separate from entity constants
+    # RULE 3: bound variable is a Const separate from all entity constants
     x = Const('x', Entity)
 
     # RULE 9: 4 premises in → 4 formulas in premises[]
     premises = [
-        # P1: RULE 12 — 'was a Czech choral conductor' → type predicates is_czech(x),
-        #     is_choral_conductor(x) — NEVER entity equality like MiroslavVenhoda == conductor
-        # P1: RULE 7 — compound description decomposes into three separate predicates
+        # P1: RULE 12 — 'was a Czech choral conductor' → type predicates
+        #     RULE 7 — compound description → three separate predicates
         And(is_czech(MiroslavVenhoda),
             is_choral_conductor(MiroslavVenhoda),
             specialized_renaissance_baroque(MiroslavVenhoda)),
         # P2: RULE 4 — 'Any ... is ...' → ForAll + Implies
         ForAll([x], Implies(is_choral_conductor(x), is_musician(x))),
         # P3: RULE 4 — 'Some musicians ...' → Exists (not ForAll)
-        # RULE 2 — Exists list [x] is non-empty
         Exists([x], And(is_musician(x), loves_music(x))),
         # P4: RULE 6 — year '1946' → Const('Y1946', Entity), never IntVal(1946)
         published_book_in(MiroslavVenhoda, Y1946),
@@ -68,7 +66,7 @@
     # Key rules: RULE 12, RULE 7, RULE 8, RULE 4(ForAll)
     from z3 import *
 
-    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     # RULE 1: every entity is a named Const
     # RULE 8: 'The University of Edinburgh' → UnivEdinburgh used identically in P2 AND P3
@@ -132,7 +130,7 @@
     # Key rules: RULE 11, RULE 4(ForAll + Or), RULE 2/3
     from z3 import *
 
-    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     # RULE 1: named Const for James
     James = Const('James', Entity)
@@ -194,7 +192,7 @@
     from z3 import *
 
     # RULE 6: DeclareSort only — never IntSort() or StringSort()
-    Entity = DeclareSort('Entity')
+    Entity = DeclareSort('Entity')  # ONE sort for all entities
 
     # RULE 1: Every entity is a named Const — no Sort!val!N ever
     SinghKaur = Const('SinghKaur', Entity)
@@ -247,19 +245,20 @@
     # Key rules: RULE 10 (comparison predicate asymmetry axiom), RULE 1, RULE 9
     from z3 import *
 
-    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+    # RULE 6: ONE Entity sort for all domain entities (all are soccer teams here)
+    Entity = DeclareSort('Entity')
 
-    # RULE 1: team names are named Consts — no Sort!val!N
+    # RULE 1: team names are named Consts
     RealMadrid = Const('RealMadrid', Entity)
     Barcelona  = Const('Barcelona', Entity)
 
-    # Predicates
+    # Predicates — all over Entity sort
     is_laliga_team         = Function('is_laliga_team', Entity, BoolSort())
     ranks_higher           = Function('ranks_higher', Entity, Entity, BoolSort())
     more_points_than       = Function('more_points_than', Entity, Entity, BoolSort())
     more_game_points_than  = Function('more_game_points_than', Entity, Entity, BoolSort())
 
-    # RULE 3: bound variables separate from named constants
+    # RULE 3: bound variables must use Entity sort
     x = Const('x', Entity)
     y = Const('y', Entity)
 
@@ -285,8 +284,6 @@
     ]
 
     # RULE 10: more_points_than is an uninterpreted comparison predicate — add asymmetry axiom.
-    # Without this, the solver cannot exclude more_points_than(Barcelona, RealMadrid) being
-    # simultaneously true, leading to spurious inferences.
     background_constraints = [
         ForAll([x, y], Implies(more_points_than(x, y), Not(more_points_than(y, x)))),
     ]

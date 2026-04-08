@@ -17,7 +17,7 @@ class CheckpointManager:
     On restart, already-done samples are skipped.
     """
 
-    def __init__(self, results_dir: str, run_id: str):
+    def __init__(self, results_dir: str | Path, run_id: str):
         self.base = Path(results_dir) / run_id
 
     def is_done(self, sample: DataSample) -> bool:

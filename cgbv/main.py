@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 import cgbv.logging as cgbv_log
-from dotenv import load_dotenv
 
 
 _METRIC_DISPLAY_ORDER: tuple[tuple[str, str], ...] = (
@@ -37,9 +36,10 @@ _METRIC_DISPLAY_ORDER: tuple[tuple[str, str], ...] = (
 
 
 def main() -> None:
-    # Load .env from the current working directory (project root) before
-    # anything else so API keys are available when config is loaded.
-    load_dotenv()
+    # Load environment variables before config parsing.
+    from cgbv.config.env import load_project_env
+
+    load_project_env()
     parser = argparse.ArgumentParser(
         description="CGBV: Cross-Granularity Boundary Verification experiment runner",
     )

@@ -14,7 +14,7 @@
   code: |
     from z3 import *
 
-    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     # RULE 1: every entity is a named Const
     isaac = Const('isaac', Entity)
@@ -65,7 +65,7 @@
   code: |
     from z3 import *
 
-    Entity = DeclareSort('Entity')
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     buster = Const('buster', Entity)
 
@@ -118,7 +118,7 @@
   code: |
     from z3 import *
 
-    Entity = DeclareSort('Entity')
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     kevin = Const('kevin', Entity)
 
@@ -171,7 +171,7 @@
   code: |
     from z3 import *
 
-    Entity = DeclareSort('Entity')
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     ellis = Const('ellis', Entity)
 

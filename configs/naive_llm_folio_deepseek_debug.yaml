@@ -1,0 +1,24 @@
+experiment:
+  id: naive_llm_folio_deepseek_debug
+  description: "Naive LLM baseline: FOLIO validation, DeepSeek, zero-shot CoT"
+
+dataset:
+  name: folio
+  split: validation
+  path: ./datasets
+  sample_index_range: [1, 100]
+  # sample_index_range: full
+
+llm:
+  provider: deepseek
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+  temperature: 0.0
+  max_tokens: 8192
+
+runner:
+  max_concurrency: 5
+  checkpoint: true
+  results_dir: ./results
+  results_subdir: naive_llm

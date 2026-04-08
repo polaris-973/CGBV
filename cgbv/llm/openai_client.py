@@ -141,14 +141,37 @@ class OpenAIClient(LLMClient):
                 now = loop.time()
             self._next_request_at = now + self._min_request_interval
 
+    def _merge_extra_body(
+        self,
+        base: dict | None,
+        override: dict | None,
+    ) -> dict | None:
+        merged: dict = {}
+        if base:
+            merged.update(base)
+        if override:
+            merged.update(override)
+        return merged or None
+
+    def _build_request_kwargs(self, messages: list[dict], **kwargs) -> dict:
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+        }
+        temperature = kwargs.get("temperature", self.temperature)
+        if temperature is not None:
+            params["temperature"] = temperature
+        extra_body = self._merge_extra_body(self.extra_body, kwargs.get("extra_body"))
+        if extra_body is not None:
+            params["extra_body"] = extra_body
+        return params
+
     async def _send_request(self, messages: list[dict], **kwargs) -> str:
         await self._wait_for_request_slot()
+        request_kwargs = self._build_request_kwargs(messages, **kwargs)
         response = await self._client.chat.completions.with_raw_response.create(
-            model=self.model,
-            messages=messages,
-            temperature=kwargs.get("temperature", self.temperature),
-            max_tokens=kwargs.get("max_tokens", self.max_tokens),
-            extra_body=kwargs.get("extra_body", self.extra_body),
+            **request_kwargs,
         )
         payload = await self._read_raw_payload(response)
         return self._extract_text_from_payload(payload)

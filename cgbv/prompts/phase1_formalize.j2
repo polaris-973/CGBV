@@ -7,18 +7,18 @@ Your code MUST follow this exact structure. Output ONLY the Python code — no m
 ```
 from z3 import *
 
-# 1. Declare custom sorts
-SortName = DeclareSort('SortName')
+# 1. Declare the Entity sort (ONE sort for ALL domain entities)
+Entity = DeclareSort('Entity')
 
 # 2. Declare ALL domain entities as named constants  ← CRITICAL REQUIREMENT
-entity1 = Const('entity1', SortName)
-entity2 = Const('entity2', SortName)
+entity1 = Const('entity1', Entity)
+entity2 = Const('entity2', Entity)
 
 # 3. Declare predicates and functions
-pred = Function('pred', SortName, BoolSort())
+pred = Function('pred', Entity, BoolSort())
 
 # 4. Declare a bound variable for quantifiers (separate from entity constants)
-v = Const('v', SortName)
+v = Const('v', Entity)
 
 # 5. Formalize each premise
 f1 = ForAll([v], Implies(pred(v), other_pred(v)))   # universal rule
@@ -47,7 +47,7 @@ RULE 4  — Universal claims → `ForAll`; existential → `Exists`; "No X is Y"
 
 RULE 5  — No solver calls, no print statements, no assertions. Only declarations and assignments. Do NOT write `Solver()`, `s.check()`, `print(...)`, or `assert`.
 
-RULE 6  — Only `DeclareSort` is allowed. Never use `IntSort()`, `StringSort()`, `RealSort()`, or `SeqSort()`. Years, counts, and string-valued facts (channel names, titles, numeric quantities) must be modelled as named `Const` of a declared sort.
+RULE 6  — Use exactly ONE `DeclareSort('Entity')` for all domain entities. Never use `IntSort()`, `StringSort()`, `RealSort()`, or `SeqSort()`. Never declare multiple sorts. Years, counts, and string-valued facts (channel names, titles, numeric quantities) must be modelled as named `Const` of the single Entity sort.
 
 RULE 7  — One NL property = one predicate. Each independently assertable property must be its own predicate. Never compress "private Ivy League research university" into one opaque predicate name — declare `is_private`, `is_ivy_league`, `is_research` separately.
 
@@ -140,4 +140,4 @@ Conclusion: {{ conclusion }}
   - "A [type]..." / "[Types] are..." / "Every..." → `ForAll` + `Implies`
   - "Some [type]..." / "There exists..." → `Exists`
   - Count the independently assertable predicates in the NL conclusion — each should appear in `q`. Missing any = structural over-simplification.
-- VOCABULARY SCAN: scan all predicate names across all premises. If two predicates describe the same NL action/property used in different premises, unify to one name before outputting. (RULE 11)
+- MANDATORY VOCABULARY AUDIT (RULE 11): list ALL Function(...) declarations. For each pair (f1, f2): (a) do they appear in DIFFERENT premises? (b) do they describe the same NL property or action? If both yes → merge: pick ONE name, rename ALL occurrences. This step is MANDATORY.

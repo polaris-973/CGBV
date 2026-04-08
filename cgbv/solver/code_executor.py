@@ -287,7 +287,15 @@ def _extract_bound_var_names(code: str) -> set[str]:
 
 
 def _strip_fences(code: str) -> str:
-    """Remove markdown code fences if LLM wraps output in them."""
+    """Extract fenced Python code when present, else strip outer fences."""
+    fenced = re.search(
+        r"```(?:python)?\s*\n(.*?)\n```",
+        code.strip(),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        return fenced.group(1).strip()
+
     code = re.sub(r'^```(?:python)?\s*\n', '', code, flags=re.MULTILINE)
     code = re.sub(r'\n```\s*$', '', code, flags=re.MULTILINE)
     return code.strip()

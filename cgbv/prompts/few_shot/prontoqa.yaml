@@ -25,7 +25,7 @@
   code: |
     from z3 import *
 
-    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only
+    Entity = DeclareSort('Entity')  # RULE 6: DeclareSort only; ONE sort for all entities
 
     # RULE 1: every entity is a named Const
     # Use _e suffix to avoid conflicts with Python built-ins

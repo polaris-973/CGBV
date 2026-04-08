@@ -246,6 +246,8 @@ class GapAnalysisResult:
     query_relevant_premise_indices: list[int] = field(default_factory=list)
     predicate_graph: dict[str, set[str]] = field(default_factory=dict)
     missing_links: list[tuple[str, str]] = field(default_factory=list)
+    bridgeable: bool = False
+    non_bridgeable_reason: str | None = None
     obligation_hints: list[str] = field(default_factory=list)
     obligation_count: int = 0
 
@@ -386,6 +388,22 @@ def compute_gap_analysis(
         if closest and closest != pred:
             missing_links.append((closest, pred))
 
+    # A bridge is only considered safe in the minimalist CGBV sense when there
+    # is either:
+    #   1. an explicit witness-backed mismatch already localizing the failure, or
+    #   2. a disconnected grounded premise that provides existing evidence to
+    #      reconnect to the query-relevant slice.
+    #
+    # Pure "missing link" gaps without either signal are treated conservatively
+    # as re-formalization problems rather than invitations to invent new axioms.
+    bridgeable = bool(missing_links) and (bool(mismatches) or bool(disconnected))
+    non_bridgeable_reason: str | None = None
+    if missing_links and not bridgeable:
+        non_bridgeable_reason = (
+            "missing links lack disconnected grounded evidence and no witness-backed "
+            "mismatch localizes a safe bridge; prefer re-formalization"
+        )
+
     obligation_hints: list[str] = []
     for idx in disconnected:
         obligation_hints.append(
@@ -404,6 +422,8 @@ def compute_gap_analysis(
         query_relevant_premise_indices=query_relevant_premise_indices,
         predicate_graph=graph,
         missing_links=missing_links,
+        bridgeable=bridgeable,
+        non_bridgeable_reason=non_bridgeable_reason,
         obligation_hints=obligation_hints,
         obligation_count=len(disconnected) + len(relevant_ungrounded - bg_antecedent_preds),
     )
