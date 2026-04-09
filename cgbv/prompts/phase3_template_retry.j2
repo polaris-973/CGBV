@@ -1,67 +1,56 @@
-You are a logic translator working with a specific finite domain.
+You are repairing one grounded-template IR.
 
-A previous grounded boolean expression template for the sentence below was invalid. Repair it
-so that it is a single valid Python boolean expression **template** that can be evaluated against
-ANY truth table on this domain to determine if the sentence holds.
-
----
-
-## Retry Context
-
-This is attempt {{ attempt_num }} of {{ max_attempts }}.
+Output ONLY one JSON object.
 
 ## Previous Output
 
-```python
+```json
 {{ previous_output }}
 ```
 
-## Observed Error
+## Error
 
 {{ last_error }}
 
----
+## Frozen Symbol Table
 
-## Output Format
+```json
+{{ symbol_context_json }}
+```
 
-Write a **single Python boolean expression**. Use:
-- `truth["PredName(entity)"]` — look up a ground atom's truth value
-- `value["fname(entity)"]` — look up a function's numeric value (for comparisons)
-- `and`, `or`, `not` — boolean connectives
-- `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
-- `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
+## Current Sentence DSL Logic
 
-**Critical rules:**
-1. Use predicate names **exactly as they appear** in the domain schema (matching capitalisation).
-2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort.
-   Never mix entities from different sorts in the same loop.
-3. If the sort already determines the type, do **not** add a redundant `if truth["is_X(e)"]`
-   guard — only add one when the NL explicitly conditions on an additional predicate.
-4. Do **not** invent entity names. Use only the canonical IDs listed in the domain below.
-5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
-   Access predicates via `truth[...]` subscripts only — never call them directly.
-6. Do **not** iterate over booleanised `_is` predicates when `value[...]` entries are available.
-   For comparisons, use `value[...]` directly.
-7. Repair the previous output with the smallest change that fixes the error while preserving
-   the sentence's full meaning.
-8. Output ONLY the expression — no imports, no assignments, no prose.
+```json
+{{ sentence_logic_json }}
+```
 
----
+Core predicate/function vocabulary that must remain represented:
+{% if core_predicates %}`{{ core_predicates | join("`, `") }}`{% else %}`(none)`{% endif %}
 
-{% if world_assumption == "cwa" %}
-## Closed-World Assumption
+## Domain Schema
 
-Under the Closed-World Assumption: any property not explicitly asserted for an entity is **False**.
-For "either A or B" patterns, model as exclusive: `truth["A(e)"] != truth["B(e)"]`.
-
----
-{% endif %}
-
-## Your Task
-
-**Domain Schema:**
 {{ domain_schema }}
 
-**Sentence:** "{{ sentence }}"
+## Sentence
 
-Write the repaired grounded boolean expression template:
+"{{ sentence }}"
+
+## Sentence Index (Debug Context Only)
+
+- `sentence_index`: `{{ sentence_index }}`
+
+## Reminder
+
+1. Keep top-level structure:
+   - `expr` only
+2. Fix errors by IR semantics only.
+3. Typical errors to fix:
+   - undeclared `pred` / `func` / `var`
+   - unsupported `op`
+   - missing required fields
+   - arity mismatch
+   - sort mismatch
+   - missing required predicate/function from core vocabulary
+4. `all/any` must use `vars` + `body` shape.
+5. `truth` must use `pred + args`; `value` must use `func + args`.
+6. Do not output `sentence_index`, `role`, or `kind`; only repair `expr`.

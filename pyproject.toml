@@ -25,3 +25,6 @@ naive-llm = "naive_llm.main:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["cgbv*", "naive_llm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

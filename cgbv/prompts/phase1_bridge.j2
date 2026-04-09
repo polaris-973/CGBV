@@ -1,86 +1,41 @@
-You are fixing a predicate vocabulary connectivity issue in a Z3-Python logical formalization.
+You are fixing a predicate-connectivity gap in a JSON DSL formalization.
 
-## Full Original Formalization
+Output ONLY one JSON logic expression for a bridge rule, or `NONE`.
+You may output either:
+- a JSON string (compact logic DSL), or
+- a JSON logic object.
+Do NOT output Python.
 
-```python
-{{ raw_code }}
+## Current DSL
+
+```json
+{{ current_dsl }}
 ```
 
----
+## Problem
 
-## Problem: Premise {{ premise_index }} is Structurally Disconnected
-
-**Premise {{ premise_index }}** uses predicate(s) `{{ orphaned_preds | join(", ") }}` that do not
-appear in any universal rule or the conclusion. The premise can **never** contribute to deriving
-the conclusion — the proof chain is broken.
-
-- NL text:          "{{ nl_text }}"
-- Current formula:  `{{ current_formula }}`
-- Orphaned predicate(s): `{{ orphaned_preds | join(", ") }}`
-
----
+- Premise index: {{ premise_index }}
+- NL text: "{{ nl_text }}"
+- Current compiled formula: `{{ current_formula }}`
+- Orphaned predicates: `{{ orphaned_preds | join(", ") }}`
+- Connected predicates: `{{ connected_preds | join(", ") }}`
+- Conclusion NL: "{{ conclusion_nl }}"
+- Conclusion formula: `{{ conclusion_formula }}`
 
 {% if retry_context %}
 ## Previous Bridge Rejected
 
-Your previous bridge was rejected because it creates a **logical contradiction** with the existing premises.
-
-- **Rejected bridge**: `{{ retry_context.rejected_bridge }}`
-- **Reason**: Adding this bridge makes the premise set unsatisfiable (Z3 reports UNSAT). This would
-  cause Z3 to vacuously prove any conclusion — it must NOT be used.
-
-Generate a **different** bridge that:
-1. Does **NOT** contradict any existing premise
-2. Still connects `{{ orphaned_preds | join(", ") }}` to the proof chain via a semantically valid link
-
-If no valid alternative exists, output `NONE`.
-
----
+- Rejected bridge: `{{ retry_context.rejected_bridge }}`
+- Reason: {{ retry_context.reason }}
 {% endif %}
-## Proof-Chain Context
 
-**Conclusion to prove:**
-- NL:      "{{ conclusion_nl }}"
-- Formula: `{{ conclusion_formula }}`
+## Bridge Rules
 
-**Connected predicates** (appear in connected premises or the conclusion):
-`{{ connected_preds | join(", ") }}`
-
-**Other premises (for context):**
-{% for i, nl, fol in other_premises %}
-Premise {{ i }}: "{{ nl }}"
-  → `{{ fol }}`
-{% endfor %}
-
----
-
-## Your Task
-
-Write a **linking axiom** — a universally-quantified rule that connects the orphaned
-predicate(s) `{{ orphaned_preds | join(", ") }}` into the connected proof chain, so that
-Premise {{ premise_index }} can participate in deriving the conclusion.
-
-What general semantic relationship between the orphaned and connected predicates is
-**directly supported by the NL text**?
-
-**Examples of valid linking axioms:**
-- Orphaned `is_cat`, connected `is_pet`:
-  → `ForAll([x], Implies(is_cat(x), is_pet(x)))`
-- Orphaned `applying_to_take(x, y)`, connected `gre_applicant`:
-  → `ForAll([x], Implies(Exists([y], applying_to_take(x, y)), gre_applicant(x)))`
-- Orphaned `is_mature_stock`, connected `is_stock`:
-  → `ForAll([x], Implies(is_mature_stock(x), is_stock(x)))`
-
-**When to output `NONE` (uppercase):**
-- The NL text does not state or imply a general relationship between the orphaned and
-  connected predicates — do NOT invent relationships without textual support.
-
----
-
-## Output Rules
-
-1. The axiom MUST be universally quantified (`ForAll`/`Exists` form). Do NOT output a ground fact.
-2. Use ONLY identifiers already declared in the code above. Do NOT introduce new names.
-3. Output ONLY the Python expression (or `NONE`). No imports, assignments, comments, or prose.
-4. The output (if not `NONE`) must be a valid Z3 `BoolRef` evaluable in the same namespace
-   as the original code.
+1. Output one quantified bridge rule only (typically `forall ...` / `exists ...`).
+2. Use only the existing symbol table from the current DSL.
+3. The bridge must be a general quantified rule, not a ground fact.
+4. If the NL does not license a valid bridge, output `NONE`.
+5. Preferred compact logic syntax: `p(x)`, `f(x)==y`, `x!=y`, `and(...)`, `or(...)`, `not(...)`, `implies(a,b)`, `iff(a,b)`, `forall x:S. body`, `exists x:S. body`, `eq(a,b)`, `ne(a,b)`.
+6. Never use assignment-style `"x = y"`; use `"x == y"`.
+7. Never use literal boolean atoms like `"true"` or `"false"`.
+8. Do not output legacy wrapper fields like `kind`, `constraint`, `forall`, `exists`.

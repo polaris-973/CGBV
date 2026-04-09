@@ -1,0 +1,6 @@
+exclude_ids_by_split:
+  validation: ["a1", "a2"]
+
+examples:
+  - conclusion: example-one
+  - conclusion: example-two

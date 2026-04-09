@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import ast
@@ -10,9 +11,16 @@ import z3
 
 from cgbv.llm.base import LLMClient
 from cgbv.prompts.prompt_engine import PromptEngine
-from cgbv.solver.code_executor import execute_z3_code, CodeExecutionError, build_name_error_hint, build_runtime_error_hint
 from cgbv.solver.cwa_axioms import build_cwa_constraints
 from cgbv.solver.z3_solver import Z3Solver, VERDICT_UNKNOWN, VERDICT_UNCERTAIN, VERDICT_ENTAILED
+from cgbv.core.logic_compiler import (
+    CompiledTheory,
+    SymbolTable,
+    canonicalize_logic_obj,
+    compile_sentence_logic,
+    compile_theory_dsl,
+    to_compact_dsl_payload_safe,
+)
 
 from cgbv.core.phase4_check import Mismatch
 
@@ -56,7 +64,9 @@ class Phase1Result:
     model_info: object | None          # z3.ModelRef for P∧¬q side (Not Entailed / Uncertain)
     model_info_q: object | None        # z3.ModelRef for P∧q side (Uncertain only)
     namespace: dict[str, Any]          # full exec namespace
-    raw_code: str                      # the generated Z3 code
+    raw_code: str                      # compiler-rendered compatibility code
+    dsl_payload: dict[str, Any] = field(default_factory=dict)
+    symbol_table: SymbolTable | None = None
     verdict_pre_bridge: str = ""       # verdict before Phase 1.5 bridge repair (empty = no bridge ran)
     attempts: list[Phase1Attempt] = field(default_factory=list)
     repeated_failure: bool = False     # True iff compile/validation failure repeated structurally
@@ -80,11 +90,8 @@ async def run_phase1(
     """
     Phase 1: Formalize & Solve.
 
-    LLM translates NL → Z3-Python code.
-    CodeExecutor exec()s the code.
-    Z3Solver checks entailment with Unique Name Assumption (Distinct constraints).
-
-    On code errors: feed error back to LLM and retry (up to max_retries).
+    LLM translates NL → JSON DSL.
+    The local compiler turns DSL into Z3 objects and compatibility raw_code.
 
     Phase 1.5 (bridge check) runs automatically after a successful formalization
     when the verdict is not Entailed, to detect and repair structurally
@@ -93,22 +100,22 @@ async def run_phase1(
     messages = _build_messages(premises_nl, conclusion_nl, prompt_engine, dataset, world_assumption)
     last_error: str | None = None
     last_validation_feedback: list[str] = []
-    last_name_error_hint: str | None = None   # specific spelling-error diagnosis for retry
+    last_name_error_hint: str | None = None
     last_diagnostic = Phase1Diagnostic()
-    raw_code = ""
+    raw_output = ""
     attempts: list[Phase1Attempt] = []
     failure_fingerprints: list[str] = []
     repeated_failure_detected = False
-    _vacuous_check_done: bool = False       # fire vacuous-model check at most once
+    _vacuous_check_done: bool = False
 
     for attempt in range(max_retries):
         if attempt > 0:
             messages = messages + [
-                {"role": "assistant", "content": raw_code},
+                {"role": "assistant", "content": raw_output},
                 _build_retry_message(
                     premises_nl=premises_nl,
                     conclusion_nl=conclusion_nl,
-                    raw_code=raw_code,
+                    raw_output=raw_output,
                     last_error=last_error or "Unknown error",
                     validation_feedback=last_validation_feedback,
                     name_error_hint=last_name_error_hint,
@@ -119,30 +126,26 @@ async def run_phase1(
                     prompt_engine=prompt_engine,
                 ),
             ]
-        last_name_error_hint = None   # reset; will be set only if this attempt has a NameError
+        last_name_error_hint = None
 
         attempt_record = Phase1Attempt(
             attempt_num=attempt + 1,
             messages=_snapshot_messages(messages),
         )
-        raw_code = await llm.complete_with_retry(messages)
-        attempt_record.raw_output = raw_code
+        raw_output = await llm.complete_with_retry(messages)
+        attempt_record.raw_output = raw_output
 
-        # Fix D: AST-based sort consistency check (before execution).
-        # Catches sort mismatches statically, providing precise diagnostics
-        # that guide the retry instead of opaque Z3 runtime errors.
-        sort_error = check_z3_sort_consistency(raw_code)
-        if sort_error:
-            last_error = sort_error
+        payload = _extract_dsl_json(raw_output)
+        if payload is None:
+            last_error = "Model output did not contain a valid JSON DSL object."
             last_validation_feedback = []
-            last_name_error_hint = sort_error  # inject as specific diagnosis
-            attempt_record.code_exec_error = sort_error
+            attempt_record.validation_error = last_error
             last_diagnostic = _build_phase1_diagnostic(
-                raw_code=raw_code,
-                failure_stage="sort_check",
-                raw_error=sort_error,
+                raw_code=raw_output,
+                failure_stage="validation",
+                raw_error=last_error,
                 validation_feedback=[],
-                name_error_hint=sort_error,
+                name_error_hint=None,
                 premises_nl=premises_nl,
                 conclusion_nl=conclusion_nl,
             )
@@ -154,31 +157,27 @@ async def run_phase1(
             attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
             attempts.append(attempt_record)
             logger.warning(
-                "Phase 1 attempt %d/%d: static sort mismatch: %s",
-                attempt + 1, max_retries, sort_error[:200],
+                "Phase 1 attempt %d/%d: invalid JSON DSL output",
+                attempt + 1, max_retries,
             )
             continue
 
         try:
-            ctx = execute_z3_code(raw_code, timeout_seconds=code_exec_timeout)
-        except CodeExecutionError as e:
+            compiled = _compile_dsl_to_phase1_result(
+                payload=payload,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
+            )
+        except Exception as e:
             last_error = str(e)
             last_validation_feedback = []
-            # Build a specific spelling-error hint for NameErrors so the retry
-            # prompt gives the LLM a targeted "replace X with Y" instruction
-            # rather than just the generic error string.
-            last_name_error_hint = build_name_error_hint(raw_code, last_error)
-            # Fall back to runtime error hint for non-NameError patterns
-            # (e.g., index out of bounds, sort mismatch, arity errors).
-            if last_name_error_hint is None:
-                last_name_error_hint = build_runtime_error_hint(raw_code, last_error)
-            attempt_record.code_exec_error = last_error
+            attempt_record.validation_error = last_error
             last_diagnostic = _build_phase1_diagnostic(
-                raw_code=raw_code,
-                failure_stage="exec",
+                raw_code=json.dumps(payload, ensure_ascii=False, indent=2),
+                failure_stage="validation",
                 raw_error=last_error,
                 validation_feedback=[],
-                name_error_hint=last_name_error_hint,
+                name_error_hint=None,
                 premises_nl=premises_nl,
                 conclusion_nl=conclusion_nl,
             )
@@ -190,77 +189,44 @@ async def run_phase1(
             attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
             attempts.append(attempt_record)
             logger.warning(
-                "Phase 1 attempt %d/%d: code execution error: %s",
+                "Phase 1 attempt %d/%d: DSL compile error: %s",
                 attempt + 1, max_retries, e,
             )
             continue
 
-        # Comprehensive output validation (Fix 6)
-        validation_result = _validate_output(premises_nl, ctx)
-        if validation_result:
-            last_error, last_validation_feedback = validation_result
-            attempt_record.validation_error = last_error
-            last_diagnostic = _build_phase1_diagnostic(
-                raw_code=raw_code,
-                failure_stage="validation",
-                raw_error=last_error,
-                validation_feedback=last_validation_feedback,
-                name_error_hint=last_name_error_hint,
-                premises_nl=premises_nl,
-                conclusion_nl=conclusion_nl,
-            )
-            repeated_failure_detected = bool(
-                failure_fingerprints
-                and failure_fingerprints[-1] == last_diagnostic.attempt_fingerprint
-            )
-            failure_fingerprints.append(last_diagnostic.attempt_fingerprint)
-            attempt_record.diagnostic = _diagnostic_to_dict(last_diagnostic)
-            attempts.append(attempt_record)
-            logger.warning(
-                "Phase 1 attempt %d/%d: %s", attempt + 1, max_retries, last_error
-            )
-            continue
         last_validation_feedback = []
 
-        # Build Distinct() constraints for named entity constants (P0.2)
-        bound_var_names: set[str] = ctx.get("bound_var_names", set())
+        bound_var_names = compiled.bound_var_names
         background_constraints = solver.build_distinct_constraints(
-            ctx["namespace"], bound_var_names
+            compiled.namespace, bound_var_names
         )
-        # Pick up user-defined background_constraints from LLM code (RULE 10:
-        # comparison predicate axioms like transitivity, antisymmetry).
-        user_bg = ctx["namespace"].get("background_constraints")
-        if user_bg and hasattr(user_bg, '__iter__'):
-            for c in user_bg:
-                if isinstance(c, z3.BoolRef):
-                    background_constraints.append(c)
+        background_constraints.extend(compiled.background_constraints)
         # CWA axiom injection: detect and close semantic gaps under closed-world assumption
         if world_assumption == "cwa":
             cwa_axioms = build_cwa_constraints(
-                namespace=ctx["namespace"],
-                premises=list(ctx["premises"]),
-                q=ctx["q"],
+                namespace=compiled.namespace,
+                premises=list(compiled.premises),
+                q=compiled.q,
                 bound_var_names=bound_var_names,
             )
             background_constraints.extend(cwa_axioms)
         # Solver uses NL premises + background constraints for entailment check
-        solver_premises = list(ctx["premises"]) + background_constraints
+        solver_premises = list(compiled.premises) + background_constraints
 
-        # Run solver
         try:
             if task_type == "three_class":
                 verdict, model_info, model_info_q = solver.check_entailment_three_class(
-                    solver_premises, ctx["q"]
+                    solver_premises, compiled.q
                 )
             else:
-                verdict, model_info = solver.check_entailment(solver_premises, ctx["q"])
+                verdict, model_info = solver.check_entailment(solver_premises, compiled.q)
                 model_info_q = None
         except Exception as e:
             last_error = str(e)
             last_validation_feedback = []
             attempt_record.solver_error = last_error
             last_diagnostic = _build_phase1_diagnostic(
-                raw_code=raw_code,
+                raw_code=compiled.raw_code,
                 failure_stage="solver",
                 raw_error=last_error,
                 validation_feedback=[],
@@ -304,9 +270,9 @@ async def run_phase1(
                 try:
                     vacuous, always_false_preds = _check_model_vacuousness(
                         _model_to_check,
-                        list(ctx["premises"]),
-                        ctx["q"],
-                        ctx["namespace"],
+                        list(compiled.premises),
+                        compiled.q,
+                        compiled.namespace,
                         bound_var_names,
                     )
                 except Exception as _vac_exc:
@@ -350,15 +316,17 @@ async def run_phase1(
 
         result = Phase1Result(
             verdict=verdict,
-            premises=list(ctx["premises"]),       # NL-only, aligned with sentences
+            premises=list(compiled.premises),
             background_constraints=background_constraints,
             bound_var_names=bound_var_names,
-            q=ctx["q"],
+            q=compiled.q,
             model_info=model_info,
             model_info_q=model_info_q,
-            namespace=ctx["namespace"],
-            raw_code=ctx["raw_code"],
-            verdict_pre_bridge=verdict,           # snapshot before Phase 1.5 may change verdict
+            namespace=compiled.namespace,
+            raw_code=compiled.raw_code,
+            dsl_payload=compiled.payload,
+            symbol_table=compiled.symbol_table,
+            verdict_pre_bridge=verdict,
             attempts=attempts,
             repeated_failure=repeated_failure_detected or _has_repeated_phase1_failure(attempts),
         )
@@ -394,7 +362,9 @@ async def run_phase1(
         model_info=None,
         model_info_q=None,
         namespace={},
-        raw_code=raw_code,
+        raw_code="",
+        dsl_payload={},
+        symbol_table=None,
         attempts=attempts,
         repeated_failure=repeated_failure_detected or _has_repeated_phase1_failure(attempts),
         error=f"Phase 1 failed after {max_retries} attempts. Last error: {last_error}",
@@ -458,6 +428,8 @@ async def _run_bridge_check(
             q=result.q,
             conclusion_nl=conclusion_nl,
             namespace=result.namespace,
+            symbol_table=result.symbol_table,
+            dsl_payload=result.dsl_payload,
             connected_preds=connected_preds,
             llm=llm,
             prompt_engine=prompt_engine,
@@ -466,15 +438,19 @@ async def _run_bridge_check(
             solver=solver,
         )
         if linking_axiom is not None:
+            bridge_formula, bridge_logic = linking_axiom
             # Add as background constraint instead of replacing the original
             # premise.  This preserves the original NL→FOL alignment (premises[i]
             # always corresponds to sentence i) and prevents semantic corruption
             # where the replacement silently drops part of the original meaning.
-            background_constraints.append(linking_axiom)
+            background_constraints.append(bridge_formula)
             changed = True
+            result.dsl_payload.setdefault("background_constraints", []).append(
+                canonicalize_logic_obj(bridge_logic)
+            )
             logger.info(
                 "Phase 1.5 idx=%d: bridge axiom added: %.80s (original preserved: %.60s)",
-                idx, str(linking_axiom), str(premises[idx]),
+                idx, str(bridge_formula), str(premises[idx]),
             )
         else:
             logger.warning(
@@ -502,20 +478,13 @@ async def _run_bridge_check(
         "Phase 1.5: re-solve complete: verdict %s → %s", result.verdict, verdict
     )
 
-    # Append bridge axiom notes to raw_code so subsequent Phase 5 prompts
-    # reflect the added linking axioms.
-    new_axioms = background_constraints[len(result.background_constraints):]
-    repair_notes = [
-        f"# Phase 1.5 bridge axiom: {str(ax)}"
-        for ax in new_axioms
-    ]
     updated_raw_code = result.raw_code
-    if repair_notes:
-        updated_raw_code = (
-            result.raw_code.rstrip()
-            + "\n\n# ---- Phase 1.5 bridge axioms ----\n"
-            + "\n".join(repair_notes)
-        )
+    if result.symbol_table is not None:
+        try:
+            compiled_view = compile_theory_dsl(result.dsl_payload, premises_nl, conclusion_nl)
+            updated_raw_code = compiled_view.raw_code
+        except Exception as exc:
+            logger.warning("Phase 1.5: failed to re-render DSL after bridge repair: %s", exc)
 
     return Phase1Result(
         verdict=verdict,
@@ -527,6 +496,8 @@ async def _run_bridge_check(
         model_info_q=model_info_q,
         namespace=result.namespace,
         raw_code=updated_raw_code,
+        dsl_payload=result.dsl_payload,
+        symbol_table=result.symbol_table,
         verdict_pre_bridge=result.verdict_pre_bridge,  # preserve original pre-bridge snapshot
         attempts=result.attempts,
         repeated_failure=result.repeated_failure,
@@ -543,19 +514,24 @@ async def _repair_bridge_premise(
     q: z3.ExprRef,
     conclusion_nl: str,
     namespace: dict[str, Any],
+    symbol_table: SymbolTable | None,
+    dsl_payload: dict[str, Any],
     connected_preds: set[str],
     llm: LLMClient,
     prompt_engine: PromptEngine,
     raw_code: str,
     bridge_retries: int = 2,
     solver: "Z3Solver | None" = None,
-) -> z3.ExprRef | None:
+) -> tuple[z3.ExprRef, Any] | None:
     """
     Ask the LLM to reformulate a single disconnected premise so its predicate
     vocabulary connects to the rest of the proof chain.
 
-    Returns the new z3.ExprRef on success, or None if all attempts fail.
+    Returns the compiled bridge formula plus its DSL object on success.
     """
+    if symbol_table is None:
+        return None
+    compact_dsl_json = _dsl_payload_for_prompt(dsl_payload)
     orphaned_preds = sorted(_extract_predicate_names(current_formula))
     other_premises = [
         (i, premises_nl[i], str(all_premises[i]))
@@ -565,6 +541,7 @@ async def _repair_bridge_premise(
 
     initial_render = prompt_engine.render(
         "phase1_bridge.j2",
+        current_dsl=compact_dsl_json,
         raw_code=raw_code,
         premise_index=idx,
         nl_text=nl_text,
@@ -591,6 +568,7 @@ async def _repair_bridge_premise(
                 # has complete context about why the previous bridge was rejected.
                 retry_render = prompt_engine.render(
                     "phase1_bridge.j2",
+                    current_dsl=compact_dsl_json,
                     raw_code=raw_code,
                     premise_index=idx,
                     nl_text=nl_text,
@@ -617,26 +595,29 @@ async def _repair_bridge_premise(
                         "role": "user",
                         "content": (
                             f"Error: {last_error}\n\n"
-                            "Output ONLY a valid Z3 boolean expression using identifiers "
-                            "already declared in the code. No imports, no assignments."
+                            "Output ONLY one valid JSON logic expression using the existing symbol table. "
+                            "It can be a compact logic string or a logic JSON object. "
+                            "Do not output Python or prose."
                         ),
                     },
                 ]
 
         raw_output = await llm.complete_with_retry(messages)
-        expr_str = _strip_fences(raw_output)
-        if not expr_str:
-            last_error = "Empty output"
-            continue
 
         # P2: allow LLM to explicitly decline bridging
-        if expr_str.strip().upper() == "NONE":
+        if raw_output.strip().upper() == "NONE":
             logger.info("Phase 1.5 idx=%d: LLM returned NONE (no bridge needed)", idx)
             return None
 
-        formula, error = _eval_bridge_expr(expr_str, namespace)
-        if error or formula is None:
-            last_error = error or "Returned None"
+        bridge_logic = _extract_json_value(raw_output)
+        if not isinstance(bridge_logic, (dict, str)):
+            last_error = "Bridge output was not a valid JSON logic expression."
+            continue
+
+        try:
+            formula = compile_sentence_logic(bridge_logic, symbol_table, dict(symbol_table.variables))
+        except Exception as exc:
+            last_error = f"Bridge object did not compile: {exc}"
             continue
 
         # Guard: bridge output must be a universally/existentially quantified
@@ -681,9 +662,14 @@ async def _repair_bridge_premise(
                 )
                 continue
 
-        return formula
+        return formula, bridge_logic
 
     return None
+
+
+def _dsl_payload_for_prompt(dsl_payload: dict[str, Any]) -> str:
+    compact = to_compact_dsl_payload_safe(dsl_payload)
+    return json.dumps(compact, ensure_ascii=False, indent=2)
 
 
 from cgbv.core.gap_analysis import (
@@ -827,6 +813,7 @@ def _run_structural_sanity_check(result: "Phase1Result") -> str | None:
 
 async def run_phase1_targeted(
     original_code: str,
+    original_dsl_payload: dict[str, Any],
     failed_repairs: list[tuple[Any, str | None]],
     premises_nl: list[str],
     conclusion_nl: str,
@@ -839,31 +826,9 @@ async def run_phase1_targeted(
     max_retries: int = 2,
 ) -> Phase1Result | None:
     """
-    Phase 1 targeted re-formalization: rewrite the entire Z3 theory when
+    Phase 1 targeted re-formalization: rewrite the entire DSL theory when
     Phase 5 repair fails to fix detected mismatches.
-
-    Unlike formula-level repair (Phase 5), this rewrites the whole theory,
-    allowing structural changes like adding new sorts, predicates, or entity
-    constants that the original formalization missed.
-
-    Args:
-        original_code: the current Z3-Python code (may include Phase 5 repair notes)
-        failed_repairs: list of (Mismatch, repair_error_str | None) for mismatches
-                       that Phase 5 could not fix
-        premises_nl: original NL premises
-        conclusion_nl: original NL conclusion
-        llm: LLM client
-        solver: Z3 solver
-        prompt_engine: for rendering the reformalize template
-        task_type: "entailment" or "three_class"
-        code_exec_timeout: timeout for executing the re-formalized code
-        world_assumption: "owa" or "cwa"
-        max_retries: number of retry attempts on code execution errors
-
-    Returns:
-        Phase1Result on success, None if all retries fail.
     """
-    # Build mismatch data for the template
     mismatch_data = []
     for m, repair_error in failed_repairs:
         mismatch_data.append({
@@ -873,93 +838,84 @@ async def run_phase1_targeted(
             "fol_truth": getattr(m, "fol_truth", None),
             "grounded_truth": getattr(m, "grounded_truth", None),
             "fol_formula": getattr(m, "fol_formula_str", getattr(m, "current_formula_str", "")),
-            "grounded_formula": getattr(m, "grounded_formula", getattr(m, "audited_formula_str", "")),
+            "current_logic": getattr(m, "current_logic", None),
+            "current_logic_json": json.dumps(getattr(m, "current_logic", None), ensure_ascii=False, indent=2)
+            if getattr(m, "current_logic", None) is not None else "",
+            "drift_reason": getattr(m, "drift_reason", None),
             "repair_error": repair_error,
         })
 
     user_content = prompt_engine.render(
         "phase1_reformalize.j2",
+        original_dsl=_dsl_payload_for_prompt(original_dsl_payload),
         original_code=original_code,
         failed_mismatches=mismatch_data,
     )
     messages: list[dict] = [{"role": "user", "content": user_content}]
-    raw_code = ""
+    raw_output = ""
     last_error = ""
 
     for attempt in range(max_retries):
         if attempt > 0:
             messages = messages + [
-                {"role": "assistant", "content": raw_code},
+                {"role": "assistant", "content": raw_output},
                 {
                     "role": "user",
                     "content": (
                         f"Error: {last_error}\n\n"
-                        "Fix the error and output the corrected COMPLETE Z3-Python code. "
+                        "Fix the error and output the corrected COMPLETE JSON DSL theory. "
                         "No markdown fences, no explanations."
                     ),
                 },
             ]
 
-        raw_code = await llm.complete_with_retry(messages)
-
-        sort_error = check_z3_sort_consistency(raw_code)
-        if sort_error:
-            last_error = sort_error
+        raw_output = await llm.complete_with_retry(messages)
+        payload = _extract_dsl_json(raw_output)
+        if payload is None:
+            last_error = "Model output did not contain a valid JSON DSL object."
             logger.warning(
-                "Phase 1 targeted re-formalization attempt %d/%d: static sort mismatch: %s",
-                attempt + 1, max_retries, sort_error[:200],
+                "Phase 1 targeted re-formalization attempt %d/%d: invalid JSON output",
+                attempt + 1, max_retries,
             )
             continue
 
         try:
-            ctx = execute_z3_code(raw_code, timeout_seconds=code_exec_timeout)
-        except CodeExecutionError as e:
-            last_error = str(e)
-            logger.warning(
-                "Phase 1 targeted re-formalization attempt %d/%d: code error: %s",
-                attempt + 1, max_retries, e,
+            compiled = _compile_dsl_to_phase1_result(
+                payload=payload,
+                premises_nl=premises_nl,
+                conclusion_nl=conclusion_nl,
             )
-            continue
-
-        # Validate output structure
-        validation_result = _validate_output(premises_nl, ctx)
-        if validation_result:
-            last_error = validation_result[0]
+        except ValueError as e:
+            last_error = str(e)
             logger.warning(
                 "Phase 1 targeted re-formalization attempt %d/%d: validation error: %s",
                 attempt + 1, max_retries, last_error,
             )
             continue
 
-        # Build constraints and solve
-        bound_var_names: set[str] = ctx.get("bound_var_names", set())
+        bound_var_names = compiled.bound_var_names
         background_constraints = solver.build_distinct_constraints(
-            ctx["namespace"], bound_var_names
+            compiled.namespace, bound_var_names
         )
-        # Pick up user-defined background_constraints from LLM code (RULE 10)
-        user_bg = ctx["namespace"].get("background_constraints")
-        if user_bg and hasattr(user_bg, '__iter__'):
-            for c in user_bg:
-                if isinstance(c, z3.BoolRef):
-                    background_constraints.append(c)
+        background_constraints.extend(compiled.background_constraints)
         if world_assumption == "cwa":
             cwa_axioms = build_cwa_constraints(
-                namespace=ctx["namespace"],
-                premises=list(ctx["premises"]),
-                q=ctx["q"],
+                namespace=compiled.namespace,
+                premises=list(compiled.premises),
+                q=compiled.q,
                 bound_var_names=bound_var_names,
             )
             background_constraints.extend(cwa_axioms)
 
-        solver_premises = list(ctx["premises"]) + background_constraints
+        solver_premises = list(compiled.premises) + background_constraints
 
         try:
             if task_type == "three_class":
                 verdict, model_info, model_info_q = solver.check_entailment_three_class(
-                    solver_premises, ctx["q"]
+                    solver_premises, compiled.q
                 )
             else:
-                verdict, model_info = solver.check_entailment(solver_premises, ctx["q"])
+                verdict, model_info = solver.check_entailment(solver_premises, compiled.q)
                 model_info_q = None
         except Exception as e:
             last_error = str(e)
@@ -976,14 +932,16 @@ async def run_phase1_targeted(
 
         return Phase1Result(
             verdict=verdict,
-            premises=list(ctx["premises"]),
+            premises=list(compiled.premises),
             background_constraints=background_constraints,
             bound_var_names=bound_var_names,
-            q=ctx["q"],
+            q=compiled.q,
             model_info=model_info,
             model_info_q=model_info_q,
-            namespace=ctx["namespace"],
-            raw_code=ctx["raw_code"],
+            namespace=compiled.namespace,
+            raw_code=compiled.raw_code,
+            dsl_payload=compiled.payload,
+            symbol_table=compiled.symbol_table,
             verdict_pre_bridge="",  # not applicable for re-formalization
             attempts=[],
             repeated_failure=False,
@@ -1019,7 +977,7 @@ def _build_messages(
 def _build_retry_message(
     premises_nl: list[str],
     conclusion_nl: str,
-    raw_code: str,
+    raw_output: str,
     last_error: str,
     validation_feedback: list[str],
     attempt_num: int,
@@ -1033,7 +991,7 @@ def _build_retry_message(
         "phase1_retry.j2",
         premises=premises_nl,
         conclusion=conclusion_nl,
-        previous_code=_normalise_code_for_prompt(raw_code),
+        previous_output=_normalise_code_for_prompt(raw_output),
         last_error=last_error,
         validation_feedback=validation_feedback,
         name_error_hint=name_error_hint,
@@ -1043,6 +1001,77 @@ def _build_retry_message(
         max_retries=max_retries,
     )
     return {"role": "user", "content": user_content}
+
+
+def _extract_dsl_json(raw: str) -> dict[str, Any] | None:
+    text = raw.strip()
+    fenced = re.search(
+        r"```(?:json)?\s*\n(.*?)\n```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        text = fenced.group(1).strip()
+
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start:end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _extract_json_value(raw: str) -> Any | None:
+    text = raw.strip()
+    fenced = re.search(
+        r"```(?:json)?\s*\n(.*?)\n```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if fenced:
+        text = fenced.group(1).strip()
+
+    candidates = [text]
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+    if obj_start >= 0 and obj_end > obj_start:
+        candidates.append(text[obj_start:obj_end + 1])
+
+    quote_start = text.find('"')
+    quote_end = text.rfind('"')
+    if quote_start >= 0 and quote_end > quote_start:
+        candidates.append(text[quote_start:quote_end + 1])
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _compile_dsl_to_phase1_result(
+    payload: dict[str, Any],
+    premises_nl: list[str],
+    conclusion_nl: str,
+) -> CompiledTheory:
+    return compile_theory_dsl(
+        payload=payload,
+        premises_nl=premises_nl,
+        conclusion_nl=conclusion_nl,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +1431,7 @@ def _build_phase1_diagnostic(
     source_slots: list[str] = []
     offending_symbols: list[str] = []
     forbidden_patterns: list[str] = []
+    extra_preserve_constraints: list[str] = []
 
     err = raw_error or ""
     if re.search(r"premises\[(\d+)\]", err):
@@ -1420,8 +1450,26 @@ def _build_phase1_diagnostic(
         offending_symbols.append(m_name.group(1))
 
     err_lower = err.lower()
+    sort_mismatch_match = re.search(
+        r"Sort mismatch in function call '([^']+)' arg (\d+): expected '([^']+)', got '([^']+)'",
+        err,
+    )
+    if sort_mismatch_match:
+        offending_symbols.append(sort_mismatch_match.group(1))
+
     if "sort mismatch" in err_lower:
         forbidden_patterns.append("Do not use Bool predicates as values inside equality/comparison predicates.")
+        if sort_mismatch_match:
+            expected_sort = sort_mismatch_match.group(3)
+            got_sort = sort_mismatch_match.group(4)
+            extra_preserve_constraints.append(
+                "Resolve sort mismatch by aligning symbol declarations and atom arguments; "
+                f"expected `{expected_sort}`, got `{got_sort}`."
+            )
+            extra_preserve_constraints.append(
+                "If NL mentions subtype words (e.g. island/cove/place), keep one shared domain sort "
+                "for arguments and encode type with unary predicates instead of split constant sorts."
+            )
     if "literal boolean" in err_lower or "raw python boolean" in err_lower:
         forbidden_patterns.append("Do not place literal True/False inside premises or q.")
     if "exactly one top-level formula" in err_lower:
@@ -1437,6 +1485,7 @@ def _build_phase1_diagnostic(
         "Preserve valid declarations, constants, sorts, and predicates unless the error proves one is wrong.",
         "Reuse the existing symbol table whenever possible; do not rename working identifiers.",
     ]
+    preserve_constraints.extend(extra_preserve_constraints)
     preserve_constraints.extend(validation_feedback[:3])
 
     fingerprint = _fingerprint_phase1_attempt(
@@ -1545,36 +1594,6 @@ def _strip_fences(raw: str) -> str:
         raw = raw[1:-1].strip()
     return raw
 
-
-def _eval_bridge_expr(
-    expr_str: str,
-    namespace: dict[str, Any],
-) -> tuple[z3.ExprRef | None, str | None]:
-    """
-    Evaluate a Z3-Python expression string in the Phase 1 namespace.
-    Returns (formula, None) on success or (None, error_str) on failure.
-    """
-    if not expr_str:
-        return None, "Empty expression"
-    try:
-        import z3 as _z3
-        eval_ns = dict(namespace)
-        for name in dir(_z3):
-            if not name.startswith("_") and name not in eval_ns:
-                eval_ns[name] = getattr(_z3, name)
-        result = eval(expr_str, eval_ns)  # noqa: S307
-        if not isinstance(result, _z3.BoolRef):
-            return None, (
-                f"Expression is not a Z3 boolean formula "
-                f"(got {type(result).__name__})"
-            )
-        return result, None
-    except SyntaxError as e:
-        return None, f"Syntax error: {e}"
-    except Exception as e:
-        return None, f"Evaluation error: {e}"
-
-
 def _snapshot_messages(messages: list[dict]) -> list[dict[str, str]]:
     """Copy chat messages so attempt traces remain stable after retries mutate the list."""
     return [
@@ -1600,7 +1619,7 @@ def check_z3_sort_consistency(code: str) -> str | None:
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return None  # let execute_z3_code handle syntax errors
+        return None  # syntax issues are handled by the compiler/validator path
 
     # Pass 1: collect Function declarations and their sort signatures.
     # Function('name', SortA, SortB, BoolSort()) → name: [SortA, SortB, BoolSort]

@@ -54,6 +54,8 @@ async def run_multi_witness(
     solver: Z3Solver,
     llm: LLMClient,
     prompt_engine: PromptEngine,
+    dsl_payload: dict[str, Any] | None = None,
+    symbol_table: Any | None = None,
     bound_var_names: set[str] | None = None,
     background_constraints: list | None = None,
     num_witnesses: int = 1,
@@ -198,6 +200,8 @@ async def run_multi_witness(
                     max_retries=grounding_retries,
                     world_assumption=world_assumption,
                     solver=solver,
+                    dsl_payload=dsl_payload,
+                    symbol_table=symbol_table,
                 )
                 # Merge: replace only regenerated indices, keep rest from cache
                 partial_by_idx = {t.sentence_index: t for t in partial}
@@ -227,6 +231,8 @@ async def run_multi_witness(
                 max_retries=grounding_retries,
                 world_assumption=world_assumption,
                 solver=solver,
+                dsl_payload=dsl_payload,
+                symbol_table=symbol_table,
                 batch_size=batch_grounding_size,
             )
             templates = templates_result.templates
@@ -241,6 +247,8 @@ async def run_multi_witness(
             max_retries=grounding_retries,
             world_assumption=world_assumption,
             solver=solver,
+            dsl_payload=dsl_payload,
+            symbol_table=symbol_table,
             batch_size=batch_grounding_size,
         )
         templates = templates_result.templates
@@ -306,17 +314,18 @@ async def _run_eval_and_phase4(
     """Phase 3 Step 2 + Phase 4 for a single witness (no LLM calls).
 
     Converts witness-independent GroundingTemplates to GroundedFormula objects,
-    then runs Phase 4 which evaluates each formula on this witness's truth table.
+    then runs Phase 4 which evaluates each template IR on this witness's domain.
     """
     cgbv_log.update_phase("phase4")
 
     # Convert templates to GroundedFormula for Phase 4 compatibility.
-    # Phase 4 will eval template_code on p2.domain via evaluate_grounded_formula().
+    # formula_code stays as debug_render for logs/results; execution uses template_ir.
     grounded_formulas = [
         GroundedFormula(
             sentence_index=tmpl.sentence_index,
             nl_sentence=tmpl.nl_sentence,
-            formula_code=tmpl.template_code,
+            formula_code=tmpl.debug_render,
+            template_ir=tmpl.template_ir,
             failed=tmpl.failed,
             attempts=tmpl.attempts,
             error=tmpl.error,

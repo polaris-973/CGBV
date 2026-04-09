@@ -1,131 +1,52 @@
-You are a logic translator working with a specific finite domain.
+You are grounding one natural-language sentence into ONE grounded-template IR JSON object.
 
-You are given:
-1. A **domain SCHEMA** listing entities grouped by sort and predicate/function signatures.
-   **You are NOT given truth values** — you do not know what is true or false in any world.
-2. A **natural language sentence**.
+Output ONE JSON object only.
 
-Your task: write a Python boolean expression **template** that can be evaluated against ANY
-truth table on this domain to determine if the sentence holds. Base your translation solely
-on the natural language meaning of the sentence.
+## Frozen Symbol Table
 
----
-
-## Output Format
-
-Write a **single Python boolean expression**. Use:
-- `truth["PredName(entity)"]` — look up a ground atom's truth value
-- `value["fname(entity)"]` — look up a function's numeric value (e.g. `value["score(alice)"] < value["score(bob)"]`)
-- `and`, `or`, `not` — boolean connectives
-- `all(... for e in SORT_LIST if ...)` — universal quantification over ONE sort
-- `any(... for e in SORT_LIST if ...)` — existential quantification over ONE sort
-
-**Critical rules:**
-1. Use predicates names **exactly as they appear** in the domain schema (matching capitalisation).
-2. Each `for e in [...]` loop must iterate over **only** the entity list for the correct sort of
-   that predicate's argument. Never mix entities from different sorts in the same loop.
-3. If the sort already determines the type (e.g., all entities in the `Stock` sort ARE stocks),
-   do **not** add a redundant `if truth["is_stock(e)"]` guard — it creates a semantic gap. Only
-   add an `if truth[...]` guard when the NL explicitly conditions on an additional predicate.
-4. Do **not** invent entity names. Use only the canonical IDs listed under "Canonical entity IDs".
-5. Do **not** use Z3 syntax (`ForAll`, `Exists`, `Implies`, `Function`, `BoolSort`, etc.).
-6. Output ONLY the expression — no imports, no assignments, no prose.
-
----
-
-## Translation Patterns
-
-Given sort `Person` with entities `['alice', 'bob', 'carol']`:
-
-| Natural language | Grounded expression |
-|---|---|
-| "Alice is happy." | `truth["happy(alice)"]` |
-| "Alice is NOT happy." | `not truth["happy(alice)"]` |
-| "All persons are happy." | `all(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
-| "Some person is happy." | `any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
-| "No person is happy." | `not any(truth[f"happy({e})"] for e in ["alice","bob","carol"])` |
-| "Alice likes Bob." | `truth["likes(alice, bob)"]` |
-| "Alice likes someone." | `any(truth[f"likes(alice, {e})"] for e in ["alice","bob","carol"])` |
-| "Everyone who studies passes." | `all(truth[f"passes({e})"] for e in ["alice","bob","carol"] if truth[f"studies({e})"])` |
-| "If Alice studies, she passes." (conditional/Implies) | `not truth["studies(alice)"] or truth["passes(alice)"]` |
-| "Alice is happy or sad, but not both." (XOR) | `truth["happy(alice)"] != truth["sad(alice)"]` |
-| "If Alice is happy or sad (but not both), she passes." (Implies + XOR) | `not (truth["happy(alice)"] != truth["sad(alice)"]) or truth["passes(alice)"]` |
-
-**Multi-sort example** — sort `Person: ['alice']`, sort `Book: ['walden']`:
-
-| Natural language | Grounded expression |
-|---|---|
-| "Alice reads Walden." | `truth["reads(alice, walden)"]` |
-| "Alice reads some book." | `any(truth[f"reads(alice, {b})"] for b in ["walden"])` |
-| "Every person reads some book." | `all(any(truth[f"reads({p}, {b})"] for b in ["walden"]) for p in ["alice"])` |
-
-The `for p in [...]` loop uses **only** Person entities; `for b in [...]` uses **only** Book
-entities. Never mix them.
-
----
-
-## Worked Example
-
-**Domain Schema (no truth values):**
-```
-Entities by sort:
-  Animal: ['tweety', 'sam', 'Animal!val!0']
-
-Predicate signatures:
-  is_bird(Animal) → bool
-  can_fly(Animal) → bool
-
-Canonical entity IDs: tweety, sam, Animal!val!0
+```json
+{{ symbol_context_json }}
 ```
 
-| Sentence | Template output |
-|---|---|
-| "Tweety can fly." | `truth["can_fly(tweety)"]` |
-| "Tweety cannot fly." | `not truth["can_fly(tweety)"]` |
-| "All birds can fly." | `all(truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
-| "Some bird cannot fly." | `any(not truth[f"can_fly({e})"] for e in ["tweety","sam","Animal!val!0"] if truth[f"is_bird({e})"])` |
-| "Tweety is a bird that can fly." | `truth["is_bird(tweety)"] and truth["can_fly(tweety)"]` |
+## Current Sentence DSL Logic
 
-Note: these templates work on **any** assignment of truth values to the predicates — you
-don't need to know what is_bird(tweety) is True or False to write the correct template.
+```json
+{{ sentence_logic_json }}
+```
 
----
+Core predicate/function vocabulary that should remain visible in the template:
+{% if core_predicates %}`{{ core_predicates | join("`, `") }}`{% else %}`(none)`{% endif %}
 
-## Numeric Comparison (Function-value predicates)
+## Domain Schema
 
-When the domain lists function signatures like `score(Person) → int`, use `value[...]`
-lookup for comparisons:
-
-| Natural language | Template expression |
-|---|---|
-| "Alice's score is less than Bob's." | `value["score(alice)"] < value["score(bob)"]` |
-| "Bob has the highest score." | `all(value[f"score({e})"] < value["score(bob)"] for e in SORT_LIST if e != "bob")` |
-| "Alice and Bob have equal scores." | `value["score(alice)"] == value["score(bob)"]` |
-| "Alice's score is at most 100." | `value["score(alice)"] <= 100` |
-
-**Operator must exactly match the NL meaning:**
-- "less / smaller / lower" → `<`
-- "greater / larger / higher" → `>`
-- "X has the highest/largest" → all others are strictly below X: `value[f"f({e})"] < value["f(x)"]`
-- "at most" → `<=`; "at least" → `>=`; "equal / same" → `==`
-
----
-
-{% if world_assumption == "cwa" %}
-## Closed-World Assumption
-
-Under the Closed-World Assumption: any property not explicitly asserted for an entity in the
-domain is **False**. For "either A or B" patterns, model as exclusive (exactly one is
-true): use `truth["A(e)"] != truth["B(e)"]`. Do not assume unmentioned relationships hold.
-
----
-{% endif %}
-
-## Your Task
-
-**Domain Schema:**
 {{ domain_schema }}
 
-**Sentence:** "{{ sentence }}"
+## Sentence
 
-Write the grounded boolean expression template:
+"{{ sentence }}"
+
+## Sentence Index (Debug Context Only)
+
+- `sentence_index`: `{{ sentence_index }}`
+
+## Output Rules
+
+1. Top-level field required:
+   - `expr` (object)
+2. Allowed `op` only:
+   - Bool: `and`, `or`, `not`, `implies`, `iff`, `const_bool`
+   - Atom: `truth`
+   - Term: `value`, `const`, `var`
+   - Compare: `eq`, `ne`, `lt`, `le`, `gt`, `ge`
+   - Quantifier: `all`, `any`
+3. `truth` shape:
+   - `{"op":"truth","pred":"predicate_name","args":[TERM,...]}`
+4. `value` shape:
+   - `{"op":"value","func":"function_name","args":[TERM,...]}`
+5. Quantifier shape:
+   - `{"op":"all","vars":[{"name":"x","sort":"SortName"}],"body":BOOL_EXPR}`
+   - `{"op":"any","vars":[{"name":"x","sort":"SortName"}],"body":BOOL_EXPR}`
+6. Use only predicate/function/constant/sort/variable names licensed by the frozen symbol table and domain schema.
+7. Preserve the core predicate/function vocabulary from current sentence DSL logic.
+8. Do not hand-write truth/value key strings. Represent structure only by IR nodes.
+9. Do not output `sentence_index`, `role`, or `kind`; the system injects alignment metadata.

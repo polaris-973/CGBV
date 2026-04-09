@@ -29,7 +29,6 @@ _METRIC_LABELS = {
     "cgbv_regression_rate": "CGBV Regression Rate (phase1-correct→final-wrong)",
     "phase3_reground_rate": "Phase 3 Re-grounding Resolution Rate",
     "underformalized_rate": "Underformalized Rate",
-    "semantic_instability_rate": "Semantic Instability Rate",
     "phase1_repeat_failure_rate": "Phase 1 Repeat Failure Rate",
     "obligation_resolution_rate": "Obligation Resolution Rate",
 }

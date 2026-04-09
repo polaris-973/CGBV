@@ -1,282 +1,122 @@
-# Few-shot examples for ProofWriter
-# Format: premises (list), conclusion (str), code (str)
-
-# ── Example 1 ──────────────────────────────────
-- premises:
-    - "Anne is kind."
-    - "Bob is green."
-    - "Bob is kind."
-    - "Bob is nice."
-    - "Bob is quiet."
-    - "Bob is red."
-    - "Gary is green."
-    - "Gary is quiet."
-    - "Gary is young."
-    - "Harry is furry."
-    - "All quiet, green people are young."
-    - "If someone is quiet then they are kind."
-    - "Quiet, kind people are nice."
-    - "All red people are green."
-    - "All furry people are red."
-    - "If someone is green then they are quiet."
-  conclusion: "Bob is kind."
-  code: |
-    from z3 import *
-
-    Thing = DeclareSort('Thing')  # RULE 6: DeclareSort only; ONE sort for all entities
-
-    # RULE 1: every entity is a named Const
-    anne  = Const('anne', Thing)
-    bob   = Const('bob', Thing)
-    gary  = Const('gary', Thing)
-    harry = Const('harry', Thing)
-
-    # Unary predicates
-    is_kind   = Function('is_kind', Thing, BoolSort())
-    is_green  = Function('is_green', Thing, BoolSort())
-    is_nice   = Function('is_nice', Thing, BoolSort())
-    is_quiet  = Function('is_quiet', Thing, BoolSort())
-    is_red    = Function('is_red', Thing, BoolSort())
-    is_young  = Function('is_young', Thing, BoolSort())
-    is_furry  = Function('is_furry', Thing, BoolSort())
-
-    # RULE 3: bound variable separate from entity constants
-    x = Const('x', Thing)
-
-    # RULE 9: 16 premises in → 16 formulas in premises[]
-    premises = [
-        # P1-P10: ground facts
-        is_kind(anne),
-        is_green(bob),
-        is_kind(bob),
-        is_nice(bob),
-        is_quiet(bob),
-        is_red(bob),
-        is_green(gary),
-        is_quiet(gary),
-        is_young(gary),
-        is_furry(harry),
-        # P11-P16: universal rules — RULE 4: ForAll + Implies
-        # P11: RULE 4 — conjunctive antecedent → And(...)
-        ForAll([x], Implies(And(is_quiet(x), is_green(x)), is_young(x))),
-        ForAll([x], Implies(is_quiet(x), is_kind(x))),
-        ForAll([x], Implies(And(is_quiet(x), is_kind(x)), is_nice(x))),
-        ForAll([x], Implies(is_red(x), is_green(x))),
-        ForAll([x], Implies(is_furry(x), is_red(x))),
-        ForAll([x], Implies(is_green(x), is_quiet(x))),
-    ]
-    q = is_kind(bob)
-
-# ── Example 2 ─────────────────────────────────────
-- premises:
-    - "The bald eagle chases the cat."
-    - "The bald eagle is young."
-    - "The cat chases the bald eagle."
-    - "The cat sees the bald eagle."
-    - "The cat sees the lion."
-    - "The cow chases the bald eagle."
-    - "The cow sees the bald eagle."
-    - "The cow sees the lion."
-    - "The lion is rough."
-    - "The lion sees the bald eagle."
-    - "If someone chases the cow then the cow visits the lion."
-    - "If the cat visits the bald eagle and the cat is rough then the cat visits the cow."
-    - "If someone visits the cat then they visit the lion."
-    - "If the lion sees the cow and the lion sees the cat then the cat is young."
-    - "If someone sees the lion and they visit the lion then the lion visits the cat."
-    - "If someone visits the lion then they visit the cow."
-    - "If someone chases the cat then the cat chases the cow."
-  conclusion: "The cow visits the lion."
-  code: |
-    from z3 import *
-
-    Thing = DeclareSort('Thing')
-
-    # RULE 1: named Consts for all entities
-    bald_eagle = Const('bald_eagle', Thing)
-    cat        = Const('cat', Thing)
-    cow        = Const('cow', Thing)
-    lion       = Const('lion', Thing)
-
-    # Unary predicates
-    is_young = Function('is_young', Thing, BoolSort())
-    is_rough = Function('is_rough', Thing, BoolSort())
-
-    # Binary relations — RULE 7: each relation is its own separate predicate
-    chases = Function('chases', Thing, Thing, BoolSort())
-    sees   = Function('sees', Thing, Thing, BoolSort())
-    visits = Function('visits', Thing, Thing, BoolSort())
-
-    # RULE 3: two bound variables for binary universals
-    x = Const('x', Thing)
-
-    # RULE 9: 17 premises in → 17 formulas in premises[]
-    premises = [
-        # P1-P10: ground facts
-        chases(bald_eagle, cat),
-        is_young(bald_eagle),
-        chases(cat, bald_eagle),
-        sees(cat, bald_eagle),
-        sees(cat, lion),
-        chases(cow, bald_eagle),
-        sees(cow, bald_eagle),
-        sees(cow, lion),
-        is_rough(lion),
-        sees(lion, bald_eagle),
-        # P11: RULE 4 — ForAll + Implies with binary predicate
-        ForAll([x], Implies(chases(x, cow), visits(cow, lion))),
-        # P12: named-entity conditional — 'if the cat ... and the cat ...' → Implies (no ForAll)
-        #      because the antecedent names a specific entity, not a variable
-        Implies(And(visits(cat, bald_eagle), is_rough(cat)), visits(cat, cow)),
-        ForAll([x], Implies(visits(x, cat), visits(x, lion))),
-        Implies(And(sees(lion, cow), sees(lion, cat)), is_young(cat)),
-        ForAll([x], Implies(And(sees(x, lion), visits(x, lion)), visits(lion, cat))),
-        ForAll([x], Implies(visits(x, lion), visits(x, cow))),
-        ForAll([x], Implies(chases(x, cat), chases(cat, cow))),
-    ]
-    q = visits(cow, lion)
-
-# ── Example 3 ─────────────────────────────────────
-- premises:
-    - "Dave is rough."
-    - "Dave is white."
-    - "Fiona is big."
-    - "Fiona is rough."
-    - "Fiona is young."
-    - "Gary is nice."
-    - "Gary is young."
-    - "Harry is big."
-    - "Harry is quiet."
-    - "Harry is young."
-    - "If Harry is white and Harry is nice then Harry is young."
-    - "If Fiona is big and Fiona is rough then Fiona is nice."
-    - "If something is nice then it is rough."
-    - "White things are green."
-    - "If something is rough and young then it is big."
-    - "If Fiona is quiet and Fiona is young then Fiona is nice."
-    - "Green, white things are quiet."
-    - "If something is big and young then it is white."
-    - "If Fiona is quiet and Fiona is nice then Fiona is rough."
-  conclusion: "Dave is young."
-  code: |
-    from z3 import *
-
-    Thing = DeclareSort('Thing')
-
-    # RULE 1: named Consts
-    dave  = Const('dave', Thing)
-    fiona = Const('fiona', Thing)
-    gary  = Const('gary', Thing)
-    harry = Const('harry', Thing)
-
-    is_rough  = Function('is_rough', Thing, BoolSort())
-    is_white  = Function('is_white', Thing, BoolSort())
-    is_big    = Function('is_big', Thing, BoolSort())
-    is_young  = Function('is_young', Thing, BoolSort())
-    is_nice   = Function('is_nice', Thing, BoolSort())
-    is_quiet  = Function('is_quiet', Thing, BoolSort())
-    is_green  = Function('is_green', Thing, BoolSort())
-
-    x = Const('x', Thing)
-
-    # RULE 9: 19 premises in → 19 formulas in premises[]
-    premises = [
-        # P1-P10: ground facts
-        is_rough(dave),
-        is_white(dave),
-        is_big(fiona),
-        is_rough(fiona),
-        is_young(fiona),
-        is_nice(gary),
-        is_young(gary),
-        is_big(harry),
-        is_quiet(harry),
-        is_young(harry),
-        # P11-P12: named-entity conditionals (antecedent names a specific entity → Implies, no ForAll)
-        Implies(And(is_white(harry), is_nice(harry)), is_young(harry)),
-        Implies(And(is_big(fiona), is_rough(fiona)), is_nice(fiona)),
-        # P13-P15, P17-P18: generic universal rules → ForAll + Implies
-        ForAll([x], Implies(is_nice(x), is_rough(x))),
-        ForAll([x], Implies(is_white(x), is_green(x))),
-        ForAll([x], Implies(And(is_rough(x), is_young(x)), is_big(x))),
-        # P16: named-entity conditional for Fiona
-        Implies(And(is_quiet(fiona), is_young(fiona)), is_nice(fiona)),
-        ForAll([x], Implies(And(is_green(x), is_white(x)), is_quiet(x))),
-        ForAll([x], Implies(And(is_big(x), is_young(x)), is_white(x))),
-        # P19: named-entity conditional for Fiona
-        Implies(And(is_quiet(fiona), is_nice(fiona)), is_rough(fiona)),
-    ]
-    q = is_young(dave)
-
-# ── Example 4 ─────────────────────────────────────
-- premises:
-    - "The bald eagle is blue."
-    - "The bald eagle does not see the mouse."
-    - "The bald eagle sees the rabbit."
-    - "The bald eagle does not visit the rabbit."
-    - "The cow is young."
-    - "The cow sees the mouse."
-    - "The cow sees the rabbit."
-    - "The mouse does not chase the cow."
-    - "The mouse is blue."
-    - "The rabbit is blue."
-    - "The rabbit sees the cow."
-    - "If someone is cold and they chase the bald eagle then the bald eagle sees the mouse."
-    - "If someone chases the cow then they chase the bald eagle."
-    - "If someone chases the rabbit then they do not visit the bald eagle."
-    - "If someone chases the bald eagle and the bald eagle sees the rabbit then the bald eagle sees the cow."
-    - "If the mouse is cold then the mouse sees the rabbit."
-    - "If someone sees the rabbit and the rabbit chases the mouse then the rabbit does not visit the cow."
-    - "If someone sees the bald eagle then they are not green."
-    - "If someone sees the rabbit and they are young then they do not visit the rabbit."
-    - "If someone sees the cow and the cow sees the mouse then they chase the cow."
-  conclusion: "The cow visits the rabbit."
-  code: |
-    from z3 import *
-
-    Thing = DeclareSort('Thing')
-
-    # RULE 1: named Consts
-    bald_eagle = Const('bald_eagle', Thing)
-    cow        = Const('cow', Thing)
-    mouse      = Const('mouse', Thing)
-    rabbit     = Const('rabbit', Thing)
-
-    is_blue  = Function('is_blue', Thing, BoolSort())
-    is_young = Function('is_young', Thing, BoolSort())
-    is_cold  = Function('is_cold', Thing, BoolSort())
-    is_green = Function('is_green', Thing, BoolSort())
-
-    chases = Function('chases', Thing, Thing, BoolSort())
-    sees   = Function('sees', Thing, Thing, BoolSort())
-    visits = Function('visits', Thing, Thing, BoolSort())
-
-    x = Const('x', Thing)
-
-    # RULE 9: 20 premises in → 20 formulas in premises[]
-    premises = [
-        # P1-P11: ground facts — negated facts use Not() explicitly
-        is_blue(bald_eagle),
-        Not(sees(bald_eagle, mouse)),     # explicit negated ground fact
-        sees(bald_eagle, rabbit),
-        Not(visits(bald_eagle, rabbit)),  # explicit negated ground fact
-        is_young(cow),
-        sees(cow, mouse),
-        sees(cow, rabbit),
-        Not(chases(mouse, cow)),          # explicit negated ground fact
-        is_blue(mouse),
-        is_blue(rabbit),
-        sees(rabbit, cow),
-        # P12-P20: universal rules
-        ForAll([x], Implies(And(is_cold(x), chases(x, bald_eagle)), sees(bald_eagle, mouse))),
-        ForAll([x], Implies(chases(x, cow), chases(x, bald_eagle))),
-        ForAll([x], Implies(chases(x, rabbit), Not(visits(x, bald_eagle)))),
-        ForAll([x], Implies(And(chases(x, bald_eagle), sees(bald_eagle, rabbit)), sees(bald_eagle, cow))),
-        Implies(is_cold(mouse), sees(mouse, rabbit)),
-        ForAll([x], Implies(And(sees(x, rabbit), chases(rabbit, mouse)), Not(visits(rabbit, cow)))),
-        ForAll([x], Implies(sees(x, bald_eagle), Not(is_green(x)))),
-        # P19: RULE 4 — consequent is Not() — 'they do not visit the rabbit'
-        ForAll([x], Implies(And(sees(x, rabbit), is_young(x)), Not(visits(x, rabbit)))),
-        ForAll([x], Implies(And(sees(x, cow), sees(cow, mouse)), chases(x, cow))),
-    ]
-    q = visits(cow, rabbit)
+examples:
+- source_split: train
+  source_id: ProofWriter_AttNoneg-OWA-D5-355_Q3
+  coverage: unary attribute chain
+  premises:
+  - Gary is quiet.
+  - All quiet things are young.
+  conclusion: Gary is young.
+  dsl: |-
+    {
+      "symbols": {
+        "sorts": [
+          "Thing"
+        ],
+        "predicates": {
+          "is_quiet": "Thing->Bool",
+          "is_young": "Thing->Bool"
+        },
+        "functions": {},
+        "constants": {
+          "gary": "Thing"
+        }
+      },
+      "sentences": [
+        {
+          "nl": "Gary is quiet.",
+          "logic": "is_quiet(gary)"
+        },
+        {
+          "nl": "All quiet things are young.",
+          "logic": "forall x:Thing. implies(is_quiet(x), is_young(x))"
+        }
+      ],
+      "query": {
+        "nl": "Gary is young.",
+        "logic": "is_young(gary)"
+      },
+      "background": []
+    }
+- source_split: train
+  source_id: ProofWriter_AttNeg-OWA-D5-951_Q4
+  coverage: negated conclusion against derived positive fact
+  premises:
+  - Erin is cold.
+  - All cold people are white.
+  conclusion: Erin is not white.
+  dsl: |-
+    {
+      "symbols": {
+        "sorts": [
+          "Thing"
+        ],
+        "predicates": {
+          "is_cold": "Thing->Bool",
+          "is_white": "Thing->Bool"
+        },
+        "functions": {},
+        "constants": {
+          "erin": "Thing"
+        }
+      },
+      "sentences": [
+        {
+          "nl": "Erin is cold.",
+          "logic": "is_cold(erin)"
+        },
+        {
+          "nl": "All cold people are white.",
+          "logic": "forall x:Thing. implies(is_cold(x), is_white(x))"
+        }
+      ],
+      "query": {
+        "nl": "Erin is not white.",
+        "logic": "not(is_white(erin))"
+      },
+      "background": []
+    }
+- source_split: train
+  source_id: ProofWriter_RelNoneg-OWA-D5-774_Q11
+  coverage: binary relation chain
+  premises:
+  - The cow eats the dog.
+  - If something eats the dog then it sees the cow.
+  - If something sees the cow then it eats the mouse.
+  conclusion: The cow eats the mouse.
+  dsl: |-
+    {
+      "symbols": {
+        "sorts": [
+          "Thing"
+        ],
+        "predicates": {
+          "eats": "Thing,Thing->Bool",
+          "sees": "Thing,Thing->Bool"
+        },
+        "functions": {},
+        "constants": {
+          "cow": "Thing",
+          "dog": "Thing",
+          "mouse": "Thing"
+        }
+      },
+      "sentences": [
+        {
+          "nl": "The cow eats the dog.",
+          "logic": "eats(cow, dog)"
+        },
+        {
+          "nl": "If something eats the dog then it sees the cow.",
+          "logic": "forall x:Thing. implies(eats(x, dog), sees(x, cow))"
+        },
+        {
+          "nl": "If something sees the cow then it eats the mouse.",
+          "logic": "forall x:Thing. implies(sees(x, cow), eats(x, mouse))"
+        }
+      ],
+      "query": {
+        "nl": "The cow eats the mouse.",
+        "logic": "eats(cow, mouse)"
+      },
+      "background": []
+    }

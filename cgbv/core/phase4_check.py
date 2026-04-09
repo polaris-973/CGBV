@@ -6,6 +6,7 @@ from typing import Any
 
 import z3
 
+from cgbv.core.grounded_template_ir import evaluate_grounded_template_ir
 from cgbv.core.phase3_grounded import GroundedFormula
 from cgbv.solver.finite_evaluator import FiniteModelEvaluator
 from cgbv.solver.z3_solver import Z3Solver
@@ -177,9 +178,13 @@ def run_phase4(
             eval_error = f"FOL evaluation error: {e}"
             logger.warning("Phase 4 idx=%d: %s", idx, eval_error)
 
-        # --- Grounded side: propositional truth-table eval ---
+        # --- Grounded side: deterministic grounded-template eval ---
         if eval_error is None:
-            grounded_truth = solver.evaluate_grounded_formula(domain, grounded.formula_code)
+            if grounded.template_ir is not None:
+                grounded_truth = evaluate_grounded_template_ir(grounded.template_ir, domain)
+            else:
+                # Backward compatibility for historical Python-template records.
+                grounded_truth = solver.evaluate_grounded_formula(domain, grounded.formula_code)
             if grounded_truth is None:
                 eval_error = (
                     f"Grounded formula evaluation error for: {grounded.formula_code!r}"

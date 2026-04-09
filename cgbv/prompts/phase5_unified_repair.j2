@@ -1,144 +1,67 @@
-You are a formal logic repair assistant. {{ mismatches | length }} cross-granularity mismatch(es)
-detected between FOL formulas and their grounded interpretations on a boundary witness world.
+You are repairing cross-granularity mismatches in a JSON DSL theory.
 
-Fix ALL mismatched formulas simultaneously, ensuring mutual consistency.
-You may also output bridge axioms to connect structurally disconnected predicates.
+Output ONLY one JSON object with this shape:
 
----
+```json
+{
+  "repairs": [
+    {
+      "sentence_index": 0,
+      "logic": "forall x:Entity. implies(p(x), q(x))"
+    }
+  ],
+  "bridges": []
+}
+```
 
-## All Detected Mismatches
+## Current DSL
+
+```json
+{{ current_dsl }}
+```
+
+## Mismatches
 
 {% for m in mismatches %}
-### Mismatch {{ loop.index }}: Sentence {{ m.sentence_index }}
+### Sentence {{ m.sentence_index }}
 
-- **NL sentence:** "{{ m.nl_sentence }}"
-- **Current FOL formula:** `{{ m.fol_formula }}`
-- **Mismatch type:** {{ m.mismatch_type }}
-{% if m.mismatch_type == "strengthening" %}
-  → FOL is **too restrictive** (False in world, but NL holds True).
-    Look for: extra predicate, `And` → `Or`, predicate guard mismatch, spurious negation.
-{% elif m.mismatch_type == "weakening" %}
-  → FOL is **too permissive** (True in world, but NL does not hold).
-    Look for: missing predicate, inclusive `Or` where XOR is needed, missing negation.
-{% endif %}
-- **FOL truth:** {{ m.fol_truth }} | **Grounded truth:** {{ m.grounded_truth }}
-- **Correct grounded interpretation:** `{{ m.grounded_formula }}`
+- NL sentence: "{{ m.nl_sentence }}"
+- Current compiled formula: `{{ m.fol_formula }}`
+- Mismatch type: {{ m.mismatch_type }}
+- FOL truth: {{ m.fol_truth }} | Grounded truth: {{ m.grounded_truth }}
+- Grounded interpretation: `{{ m.grounded_formula }}`
 {% if m.witness_desc is defined and m.witness_desc %}
-
-**Witness world for this mismatch:**
-
+Witness:
 {{ m.witness_desc }}
 {% endif %}
 {% endfor %}
 
----
-
-## Original Phase 1 Code (Symbol Table)
-
-Use the exact predicate names, sort names, constant names, and bound variable names from this code.
-The `q = ...` line is the conclusion — do not alter it unless it is listed as a mismatch above.
-
-```python
-{{ original_code }}
-```
-
----
-
-{% if function_value_helpers %}
-## Available Value-Comparison Helpers
-
-For non-boolean functions, the following helpers are available. Each returns a Z3 boolean
-`f(entity) == value`:
-
-{% for helper_name, original_func, arity_desc in function_value_helpers %}
-- `{{ helper_name }}({{ arity_desc }})` — returns `{{ original_func }}({{ arity_desc.rsplit(', ', 1)[0] }}) == {{ arity_desc.rsplit(', ', 1)[1] }}`
-{% endfor %}
-
-Use these when the grounded formula compares function outputs to specific values.
-{% endif %}
-
 {% if witness_desc %}
-## Boundary Witness World
+## Shared Witness
 
 {{ witness_desc }}
-
----
 {% endif %}
 
-{% set ungrounded_predicates = gap_analysis.ungrounded_predicates | default([]) if gap_analysis else [] %}
-{% set obligation_hints = gap_analysis.obligation_hints | default([]) if gap_analysis else [] %}
-{% set missing_links = gap_analysis.missing_links | default([]) if gap_analysis else [] %}
-{% if ungrounded_predicates or obligation_hints or missing_links %}
-## Obligation Analysis
+{% if gap_analysis %}
+## Gap Hints
 
-{% if ungrounded_predicates %}
-The following predicates appear in rule antecedents but have no grounding facts and are not
-derivable from other rules:
-{% for p in ungrounded_predicates | sort %}
-- `{{ p }}`
+{% for p in gap_analysis.ungrounded_predicates | default([]) %}
+- Ungrounded predicate: `{{ p }}`
+{% endfor %}
+{% for hint in gap_analysis.obligation_hints | default([]) %}
+- Obligation hint: {{ hint }}
 {% endfor %}
 {% endif %}
 
-{% if obligation_hints %}
-Current unresolved obligations in the query-relevant slice:
-{% for hint in obligation_hints %}
-- {{ hint }}
-{% endfor %}
-{% endif %}
+## Repair Rules
 
-{% if missing_links %}
-These predicate pairs are only diagnostic hints about where the missing proof step may lie.
-Do not treat them as mandatory bridge directions; verify NL support before bridging:
-{% for src, tgt in missing_links %}
-- `{{ src }}` → `{{ tgt }}`
-{% endfor %}
-
-If a mismatch cannot be fixed by editing the formula alone, you may output a **bridge axiom**
-using the `[BRIDGE]` prefix.
-
-**Bridge axiom rules:**
-- Only output a bridge if the NL text explicitly states or implies the relationship. Do NOT
-  invent relationships without textual support.
-- The axiom MUST be universally quantified (`ForAll`/`Exists` form), not a ground fact.
-- Use ONLY identifiers already declared in the original code. Do NOT introduce new names.
-{% endif %}
-{% endif %}
-
-{% if world_assumption == "cwa" %}
-## CWA Repair Guidance
-
-Under the Closed-World Assumption, fix mismatches by modifying the **logical structure** of
-existing formulas (do NOT introduce new axioms unless using the `[BRIDGE]` mechanism).
-{% endif %}
-
----
-
-## Repair Instructions
-
-1. For EACH mismatch, output a repaired Z3-Python expression.
-2. Use ONLY predicate, sort, constant, and variable names from the original code, plus any
-   value-comparison helpers listed above.
-3. Repairs must be **mutually consistent** — fixing one formula must not contradict another.
-4. Make **minimal edits**: preserve the NL sentence's full meaning without dropping information.
-5. Each repaired formula must evaluate to its expected `grounded_truth` on the witness world.
-6. Map the grounded formula structure back to FOL:
-   `all(...)` → `ForAll`; `any(...)` → `Exists`; ground atom conjunction → `And(...)`.
-7. Output **exactly one** repaired expression per sentence index. Do NOT split a single sentence
-   into multiple `[N]` lines — keep it as one formula (use `And(...)` for conjunctions).
-8. Do NOT use entity equality (`==`) to assert type membership. Use type predicates only (RULE 12).
-   `X == entity` is only correct for explicit identity statements.
-{% if missing_links %}
-9. If a mismatch requires a new linking rule between predicates (not just formula editing), output
-   it as a `[BRIDGE]` line. Bridge axioms must be `ForAll`-quantified.
-{% endif %}
-
----
-
-## Output Format
-
-Output ONLY the repaired expressions, one per line, prefixed with the sentence index in brackets:
-
-```
-{% for m in mismatches %}[{{ m.sentence_index }}] repaired_expression
-{% endfor %}{% if missing_links %}[BRIDGE] ForAll([x], Implies(pred_a(x), pred_b(x)))
-{% endif %}```
+1. Each repair may only replace the `logic` of the same `sentence_index`.
+2. Do not change any sentence/query `nl` text or the top-level symbol table.
+3. Use `bridges` only for additional quantified rules supported by the NL.
+4. If a sentence does not need a repair, omit it from `repairs`.
+5. Preferred output is compact logic strings: `p(x)`, `f(x)==y`, `x!=y`, `and(...)`, `or(...)`, `not(...)`, `implies(a,b)`, `iff(a,b)`, `forall x:S. body`, `exists x:S. body`, `eq(a,b)`, `ne(a,b)`.
+6. `logic` and each `bridges` entry may be either a compact logic string or a JSON logic object.
+7. Do not output legacy wrapper fields like `kind`, `constraint`, `forall`, `exists`, `role`.
+8. Never use assignment-style `"x = y"`; use `"x == y"`.
+9. Function terms are allowed inside atoms when needed.
+10. Never use literal boolean atoms like `"true"` or `"false"`.

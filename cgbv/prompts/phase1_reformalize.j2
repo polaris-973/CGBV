@@ -1,110 +1,49 @@
-You are a formal logic repair assistant. A cross-granularity mismatch was detected on one
-or more sentences, and local formula repair (Phase 5) failed to fix it.
+You are a formal logic repair assistant.
+Cross-granularity verification found structural errors that local repair could not fix.
 
-Rewrite the Z3-Python code for the **entire theory** with all errors corrected.
-Output ONLY the corrected Python code.
+Rewrite the COMPLETE JSON DSL theory.
+Do NOT output Python.
+Output ONLY valid JSON.
 
----
+## Current DSL
 
-## Original Z3-Python Code
-
-```python
-{{ original_code }}
+```json
+{{ original_dsl }}
 ```
-
----
 
 ## Mismatch Diagnostics
 
 {% for m in failed_mismatches %}
-### Sentence [{{ m.sentence_index }}]: "{{ m.nl_sentence }}"
+### Sentence {{ m.sentence_index }}
 
-{% if m.fol_truth is not none and m.grounded_truth is not none %}
-- **Error type**: {{ m.mismatch_type }} (FOL evaluates to {{ m.fol_truth }}, grounded NL evaluates to {{ m.grounded_truth }} on the boundary witness)
-{% else %}
-- **Error type**: {{ m.mismatch_type }}
+- NL sentence: "{{ m.nl_sentence }}"
+- Mismatch type: {{ m.mismatch_type }}
+{% if m.current_logic %}
+- Current logic:
+```json
+{{ m.current_logic_json }}
+```
 {% endif %}
-- **Current FOL formula**: `{{ m.fol_formula }}`
-{% if m.grounded_formula %}
-- **Grounded NL formula**: `{{ m.grounded_formula }}`
+{% if m.drift_reason %}
+- Audit / drift reason: {{ m.drift_reason }}
 {% endif %}
 {% if m.repair_error %}
-- **Why local repair failed**: {{ m.repair_error }}
+- Why local repair failed: {{ m.repair_error }}
 {% endif %}
 {% endfor %}
 
----
+## Rewrite Rules
 
-## Formalization Rules
-
-Apply these rules to the **entire** rewritten theory, not just the mismatched sentences.
-
-RULE 1  — Every domain entity MUST be a named `Const`. Never rely on unnamed sort elements;
-          Z3 would assign internal names like `Sort!val!0` that downstream code cannot reference.
-
-RULE 2  — `ForAll`/`Exists` quantifier list must be non-empty. `ForAll([], expr)` is a runtime error.
-
-RULE 3  — Bound variable must be a separate `Const` from all entity constants. Declare
-          `x = Const('x', Sort)` and use it exclusively inside `ForAll`/`Exists`; never reuse
-          an entity constant as the bound variable.
-
-RULE 4  — Universal claims → `ForAll`; existential → `Exists`; "No X is Y" →
-          `ForAll([v], Not(And(is_X(v), is_Y(v))))`. Conditional "if…then" → `Implies`.
-          Bare generic plurals: a bare plural subject without a determiner ("Vacuums suck",
-          "Dogs bark") expresses a universal claim — NOT a fact about a singleton entity.
-          → `ForAll([v], Implies(is_vacuum(v), sucks(v)))`   ✓
-          → `sucks(Vacuums)`   ← singleton entity mistake   ✗
-
-RULE 5  — No solver calls, no print statements, no assertions. Only declarations and assignments.
-          Do NOT write `Solver()`, `s.check()`, `print(...)`, or `assert`.
-
-RULE 6  — Only `DeclareSort` is allowed. Never use `IntSort()`, `StringSort()`, `RealSort()`,
-          or `SeqSort()`. Years, counts, and string-valued facts must be modelled as named `Const`
-          of a declared sort.
-
-RULE 7  — One NL property = one predicate. Each independently assertable property must be its own
-          predicate. Never compress "private Ivy League research university" into one opaque name —
-          declare `is_private`, `is_ivy_league`, `is_research` separately.
-
-RULE 8  — Every identifier used in `premises` or `q` must exactly match a previously declared name.
-          Verify every identifier before finishing.
-
-RULE 9  — `premises` must align one-to-one with the numbered NL premises: N premises in → exactly
-          N top-level formulas in `premises[]`, in the same order. Do not omit, merge, or split.
-
-RULE 10 — Uninterpreted comparison predicates (`more_than`, `equal_to`, `no_more_than`, etc.)
-          require mathematical axioms (asymmetry, transitivity) added as `background_constraints`.
-          Omit `background_constraints` entirely if no comparison predicates are used.
-
-RULE 11 — Synonymous NL phrases must map to the SAME predicate name throughout. Different surface
-          forms describing the same action or relation share one predicate. Splitting synonyms
-          silently breaks inference chains.
-
-RULE 12 — "X is a [noun/type]" means a TYPE predicate, never entity equality. Translate "X is a
-          conductor" as `is_conductor(X)`, never as `X == conductor_entity`. Entity equality (`==`)
-          is only correct for explicit identity statements like "X and Y are the same individual."
-
-RULE 13 — De Morgan negation scope: "neither A nor B" / "not A or B" with a SINGLE scoped
-          negation over a disjunction means And(Not(A), Not(B)), NOT Or(Not(A), Not(B)).
-
-          - "X is neither a cat nor a dog"  → And(Not(is_cat(X)), Not(is_dog(X)))   ← De Morgan
-          - "X is not a cat, or not a dog"  → Or(Not(is_cat(X)), Not(is_dog(X)))    ← two separate negations
-
-          Test: is there ONE "not" scoping over "A or B"?
-            Yes → And(Not(A), Not(B)).
-            No, each clause carries its own negation → Or(Not(A), Not(B)).
-
----
-
-## Instructions
-
-1. Re-read the original NL sentence for each mismatch and compare it with its current FOL formula.
-2. The mismatch diagnostic above shows exactly what went wrong: the FOL formula behaves differently
-   from the NL on a concrete witness world.
-3. Rewrite the ENTIRE Z3-Python code with all corrections applied. You may restructure mismatched
-   formulas, add missing predicates or constants, or add helper axioms.
-4. Keep all other premises and the conclusion UNCHANGED unless they are listed above.
-5. The output must follow the standard structure: `from z3 import *`, sort declarations, entity
-   constants, predicates, bound variables, `premises = [...]`, `q = ...`.
-6. Output ONLY the Python code — no markdown fences, no explanations, no prose.
-7. VOCABULARY SCAN: before outputting, scan all predicate names across all premises. If two predicates describe the same NL action/property used in different premises, unify to one name. (RULE 11)
+1. Preserve the same top-level fields and output the full theory.
+2. Keep every premise sentence's `nl` unchanged and keep premise order unchanged.
+3. Keep the query `nl` unchanged.
+4. Fix the logical structure by editing `logic`, `symbols`, and `background` only where needed.
+5. Use compact DSL top-level fields: `symbols`, `sentences`, `query`, `background`.
+6. Each sentence/query/background `logic` must be a compact logic string (not nested AST JSON).
+7. Allowed syntax: `p(x)`, `f(x)==y`, `x!=y`, `and(...)`, `or(...)`, `not(...)`, `implies(a,b)`, `iff(a,b)`, `forall x:S. body`, `exists x:S. body`, `eq(a,b)`, `ne(a,b)`.
+8. Default to one object-domain sort `Entity`; represent type/category via unary predicates.
+9. Use numeric literals only for numeric sorts (`Int`/`Real`/`BitVec`); otherwise use named constants.
+10. Use identifier-safe symbol names only (`[A-Za-z_][A-Za-z0-9_]*`).
+11. Do not output `sentence_index`, `role`, `kind`, `constraint`, `forall`, or `exists` wrapper fields.
+12. Do not use raw boolean atoms like `"true"` or `"false"`.
+13. Do not use assignment-style atoms like `"x = y"`; use `"x == y"`.

@@ -7,7 +7,7 @@ dataset:
   split: validation
   path: ./datasets
   # limit: 100
-  sample_index_range: [1, 50]   # 1-based inclusive range on dataset order
+  sample_index_range: [21, 100]   # 1-based inclusive range on dataset order
   # sample_index_range: [51, 100]
   # sample_index_range: full      # or just omit this field for a full run
 

@@ -287,7 +287,6 @@ def compute_metrics(
     phase3_errors_detected = 0    # structural Phase 3 grounding errors detected
     phase3_reground_success = 0   # Phase 3 errors resolved via targeted re-grounding
     underformalized = 0
-    semantic_unstable = 0
     verified_uncertain = 0
     verified_uncertain_correct = 0
     obligation_resolution_eligible = 0
@@ -332,8 +331,6 @@ def compute_metrics(
         diagnostic_tags = set(r.get("diagnostic_tags", []))
         if "underformalized" in diagnostic_tags:
             underformalized += 1
-        if "semantic_unstable" in diagnostic_tags or r.get("verification_status") == "semantic_unstable":
-            semantic_unstable += 1
         init_ob = int(r.get("initial_obligation_count", 0) or 0)
         final_ob = int(r.get("final_obligation_count", 0) or 0)
         if init_ob > 0:
@@ -458,7 +455,6 @@ def compute_metrics(
         "phase3_reground_rate": safe_div(phase3_reground_success, phase3_errors_detected),
         # Acceptance / adequacy diagnostics
         "underformalized_rate": safe_div(underformalized, successful),
-        "semantic_instability_rate": safe_div(semantic_unstable, successful),
         "phase1_repeat_failure_rate": safe_div(repeated_phase1_failures, total),
         "obligation_resolution_rate": safe_div(
             obligation_resolution_success, obligation_resolution_eligible
@@ -493,7 +489,6 @@ def compute_metrics(
             "phase3_errors_detected": phase3_errors_detected,
             "phase3_reground_success": phase3_reground_success,
             "underformalized": underformalized,
-            "semantic_unstable": semantic_unstable,
             "repeated_phase1_failures": repeated_phase1_failures,
             "obligation_resolution_eligible": obligation_resolution_eligible,
             "obligation_resolution_success": obligation_resolution_success,
@@ -550,7 +545,6 @@ def _empty_metrics() -> dict:
         "cgbv_repair_recovery_rate": 0.0,
         "phase3_reground_rate": 0.0,
         "underformalized_rate": 0.0,
-        "semantic_instability_rate": 0.0,
         "phase1_repeat_failure_rate": 0.0,
         "obligation_resolution_rate": 0.0,
         "verification_confidence": {"high": 0, "medium": 0, "low": 0, "none": 0},

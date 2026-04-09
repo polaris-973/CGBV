@@ -10,11 +10,12 @@ import cgbv.logging as cgbv_log
 import z3 as _z3_module  # for premise consistency SAT check (Fix C)
 from cgbv.config.settings import ExperimentConfig
 from cgbv.core.gap_analysis import compute_gap_analysis
+from cgbv.core.grounded_template_ir import evaluate_grounded_template_ir
+from cgbv.core.logic_compiler import canonicalize_logic_obj, canonicalize_theory_payload, compile_theory_dsl
 from cgbv.core.multi_witness import MultiWitnessResult, WitnessCheckResult, run_multi_witness
 from cgbv.core.phase2_witness import Phase2Result
 from cgbv.core.phase1_formalize import Phase1Result, run_phase1, run_phase1_targeted
 from cgbv.core.phase3_grounded import GroundedFormula, Phase3Result, retemplate_with_hint
-from cgbv.core.semantic_stability import SemanticAuditResult, audit_semantic_stability
 from cgbv.solver.model_extractor import format_domain_schema
 from cgbv.solver.code_executor import configure_max_workers
 from cgbv.core.phase4_check import Mismatch, Phase4Result, run_phase4
@@ -98,8 +99,6 @@ class PipelineResult:
     #   "verified"         — all witnesses clean, no mismatches, no carried issues
     #   "exhausted_rounds" — mismatches remained after R_max repair rounds
     #   "witness_failed"   — Phase 2 witness construction failed in the final round
-    #   "semantic_unstable" — witness bank is clean but independent locked-symbol audit
-    #                         still disagrees on a query-relevant formula
     #   "not_run"          — verification never started (execution failed before it)
     execution_status: str = "success"
     verification_status: str = "not_run"
@@ -261,7 +260,7 @@ class CGBVPipeline:
         history_witness_bank: list[Phase2Result] = []
 
         # Revert counter: tracks how many times Phase 5 repairs for a sentence
-        # have been reverted by the semantic audit. Used by the pre-Phase5
+        # have been reverted by post-commit validation. Used by the pre-Phase5
         # re-grounding gate (§5) to redirect to template re-generation.
         revert_counts: dict[int, int] = {}
 
@@ -294,6 +293,8 @@ class CGBVPipeline:
                 solver=self.solver,
                 llm=self.llm,
                 prompt_engine=self.prompt_engine,
+                dsl_payload=p1.dsl_payload,
+                symbol_table=p1.symbol_table,
                 background_constraints=background_constraints,
                 bound_var_names=bound_var_names,
                 num_witnesses=effective_k,
@@ -428,58 +429,6 @@ class CGBVPipeline:
                     else None
                 )
                 if gap is None or not gap.missing_links:
-                    action, semantic_audit, p1_new = await self._try_verify_via_audit(
-                        sentences=sentences, premises=premises, q=q,
-                        namespace=namespace, raw_code=p1.raw_code,
-                        witness_results=history_witness_results,
-                        sample=sample, round_num=round_num, out_dir=out_dir,
-                    )
-                    if action == "failed":
-                        rounds.append(round_record)
-                        final_gap = compute_gap_analysis(premises, q, [], background_constraints)
-                        result = PipelineResult(
-                            sample_id=sample.id,
-                            dataset=sample.dataset,
-                            label=sample.label,
-                            verdict=verdict,
-                            verdict_pre_bridge=verdict_pre_bridge,
-                            verdict_post_bridge=verdict_post_bridge,
-                            verified=False,
-                            num_rounds=round_num,
-                            rounds=rounds,
-                            phase1_raw_code=p1.raw_code,
-                            phase1_repeated_failure=p1.repeated_failure,
-                            acceptance_state="needs_repair",
-                            diagnostic_tags=["semantic_unstable"],
-                            semantic_stable=False,
-                            initial_obligation_count=initial_obligation_count,
-                            final_obligation_count=final_gap.obligation_count,
-                            execution_status="success",
-                            verification_status="semantic_unstable",
-                            verification_confidence="low",
-                            error="Semantic stability audit rejected an otherwise clean witness bank.",
-                        )
-                        self._write_json(out_dir / "result.json", asdict(result))
-                        return result
-
-                    if action == "reformalized":
-                        premises = list(p1_new.premises)
-                        q = p1_new.q
-                        background_constraints = list(p1_new.background_constraints)
-                        bound_var_names = p1_new.bound_var_names
-                        namespace = p1_new.namespace
-                        verdict = p1_new.verdict
-                        model_info = p1_new.model_info
-                        model_info_q = p1_new.model_info_q
-                        p1 = p1_new
-                        template_cache = None  # theory rewrite → invalidate all templates
-                        revert_counts.clear()  # stale revert history invalid after rewrite
-                        history_witness_bank.clear()
-                        round_record.verdict_after = verdict
-                        rounds.append(round_record)
-                        continue
-
-                    # action == "verified"
                     final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
@@ -513,6 +462,7 @@ class CGBVPipeline:
                         premises=premises,
                         q=q,
                         raw_code=p1.raw_code,
+                        dsl_payload=p1.dsl_payload,
                         gap=gap,
                         sample=sample,
                         round_num=round_num,
@@ -555,6 +505,8 @@ class CGBVPipeline:
                     premises=premises,
                     q=q,
                     namespace=namespace,
+                    dsl_payload=p1.dsl_payload,
+                    symbol_table=p1.symbol_table,
                     raw_code=p1.raw_code,
                     domain=first_witness_domain,
                     llm=self.llm,
@@ -634,20 +586,32 @@ class CGBVPipeline:
                             round_record.verdict_after = new_verdict
                             round_record.repair_success = True
 
-                            bridge_notes = [
-                                f"# Gap bridge axiom: {str(b)}"
-                                for b in accepted_gap_bridges
-                            ]
-                            updated_code = (
-                                p1.raw_code.rstrip()
-                                + "\n\n# ---- Gap analysis bridges (round "
-                                + str(round_num) + ") ----\n"
-                                + "\n".join(bridge_notes)
+                            accepted_gap_bridge_logic = _select_accepted_bridge_logic_payloads(
+                                p5_gap.bridge_axioms,
+                                p5_gap.bridge_logic_payloads,
+                                accepted_gap_bridges,
                             )
+                            updated_dsl = _append_bridge_logic_to_dsl(
+                                p1.dsl_payload,
+                                accepted_gap_bridge_logic,
+                            )
+                            updated_code = p1.raw_code
+                            try:
+                                updated_code = compile_theory_dsl(
+                                    updated_dsl,
+                                    sample.premises,
+                                    sample.conclusion,
+                                ).raw_code
+                            except Exception as exc:
+                                logger.warning(
+                                    "Pipeline sample=%s round=%d: failed to re-render DSL after gap bridge commit: %s",
+                                    sample.id, round_num, exc,
+                                )
                             p1 = _patched_p1(
                                 p1, premises, q, new_verdict, new_model_info,
                                 new_model_info_q, raw_code=updated_code,
                                 background_constraints=list(background_constraints),
+                                dsl_payload=updated_dsl,
                             )
                             logger.info(
                                 "Pipeline sample=%s round=%d: %d gap bridge(s) "
@@ -742,18 +706,20 @@ class CGBVPipeline:
                         max_retries=self.config.pipeline.grounding_retries,
                         world_assumption=self.config.pipeline.world_assumption,
                         solver=self.solver,
+                        sentence_logic=_logic_for_phase3(p1.dsl_payload, m.sentence_index),
+                        symbol_context=_phase3_symbol_context(p1.dsl_payload, p1.symbol_table),
                     )
                     resolved = False
-                    if not new_tmpl.failed:
-                        new_truth = self.solver.evaluate_grounded_formula(
-                            witness_domain, new_tmpl.template_code
+                    if not new_tmpl.failed and new_tmpl.template_ir is not None:
+                        new_truth = evaluate_grounded_template_ir(
+                            new_tmpl.template_ir, witness_domain
                         )
                         if new_truth == expected_truth:
                             logger.info(
                                 "Pipeline sample=%s round=%d: re-templating resolved "
                                 "sentence %d (%s→%s)",
                                 sample.id, round_num, m.sentence_index,
-                                m.grounded_formula[:40], new_tmpl.template_code[:40],
+                                m.grounded_formula[:40], new_tmpl.debug_render[:40],
                             )
                             resolved = True
                             # Update template cache with corrected template
@@ -763,7 +729,7 @@ class CGBVPipeline:
                         "sentence_index": m.sentence_index,
                         "witness_side": m.witness_side,
                         "old_formula": m.grounded_formula,
-                        "new_formula": new_tmpl.template_code if not new_tmpl.failed else "",
+                        "new_formula": new_tmpl.debug_render if not new_tmpl.failed else "",
                         "resolved": resolved,
                         "error": new_tmpl.error if new_tmpl.failed else None,
                     })
@@ -812,6 +778,7 @@ class CGBVPipeline:
                     )
                     p1_targeted = await run_phase1_targeted(
                         original_code=p1.raw_code,
+                        original_dsl_payload=p1.dsl_payload,
                         failed_repairs=[(m0, q_hint)],
                         premises_nl=sample.premises,
                         conclusion_nl=sample.conclusion,
@@ -884,58 +851,6 @@ class CGBVPipeline:
                         m for m in round_record.mismatches
                         if not m.get("is_phase3_error", False)
                     ]
-                    action, semantic_audit, p1_new = await self._try_verify_via_audit(
-                        sentences=sentences, premises=premises, q=q,
-                        namespace=namespace, raw_code=p1.raw_code,
-                        witness_results=history_witness_results,
-                        sample=sample, round_num=round_num, out_dir=out_dir,
-                    )
-                    if action == "failed":
-                        rounds.append(round_record)
-                        final_gap = compute_gap_analysis(premises, q, [], background_constraints)
-                        result = PipelineResult(
-                            sample_id=sample.id,
-                            dataset=sample.dataset,
-                            label=sample.label,
-                            verdict=verdict,
-                            verdict_pre_bridge=verdict_pre_bridge,
-                            verdict_post_bridge=verdict_post_bridge,
-                            verified=False,
-                            num_rounds=round_num,
-                            rounds=rounds,
-                            phase1_raw_code=p1.raw_code,
-                            phase1_repeated_failure=p1.repeated_failure,
-                            acceptance_state="needs_repair",
-                            diagnostic_tags=["semantic_unstable"],
-                            semantic_stable=False,
-                            initial_obligation_count=initial_obligation_count,
-                            final_obligation_count=final_gap.obligation_count,
-                            execution_status="success",
-                            verification_status="semantic_unstable",
-                            verification_confidence="low",
-                            error="Semantic stability audit rejected an otherwise clean witness bank.",
-                        )
-                        self._write_json(out_dir / "result.json", asdict(result))
-                        return result
-
-                    if action == "reformalized":
-                        premises = list(p1_new.premises)
-                        q = p1_new.q
-                        background_constraints = list(p1_new.background_constraints)
-                        bound_var_names = p1_new.bound_var_names
-                        namespace = p1_new.namespace
-                        verdict = p1_new.verdict
-                        model_info = p1_new.model_info
-                        model_info_q = p1_new.model_info_q
-                        p1 = p1_new
-                        template_cache = None  # theory rewrite → invalidate all templates
-                        revert_counts.clear()  # stale revert history invalid after rewrite
-                        history_witness_bank.clear()
-                        round_record.verdict_after = verdict
-                        rounds.append(round_record)
-                        continue
-
-                    # action == "verified"
                     final_gap = compute_gap_analysis(premises, q, [], background_constraints)
                     rounds.append(round_record)
                     result = PipelineResult(
@@ -973,6 +888,7 @@ class CGBVPipeline:
                             premises=premises,
                             q=q,
                             raw_code=p1.raw_code,
+                            dsl_payload=p1.dsl_payload,
                             gap=gap_post,
                             sample=sample,
                             round_num=round_num,
@@ -1019,6 +935,8 @@ class CGBVPipeline:
                         premises=premises,
                         q=q,
                         namespace=namespace,
+                        dsl_payload=p1.dsl_payload,
+                        symbol_table=p1.symbol_table,
                         raw_code=p1.raw_code,
                         domain=first_witness_domain,
                         llm=self.llm,
@@ -1093,20 +1011,32 @@ class CGBVPipeline:
                                 round_record.verdict_after = new_verdict
                                 round_record.repair_success = True
 
-                                bridge_notes = [
-                                    f"# Gap bridge axiom (post-Phase4): {str(b)}"
-                                    for b in accepted_gap2_bridges
-                                ]
-                                updated_code = (
-                                    p1.raw_code.rstrip()
-                                    + "\n\n# ---- Gap analysis bridges (round "
-                                    + str(round_num) + ") ----\n"
-                                    + "\n".join(bridge_notes)
+                                accepted_gap2_bridge_logic = _select_accepted_bridge_logic_payloads(
+                                    p5_gap2.bridge_axioms,
+                                    p5_gap2.bridge_logic_payloads,
+                                    accepted_gap2_bridges,
                                 )
+                                updated_dsl = _append_bridge_logic_to_dsl(
+                                    p1.dsl_payload,
+                                    accepted_gap2_bridge_logic,
+                                )
+                                updated_code = p1.raw_code
+                                try:
+                                    updated_code = compile_theory_dsl(
+                                        updated_dsl,
+                                        sample.premises,
+                                        sample.conclusion,
+                                    ).raw_code
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Pipeline sample=%s round=%d: failed to re-render DSL after post-Phase4 gap bridge commit: %s",
+                                        sample.id, round_num, exc,
+                                    )
                                 p1 = _patched_p1(
                                     p1, premises, q, new_verdict, new_model_info,
                                     new_model_info_q, raw_code=updated_code,
                                     background_constraints=list(background_constraints),
+                                    dsl_payload=updated_dsl,
                                 )
                                 logger.info(
                                     "Pipeline sample=%s round=%d: %d post-Phase4 gap "
@@ -1135,7 +1065,7 @@ class CGBVPipeline:
             if actionable_mismatches:
                 # -----------------------------------------------------------
                 # Pre-Phase5 re-grounding gate (§5 dead-loop breaker)
-                # For mismatches that were previously reverted by semantic audit,
+                # For mismatches that were previously reverted by post-commit validation,
                 # try re-generating the template BEFORE sending to Phase 5.
                 # If the template was wrong (not the FOL), fixing it here avoids
                 # the Phase5→audit-revert→loop cycle.
@@ -1165,7 +1095,7 @@ class CGBVPipeline:
                         hint = (
                             f"Your previous template `{m.grounded_formula}` led to a "
                             f"mismatch that was repaired at the FOL level but reverted "
-                            f"by semantic audit ({revert_counts[m.sentence_index]} time(s)). "
+                            f"by post-commit validation ({revert_counts[m.sentence_index]} time(s)). "
                             f"This suggests the TEMPLATE is wrong, not the FOL. "
                             f"Re-examine the logical structure of the sentence."
                         )
@@ -1182,10 +1112,12 @@ class CGBVPipeline:
                             max_retries=self.config.pipeline.grounding_retries,
                             world_assumption=self.config.pipeline.world_assumption,
                             solver=self.solver,
+                            sentence_logic=_logic_for_phase3(p1.dsl_payload, m.sentence_index),
+                            symbol_context=_phase3_symbol_context(p1.dsl_payload, p1.symbol_table),
                         )
-                        if not new_tmpl.failed:
-                            new_truth = self.solver.evaluate_grounded_formula(
-                                w_domain, new_tmpl.template_code
+                        if not new_tmpl.failed and new_tmpl.template_ir is not None:
+                            new_truth = evaluate_grounded_template_ir(
+                                new_tmpl.template_ir, w_domain
                             )
                             if new_truth == expected_truth:
                                 logger.info(
@@ -1220,6 +1152,8 @@ class CGBVPipeline:
                     premises=premises,
                     q=q,
                     namespace=namespace,
+                    dsl_payload=p1.dsl_payload,
+                    symbol_table=p1.symbol_table,
                     raw_code=p1.raw_code,
                     domain=first_witness_domain,      # fallback domain for prompt
                     llm=self.llm,
@@ -1290,6 +1224,7 @@ class CGBVPipeline:
                         )
                         p1_new = await run_phase1_targeted(
                             original_code=p1.raw_code,
+                            original_dsl_payload=p1.dsl_payload,
                             failed_repairs=[
                                 (
                                     Mismatch(
@@ -1466,14 +1401,16 @@ class CGBVPipeline:
                                         cached_tmpl = template_cache[idx]
                                         if cached_tmpl.failed:
                                             continue
+                                        if cached_tmpl.template_ir is None:
+                                            continue
                                         for wr in tentative_history:
                                             if wr.phase2.model is None or wr.phase2.domain is None:
                                                 continue
                                             fol_val = _finite_evaluator.evaluate(
                                                 wr.phase2.model, all_new[idx], namespace=namespace,
                                             )
-                                            tmpl_val = self.solver.evaluate_grounded_formula(
-                                                wr.phase2.domain, cached_tmpl.template_code,
+                                            tmpl_val = evaluate_grounded_template_ir(
+                                                cached_tmpl.template_ir, wr.phase2.domain,
                                             )
                                             if fol_val is not None and tmpl_val is not None and fol_val != tmpl_val:
                                                 reject_reason = (
@@ -1492,27 +1429,11 @@ class CGBVPipeline:
                                         },
                                     )
                                 else:
-                                    # No template cache (first round) → fall back to LLM audit
-                                    semantic_audit = await audit_semantic_stability(
-                                        sentences=sentences,
-                                        premises=premises,
-                                        q=q,
-                                        namespace=namespace,
-                                        raw_code=p1.raw_code,
-                                        witness_results=tentative_history,
-                                        llm=self.llm,
-                                        prompt_engine=self.prompt_engine,
-                                        indices=changed_indices,
-                                    )
-                                    self._write_json(
-                                        out_dir / f"round{round_num}_semantic_audit.json",
-                                        _semantic_audit_to_dict(semantic_audit),
-                                    )
-                                    if not semantic_audit.stable:
-                                        reject_reason = (
-                                            "semantic stability audit rejected the candidate patch "
-                                            f"({len(semantic_audit.issues)} issue(s))"
-                                        )
+                                    # No template cache available yet (typically first round),
+                                    # so there is no deterministic grounded comparator to use
+                                    # here. Accept and let the next round's witness bank catch
+                                    # any cross-granularity mismatch.
+                                    pass
 
                     if reject_reason is not None:
                         logger.warning(
@@ -1541,35 +1462,30 @@ class CGBVPipeline:
                         model_info = new_model_info
                         model_info_q = new_model_info_q
                         _committed_bridges = accepted_bridges
-                        # Append Phase 5 repair notes to raw_code so subsequent
-                        # repair prompts reflect the current formula state.
-                        repair_notes_p5 = []
-                        all_old = list(old_premises) + [old_q]
-                        all_new = list(premises) + [q]
-                        n_prem = len(old_premises)
-                        for i, (old_f, new_f) in enumerate(zip(all_old, all_new)):
-                            if str(new_f) != str(old_f):
-                                label = "q" if i == n_prem else f"premises[{i}]"
-                                repair_notes_p5.append(
-                                    f"# Phase 5 repair: {label} = {str(new_f)}"
-                                )
-                        # Only annotate bridges that were actually accepted
-                        for bridge in accepted_bridges:
-                            repair_notes_p5.append(
-                                f"# Phase 5 bridge axiom: {str(bridge)}"
-                            )
+                        updated_dsl = _apply_phase5_repairs_to_dsl(p1.dsl_payload, p5.repairs)
+                        accepted_bridge_logic = _select_accepted_bridge_logic_payloads(
+                            p5.bridge_axioms,
+                            p5.bridge_logic_payloads,
+                            accepted_bridges,
+                        )
+                        updated_dsl = _append_bridge_logic_to_dsl(updated_dsl, accepted_bridge_logic)
                         updated_code = p1.raw_code
-                        if repair_notes_p5:
-                            updated_code = (
-                                p1.raw_code.rstrip()
-                                + "\n\n# ---- Phase 5 repairs (round "
-                                + str(round_num) + ") ----\n"
-                                + "\n".join(repair_notes_p5)
+                        try:
+                            updated_code = compile_theory_dsl(
+                                updated_dsl,
+                                sample.premises,
+                                sample.conclusion,
+                            ).raw_code
+                        except Exception as exc:
+                            logger.warning(
+                                "Pipeline sample=%s round=%d: failed to re-render DSL after Phase 5 commit: %s",
+                                sample.id, round_num, exc,
                             )
                         p1 = _patched_p1(
                             p1, premises, q, new_verdict, new_model_info, new_model_info_q,
                             raw_code=updated_code,
                             background_constraints=list(background_constraints),
+                            dsl_payload=updated_dsl,
                         )
                         logger.info(
                             "Pipeline sample=%s round=%d: repair committed "
@@ -1612,16 +1528,27 @@ class CGBVPipeline:
                             )
                         else:
                             background_constraints.extend(accepted_bridges_bo)
-                            bridge_notes = [
-                                f"# Phase 5 bridge axiom: {str(b)}"
-                                for b in accepted_bridges_bo
-                            ]
-                            updated_code = (
-                                p1.raw_code.rstrip()
-                                + "\n\n# ---- Phase 5 bridges (round "
-                                + str(round_num) + ") ----\n"
-                                + "\n".join(bridge_notes)
+                            accepted_bridge_logic_bo = _select_accepted_bridge_logic_payloads(
+                                p5.bridge_axioms,
+                                p5.bridge_logic_payloads,
+                                accepted_bridges_bo,
                             )
+                            updated_dsl = _append_bridge_logic_to_dsl(
+                                p1.dsl_payload,
+                                accepted_bridge_logic_bo,
+                            )
+                            updated_code = p1.raw_code
+                            try:
+                                updated_code = compile_theory_dsl(
+                                    updated_dsl,
+                                    sample.premises,
+                                    sample.conclusion,
+                                ).raw_code
+                            except Exception as exc:
+                                logger.warning(
+                                    "Pipeline sample=%s round=%d: failed to re-render DSL after bridge-only commit: %s",
+                                    sample.id, round_num, exc,
+                                )
                             # Re-solve with accepted bridges so verdict/model_info
                             # are fresh for the next round's witness construction.
                             solver_premises = list(premises) + background_constraints
@@ -1691,6 +1618,7 @@ class CGBVPipeline:
                                     p1, premises, q, new_verdict, new_model_info,
                                     new_model_info_q, raw_code=updated_code,
                                     background_constraints=list(background_constraints),
+                                    dsl_payload=updated_dsl,
                                 )
                                 logger.info(
                                     "Pipeline sample=%s round=%d: %d/%d bridge(s) "
@@ -1722,6 +1650,7 @@ class CGBVPipeline:
                     cgbv_log.update_phase("phase1", f"re-formalize round {round_num}")
                     p1_new = await run_phase1_targeted(
                         original_code=p1.raw_code,
+                        original_dsl_payload=p1.dsl_payload,
                         failed_repairs=failed_repairs,
                         premises_nl=sample.premises,
                         conclusion_nl=sample.conclusion,
@@ -1862,74 +1791,6 @@ class CGBVPipeline:
         )
         return result
 
-    async def _try_verify_via_audit(
-        self,
-        sentences: list[str],
-        premises: list,
-        q: object,
-        namespace: dict,
-        raw_code: str,
-        witness_results: list,
-        sample: DataSample,
-        round_num: int,
-        out_dir: Path,
-    ) -> tuple[str, SemanticAuditResult, Phase1Result | None]:
-        """Run semantic audit and, if unstable, attempt targeted re-formalization.
-
-        Returns:
-            (action, audit, p1_new) where action is one of:
-              - "verified": audit passed, caller should return verified result
-              - "reformalized": audit failed but re-formalization succeeded;
-                caller should update state from p1_new and continue loop
-              - "failed": audit failed and re-formalization failed/degraded;
-                caller should return semantic_unstable result
-        """
-        semantic_audit = await audit_semantic_stability(
-            sentences=sentences,
-            premises=premises,
-            q=q,
-            namespace=namespace,
-            raw_code=raw_code,
-            witness_results=witness_results,
-            llm=self.llm,
-            prompt_engine=self.prompt_engine,
-        )
-        self._write_json(
-            out_dir / f"round{round_num}_semantic_audit.json",
-            _semantic_audit_to_dict(semantic_audit),
-        )
-
-        if semantic_audit.stable:
-            return "verified", semantic_audit, None
-
-        logger.warning(
-            "Pipeline sample=%s round=%d: semantic stability audit "
-            "flagged %d issue(s); triggering targeted re-formalization",
-            sample.id, round_num, len(semantic_audit.issues),
-        )
-        cgbv_log.update_phase("phase1", f"semantic-audit round {round_num}")
-        p1_new = await run_phase1_targeted(
-            original_code=raw_code,
-            failed_repairs=[
-                (issue, "Semantic stability audit diverged on the current witness bank.")
-                for issue in semantic_audit.issues
-            ],
-            premises_nl=sample.premises,
-            conclusion_nl=sample.conclusion,
-            llm=self.llm,
-            solver=self.solver,
-            prompt_engine=self.prompt_engine,
-            task_type=sample.task_type,
-            code_exec_timeout=self.config.pipeline.code_exec_timeout,
-            world_assumption=self.config.pipeline.world_assumption,
-            max_retries=self.config.pipeline.formalize_retries,
-        )
-
-        if p1_new is None or p1_new.verdict == VERDICT_UNKNOWN:
-            return "failed", semantic_audit, None
-
-        return "reformalized", semantic_audit, p1_new
-
     async def _try_reformalize_non_bridgeable_gap(
         self,
         *,
@@ -1937,6 +1798,7 @@ class CGBVPipeline:
         premises: list,
         q: object,
         raw_code: str,
+        dsl_payload: dict[str, Any],
         gap: Any,
         sample: DataSample,
         round_num: int,
@@ -1944,51 +1806,16 @@ class CGBVPipeline:
         """
         Conservative fallback for gap-only states that should NOT be bridged.
 
-        This keeps the pipeline from inventing new bridge axioms when the gap
-        lacks grounded evidence to reconnect; instead we ask Phase 1 targeted
-        re-formalization to rewrite the theory structure.
+        Non-bridgeable gaps are not well-localized enough to supervise a full
+        theory rewrite safely. Skip targeted re-formalization here to avoid
+        semantic drift and keep the accepted theory stable.
         """
-        target_idx = (
-            gap.query_relevant_premise_indices[0]
-            if getattr(gap, "query_relevant_premise_indices", None)
-            else len(premises)
-        )
-        nl_sentence = sentences[target_idx] if 0 <= target_idx < len(sentences) else ""
-        hint = (
-            "Gap analysis found non-bridgeable structural missing links. "
-            f"Reason: {getattr(gap, 'non_bridgeable_reason', 'prefer re-formalization')}. "
-            f"Missing links: {getattr(gap, 'missing_links', [])}. "
-            "Do not add a new bridge axiom. Rewrite the formalization so the "
-            "query-relevant proof path is represented directly."
-        )
         logger.info(
-            "Pipeline sample=%s round=%d: non-bridgeable gap routed to targeted "
-            "re-formalization (%s)",
+            "Pipeline sample=%s round=%d: non-bridgeable gap detected (%s); "
+            "skip targeted re-formalization to avoid unconstrained theory drift",
             sample.id, round_num, getattr(gap, "non_bridgeable_reason", "no reason"),
         )
-        cgbv_log.update_phase("phase1", f"gap-reformalize round {round_num}")
-        synthetic_mismatch = Mismatch(
-            sentence_index=target_idx,
-            nl_sentence=nl_sentence,
-            mismatch_type="strengthening",
-            fol_truth=False,
-            grounded_truth=True,
-            fol_formula_str=_formula_str(target_idx, premises, q),
-            grounded_formula="",
-        )
-        return await run_phase1_targeted(
-            original_code=raw_code,
-            failed_repairs=[(synthetic_mismatch, hint)],
-            premises_nl=sample.premises,
-            conclusion_nl=sample.conclusion,
-            llm=self.llm,
-            solver=self.solver,
-            prompt_engine=self.prompt_engine,
-            task_type=sample.task_type,
-            code_exec_timeout=self.config.pipeline.code_exec_timeout,
-            world_assumption=self.config.pipeline.world_assumption,
-            max_retries=self.config.pipeline.formalize_retries,
-        )
+        return None
 
     @staticmethod
     def _write_json(path: Path, data: dict) -> None:
@@ -2008,6 +1835,7 @@ def _phase1_to_dict(p1: Phase1Result, sample: DataSample | None = None) -> dict:
         "verdict": p1.verdict,
         "verdict_pre_bridge": p1.verdict_pre_bridge,
         "raw_code": p1.raw_code,
+        "dsl_payload": p1.dsl_payload,
         "repeated_failure": p1.repeated_failure,
         "premises_nl": list(sample.premises) if sample is not None else None,
         "conclusion_nl": sample.conclusion if sample is not None else None,
@@ -2077,6 +1905,7 @@ def _phase3_to_dict(p3: Phase3Result) -> dict:
                 "sentence_index": g.sentence_index,
                 "nl_sentence": g.nl_sentence,
                 "formula_code": g.formula_code,
+                "template_ir": g.template_ir,
                 "failed": g.failed,
                 "attempts": [
                     {
@@ -2158,6 +1987,7 @@ def _phase5_to_dict(p5: Phase5Result, accepted_bridges: list | None = None) -> d
                 "fol_truth_before": r.fol_truth_before,
                 "grounded_truth_expected": r.grounded_truth_expected,
                 "repaired": r.repaired_expr_str,
+                "repaired_logic": r.repaired_logic,
                 "success": r.success,
                 "local_validated": r.local_validated,
                 "seed_witness_validated": r.local_validated,
@@ -2179,6 +2009,7 @@ def _phase5_to_dict(p5: Phase5Result, accepted_bridges: list | None = None) -> d
             for r in p5.repairs
         ],
         "bridge_axioms": [str(b) for b in p5.bridge_axioms],
+        "bridge_logic_payloads": p5.bridge_logic_payloads,
         "accepted_bridge_axioms": [
             str(b) for b in (
                 accepted_bridges if accepted_bridges is not None else p5.bridge_axioms
@@ -2186,26 +2017,6 @@ def _phase5_to_dict(p5: Phase5Result, accepted_bridges: list | None = None) -> d
         ],
         "unified_attempts": p5.unified_attempts,
     }
-
-
-def _semantic_audit_to_dict(audit: SemanticAuditResult) -> dict:
-    return {
-        "stable": audit.stable,
-        "checked_indices": list(audit.checked_indices),
-        "issues": [
-            {
-                "sentence_index": issue.sentence_index,
-                "nl_sentence": issue.nl_sentence,
-                "current_formula": issue.current_formula_str,
-                "audited_formula": issue.audited_formula_str,
-                "differing_witnesses": issue.differing_witnesses,
-                "error": issue.error,
-            }
-            for issue in audit.issues
-        ],
-    }
-
-
 def _json_default(obj):
     if isinstance(obj, tuple):
         return list(obj)
@@ -2366,7 +2177,8 @@ def _grounded_from_templates(templates: list) -> list[GroundedFormula]:
         GroundedFormula(
             sentence_index=tmpl.sentence_index,
             nl_sentence=tmpl.nl_sentence,
-            formula_code=tmpl.template_code,
+            formula_code=tmpl.debug_render,
+            template_ir=tmpl.template_ir,
             failed=tmpl.failed,
             attempts=tmpl.attempts,
             error=tmpl.error,
@@ -2528,6 +2340,7 @@ def _patched_p1(
     model_info_q: object | None = None,
     raw_code: str | None = None,
     background_constraints: list | None = None,
+    dsl_payload: dict[str, Any] | None = None,
 ) -> Phase1Result:
     """Return a shallow copy of p1 with updated premises/q/verdict/model_info.
 
@@ -2550,8 +2363,97 @@ def _patched_p1(
         model_info_q=model_info_q,
         namespace=p1.namespace,
         raw_code=raw_code if raw_code is not None else p1.raw_code,
+        dsl_payload=dsl_payload if dsl_payload is not None else p1.dsl_payload,
+        symbol_table=p1.symbol_table,
         verdict_pre_bridge=p1.verdict_pre_bridge,  # preserve original pre-bridge snapshot
         attempts=p1.attempts,
         repeated_failure=p1.repeated_failure,
         error=None,
     )
+
+
+def _logic_for_phase3(dsl_payload: dict[str, Any], idx: int) -> Any | None:
+    sentences = dsl_payload.get("sentences", [])
+    if idx < len(sentences):
+        item = sentences[idx]
+        if isinstance(item, dict):
+            return item.get("logic")
+    query = dsl_payload.get("query")
+    if isinstance(query, dict) and idx == len(sentences):
+        return query.get("logic")
+    return None
+
+
+def _phase3_symbol_context(
+    dsl_payload: dict[str, Any],
+    symbol_table: Any | None = None,
+) -> dict[str, Any]:
+    ctx = {
+        "sorts": dsl_payload.get("sorts", []),
+        "functions": dsl_payload.get("functions", []),
+        "constants": dsl_payload.get("constants", {}),
+        "variables": dsl_payload.get("variables", []),
+    }
+    # Compatibility fallback: if DSL payload is incomplete, derive minimal names
+    # from Phase 1 symbol table so Phase 3 still has a frozen symbol context.
+    if symbol_table is not None:
+        if not ctx["sorts"] and getattr(symbol_table, "sorts", None):
+            ctx["sorts"] = [
+                {"name": name, "type": str(sort)}
+                for name, sort in symbol_table.sorts.items()
+            ]
+        if not ctx["functions"] and getattr(symbol_table, "functions", None):
+            funcs = []
+            for name, fn in symbol_table.functions.items():
+                domain = [str(fn.domain(i)) for i in range(fn.arity())]
+                funcs.append({"name": name, "domain": domain, "range": str(fn.range())})
+            ctx["functions"] = funcs
+    return ctx
+
+
+def _apply_phase5_repairs_to_dsl(
+    dsl_payload: dict[str, Any],
+    repairs: list,
+) -> dict[str, Any]:
+    payload = canonicalize_theory_payload(json.loads(json.dumps(dsl_payload, ensure_ascii=False)))
+    sentences = payload.get("sentences", [])
+    query = payload.get("query")
+    for repair in repairs:
+        if not getattr(repair, "success", False) or getattr(repair, "repaired_logic", None) is None:
+            continue
+        repaired_logic = canonicalize_logic_obj(repair.repaired_logic)
+        idx = repair.sentence_index
+        if 0 <= idx < len(sentences) and isinstance(sentences[idx], dict):
+            sentences[idx]["logic"] = repaired_logic
+        elif idx == len(sentences) and isinstance(query, dict):
+            query["logic"] = repaired_logic
+    payload["sentences"] = sentences
+    payload["query"] = query
+    return canonicalize_theory_payload(payload)
+
+
+def _append_bridge_logic_to_dsl(
+    dsl_payload: dict[str, Any],
+    accepted_bridge_logic_payloads: list[Any],
+) -> dict[str, Any]:
+    if not accepted_bridge_logic_payloads:
+        return canonicalize_theory_payload(json.loads(json.dumps(dsl_payload, ensure_ascii=False)))
+    payload = canonicalize_theory_payload(json.loads(json.dumps(dsl_payload, ensure_ascii=False)))
+    payload.setdefault("background_constraints", [])
+    payload["background_constraints"].extend(
+        canonicalize_logic_obj(item) for item in accepted_bridge_logic_payloads
+    )
+    return canonicalize_theory_payload(payload)
+
+
+def _select_accepted_bridge_logic_payloads(
+    bridge_axioms: list,
+    bridge_logic_payloads: list[Any],
+    accepted_bridges: list,
+) -> list[Any]:
+    accepted_keys = {str(bridge) for bridge in accepted_bridges}
+    selected: list[dict[str, Any]] = []
+    for formula, logic_obj in zip(bridge_axioms, bridge_logic_payloads, strict=False):
+        if str(formula) in accepted_keys:
+            selected.append(logic_obj)
+    return selected

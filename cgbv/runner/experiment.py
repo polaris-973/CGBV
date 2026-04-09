@@ -13,6 +13,7 @@ from cgbv.data.base import DataSample
 from cgbv.data.loader import load_dataset
 from cgbv.eval.metrics import compute_metrics
 from cgbv.eval.report import write_report
+from cgbv.prompts.prompt_engine import PromptEngine
 from cgbv.runner.checkpoint import CheckpointManager
 from cgbv.runner.concurrency import run_concurrent
 
@@ -75,6 +76,24 @@ class ExperimentRunner:
             id_set = set(str(i) for i in cfg.dataset.only_ids)
             all_samples = [s for s in all_samples if str(s.id) in id_set]
             logger.info("Filtered to %d samples by only_ids", len(all_samples))
+
+        # Exclude any evaluation samples that are also used as few-shot examples
+        # for the current dataset/split.
+        prompt_engine = PromptEngine(
+            templates_dir=cfg.prompts.templates_dir,
+            few_shot_dir=cfg.prompts.few_shot_dir,
+        )
+        excluded_ids = set(
+            prompt_engine.get_excluded_ids(cfg.dataset.name, cfg.dataset.split)
+        )
+        if excluded_ids:
+            before = len(all_samples)
+            all_samples = [s for s in all_samples if str(s.id) not in excluded_ids]
+            removed = before - len(all_samples)
+            logger.info(
+                "Excluded %d few-shot sample(s) from %s/%s evaluation",
+                removed, cfg.dataset.name, cfg.dataset.split,
+            )
 
         # Filter already-done samples (checkpoint)
         pending: list[DataSample]

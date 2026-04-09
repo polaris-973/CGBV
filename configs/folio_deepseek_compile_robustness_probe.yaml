@@ -1,27 +1,20 @@
 experiment:
-  id: folio_glm_debug
-  description: "Debug run: FOLIO validation, GLM OpenAI-compatible endpoint"
+  id: folio_deepseek_compile_robustness_probe
+  description: "Probe compile robustness on historically fragile FOLIO cases"
 
 dataset:
   name: folio
   split: validation
   path: ./datasets
-  sample_index_range: [1, 100]
-  # only_ids: [478, 361, 819, 173, 547, 476, 372, 527, 529, 440]
+  only_ids: [371, 440, 663]
 
 llm:
-  provider: glm
-  model: glm-4.6
-  api_key_env: ZAI_API_KEY
+  provider: deepseek
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
   temperature: 0.0
-  extra_body:
-    thinking:
-      type: disabled
   max_tokens: 8192
-  max_parallel_requests: 5
-  min_request_interval: 0.0
-  api_retry_count: 5
-  api_retry_delay: 2.0
 
 pipeline:
   num_witnesses: 3
@@ -37,9 +30,10 @@ pipeline:
 
 runner:
   max_concurrency: 3
-  checkpoint: true
+  checkpoint: false
   results_dir: ./results
 
 prompts:
   templates_dir: ./cgbv/prompts
   few_shot_dir: ./cgbv/prompts/few_shot
+

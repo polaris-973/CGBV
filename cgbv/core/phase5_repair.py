@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -7,6 +8,12 @@ from typing import Any
 
 import z3
 
+from cgbv.core.logic_compiler import (
+    SymbolTable,
+    canonicalize_logic_obj,
+    compile_sentence_logic,
+    to_compact_dsl_payload_safe,
+)
 from cgbv.core.phase4_check import Mismatch
 from cgbv.llm.base import LLMClient
 from cgbv.prompts.prompt_engine import PromptEngine
@@ -50,35 +57,49 @@ def _gap_analysis_prompt_data(gap_analysis: Any) -> dict[str, Any] | None:
 # f_is() normalization: Phase 3 grounded formulas use truth["f_is(e, v)"]
 # keys for booleanized functions, but Phase 1 namespace only has f(e).
 # This normalizer rewrites f_is references so the LLM sees Phase-1-compatible
-# expressions, and a fallback _is helper is injected into the eval namespace.
+# expressions using direct function-value comparisons.
 # ---------------------------------------------------------------------------
 
 def _normalize_fis_references(grounded_formula: str) -> str:
-    """Replace truth["f_is(e, v)"] with value-comparison notation.
+    """Replace f_is references with value-comparison notation.
 
     The model_extractor booleanizes non-Bool functions as f_is(args, val)
     predicates, but Phase 1 namespace only has the original f(args) function.
     This ensures the repair prompt shows f(entity) == value instead of
-    f_is(entity, value), preventing NameError in _eval_expression().
+    f_is(entity, value), matching the compiler-backed Phase 1 symbol surface.
     """
-    def _rewrite(match: re.Match) -> str:
-        inner = match.group(2)  # e.g. "rent_is(apt1, low)"
+    def _rewrite_inner(inner: str) -> str:
         m = re.match(r'^(\w+)_is\((.+)\)$', inner)
         if not m:
-            return match.group(0)
+            return ""
         func_name = m.group(1)
         all_args = [a.strip() for a in m.group(2).split(',')]
         if len(all_args) < 2:
-            return match.group(0)
+            return ""
         entity_args = ', '.join(all_args[:-1])
         value_arg = all_args[-1]
         return f'(value["{func_name}({entity_args})"] == "{value_arg}")'
 
-    return re.sub(
+    def _rewrite_bracket(match: re.Match) -> str:
+        rewritten = _rewrite_inner(match.group(2))
+        return rewritten or match.group(0)
+
+    out = re.sub(
         r'truth\[(["\'])(\w+_is\([^)]+\))\1\]',
-        _rewrite,
+        _rewrite_bracket,
         grounded_formula,
     )
+    # IR debug_render form: truth(f_is(arg, value))
+    def _rewrite_call(match: re.Match) -> str:
+        rewritten = _rewrite_inner(match.group(1))
+        return rewritten or match.group(0)
+
+    out = re.sub(
+        r'truth\(\s*(\w+_is\([^)]+\))\s*\)',
+        _rewrite_call,
+        out,
+    )
+    return out
 
 
 _Z3_KEYWORDS = frozenset({
@@ -90,9 +111,8 @@ _Z3_KEYWORDS = frozenset({
 def _build_function_value_helpers(namespace: dict[str, Any]) -> list[tuple[str, str, str]]:
     """Build (helper_name, original_func, arity_description) for non-Bool functions.
 
-    These helpers are injected into the eval namespace by _eval_expression() as
-    f_is(entity, value) → f(entity) == value.  This function produces the
-    metadata so the prompt can inform the LLM about them.
+    These helpers describe the normalized f_is(entity, value) → f(entity) == value
+    convention so the repair prompt can inform the LLM about it.
 
     Returns:
         List of (helper_name, original_func_name, arg_description) tuples.
@@ -123,11 +143,17 @@ def _extract_relevant_predicates(
     fol_ids = set(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(', fol_formula_str))
     preds.update(fol_ids - _Z3_KEYWORDS)
 
-    # From grounded formula: truth["pred_name(...)"] and value["fname(...)"]
+    # From grounded formula:
+    # - legacy: truth["pred(...)"], value["func(...)"]
+    # - IR debug_render: truth(pred(...)), value(func(...))
     truth_preds = re.findall(r'truth\[["\'](\w+)\(', grounded_formula)
     preds.update(truth_preds)
+    truth_preds_ir = re.findall(r'truth\(\s*(\w+)\(', grounded_formula)
+    preds.update(truth_preds_ir)
     value_preds = re.findall(r'value\[["\'](\w+)\(', grounded_formula)
     preds.update(value_preds)
+    value_preds_ir = re.findall(r'value\(\s*(\w+)\(', grounded_formula)
+    preds.update(value_preds_ir)
 
     # Include _is variants for booleanized functions
     for p in list(preds):
@@ -158,9 +184,10 @@ class RepairEntry:
     grounded_formula: str
     fol_truth_before: bool
     grounded_truth_expected: bool
-    repaired_expr_str: str         # raw LLM output (expression string)
+    repaired_expr_str: str         # raw LLM output or JSON-serialized replacement logic
     repaired_formula: object       # z3.ExprRef if successful, None otherwise
     success: bool
+    repaired_logic: Any | None = None
     witness_index: int = 0
     witness_side: str = "not_q"
     local_validated: bool = False  # True if repaired formula resolved the mismatch on its seed witness
@@ -182,6 +209,7 @@ class Phase5Result:
     num_local_validated: int = 0
     # Bridge axioms produced by unified repair (z3.ExprRef list)
     bridge_axioms: list = field(default_factory=list)
+    bridge_logic_payloads: list[Any] = field(default_factory=list)
     # Per-attempt trace for unified repair path (observability)
     unified_attempts: list[dict] = field(default_factory=list)
     error: str | None = None
@@ -192,6 +220,8 @@ async def run_phase5(
     premises: list,                   # current z3.ExprRef list
     q: object,                        # current z3.ExprRef for conclusion
     namespace: dict[str, Any],        # Phase 1 exec namespace (sorts, predicates, constants)
+    dsl_payload: dict[str, Any],
+    symbol_table: SymbolTable | None,
     raw_code: str,                    # original Phase 1 generated code (for context)
     domain: dict,                     # fallback domain (used when per-witness domain unavailable)
     llm: LLMClient,
@@ -250,6 +280,8 @@ async def run_phase5(
             premises=premises,
             q=q,
             namespace=namespace,
+            dsl_payload=dsl_payload,
+            symbol_table=symbol_table,
             raw_code=raw_code,
             domain=domain,
             llm=llm,
@@ -270,6 +302,8 @@ async def run_phase5(
         premises=premises,
         q=q,
         namespace=namespace,
+        dsl_payload=dsl_payload,
+        symbol_table=symbol_table,
         raw_code=raw_code,
         domain=domain,
         llm=llm,
@@ -291,6 +325,8 @@ async def _run_single_mismatch(
     premises: list,
     q: object,
     namespace: dict[str, Any],
+    dsl_payload: dict[str, Any],
+    symbol_table: SymbolTable | None,
     raw_code: str,
     domain: dict,
     llm: LLMClient,
@@ -327,6 +363,8 @@ async def _run_single_mismatch(
     repaired_entry = await _repair_one(
         mismatch=mismatch,
         witness_desc=witness_desc,
+        dsl_payload=dsl_payload,
+        symbol_table=symbol_table,
         raw_code=raw_code,
         namespace=namespace,
         llm=llm,
@@ -405,6 +443,8 @@ async def _run_unified_repair(
     premises: list,
     q: object,
     namespace: dict[str, Any],
+    dsl_payload: dict[str, Any],
+    symbol_table: SymbolTable | None,
     raw_code: str,
     domain: dict,
     llm: LLMClient,
@@ -476,10 +516,12 @@ async def _run_unified_repair(
     gap_data = _gap_analysis_prompt_data(gap_analysis)
 
     function_value_helpers = _build_function_value_helpers(namespace)
+    compact_dsl_json = _dsl_payload_for_prompt(dsl_payload)
 
     user_content = prompt_engine.render(
         "phase5_unified_repair.j2",
         mismatches=mismatch_data,
+        current_dsl=compact_dsl_json,
         original_code=raw_code,
         witness_desc=witness_desc,
         world_assumption=world_assumption,
@@ -500,9 +542,9 @@ async def _run_unified_repair(
     # Retry loop
     expected_indices = {m.sentence_index for m in mismatches}
     mismatch_by_idx: dict[int, Mismatch] = {m.sentence_index: m for m in mismatches}
-    best_parsed: dict[int, tuple[str, z3.ExprRef, bool]] = {}  # idx → (expr_str, formula, local_validated)
-    best_bridges: list[z3.ExprRef] = []
-    seen_bridge_strs: set[str] = set()
+    best_parsed: dict[int, tuple[Any, z3.ExprRef, bool]] = {}
+    best_bridges: list[tuple[Any, z3.ExprRef]] = []
+    seen_bridge_keys: set[str] = set()
     raw_output = ""
     attempt_errors: dict[int, str] = {}  # idx → last rejection reason
     unified_attempts: list[dict] = []
@@ -522,7 +564,7 @@ async def _run_unified_repair(
             ]
 
         raw_output = await llm.complete_with_retry(messages)
-        parsed, bridge_strs = _parse_unified_output(raw_output, expected_indices)
+        parsed, bridge_logic_objs = _parse_unified_output(raw_output, expected_indices)
         attempt_errors.clear()
 
         # Per-attempt trace
@@ -530,12 +572,12 @@ async def _run_unified_repair(
             "attempt_num": attempt + 1,
             "raw_output": raw_output,
             "parsed_indices": list(parsed.keys()),
-            "bridge_strs": bridge_strs,
+            "bridges": bridge_logic_objs,
             "per_idx": {},
         }
 
         # Process per-mismatch repairs
-        for idx, expr_str in parsed.items():
+        for idx in parsed:
             if idx in best_parsed:
                 attempt_trace["per_idx"][idx] = {"status": "already_accepted"}
                 continue  # already accepted from prior attempt
@@ -543,20 +585,21 @@ async def _run_unified_repair(
             local_model = mismatch_model_map.get(idx)
 
             passed, formula, local_validated, _err = _apply_guards(
-                expr_str, m, namespace, local_model, solver,
+                parsed[idx], m, symbol_table, local_model, solver,
             )
             if passed and formula is not None:
-                best_parsed[idx] = (expr_str, formula, local_validated)
+                canonical_logic = canonicalize_logic_obj(parsed[idx])
+                best_parsed[idx] = (canonical_logic, formula, local_validated)
                 attempt_trace["per_idx"][idx] = {
                     "status": "accepted",
-                    "expr": expr_str,
+                    "logic": canonical_logic,
                     "local_validated": local_validated,
                 }
             else:
                 attempt_errors[idx] = _err or "parse/eval error"
                 attempt_trace["per_idx"][idx] = {
                     "status": "rejected",
-                    "expr": expr_str,
+                    "logic": parsed[idx],
                     "error": _err,
                 }
                 logger.debug("Phase 5 unified idx=%d attempt %d: %s", idx, attempt + 1, _err)
@@ -564,19 +607,28 @@ async def _run_unified_repair(
         unified_attempts.append(attempt_trace)
 
         # Process bridge axioms (accumulate across retries, dedup by string)
-        for bridge_str in bridge_strs:
-            if bridge_str in seen_bridge_strs:
+        for bridge_logic in bridge_logic_objs:
+            try:
+                canonical_bridge = canonicalize_logic_obj(bridge_logic)
+            except Exception as exc:
+                logger.debug("Phase 5 bridge canonicalize error: %s", exc)
                 continue
-            formula, error = _eval_expression(bridge_str, namespace)
-            if error or formula is None:
-                logger.debug("Phase 5 bridge eval error: %s", error)
+            bridge_key = json.dumps(canonical_bridge, sort_keys=True, ensure_ascii=False)
+            if bridge_key in seen_bridge_keys:
+                continue
+            if symbol_table is None:
+                continue
+            try:
+                formula = compile_sentence_logic(canonical_bridge, symbol_table, dict(symbol_table.variables))
+            except Exception as exc:
+                logger.debug("Phase 5 bridge compile error: %s", exc)
                 continue
             # Bridge must be a quantified formula
             if not _contains_quantifier(formula):
                 logger.debug("Phase 5 bridge rejected: not quantified")
                 continue
-            seen_bridge_strs.add(bridge_str)
-            best_bridges.append(formula)
+            seen_bridge_keys.add(bridge_key)
+            best_bridges.append((canonical_bridge, formula))
 
         # Early exit if all parsed
         if len(best_parsed) == len(mismatches):
@@ -589,7 +641,7 @@ async def _run_unified_repair(
         is_conclusion = (idx == n)
 
         if idx in best_parsed:
-            expr_str, formula, local_validated = best_parsed[idx]
+            logic_obj, formula, local_validated = best_parsed[idx]
             if is_conclusion:
                 logger.warning(
                     "Phase 5: mismatch on conclusion index (idx=%d) should have been "
@@ -606,9 +658,10 @@ async def _run_unified_repair(
                 grounded_formula=m.grounded_formula,
                 fol_truth_before=m.fol_truth,
                 grounded_truth_expected=m.grounded_truth,
-                repaired_expr_str=expr_str,
+                repaired_expr_str=json.dumps(logic_obj, ensure_ascii=False),
                 repaired_formula=formula,
                 success=True,
+                repaired_logic=logic_obj,
                 witness_index=m.witness_index,
                 witness_side=m.witness_side,
                 local_validated=local_validated,
@@ -625,6 +678,7 @@ async def _run_unified_repair(
                 repaired_expr_str="",
                 repaired_formula=None,
                 success=False,
+                repaired_logic=None,
                 witness_index=m.witness_index,
                 witness_side=m.witness_side,
                 local_validated=False,
@@ -640,56 +694,61 @@ async def _run_unified_repair(
         repairs=repairs,
         all_repaired=all_repaired,
         num_local_validated=num_local_validated,
-        bridge_axioms=best_bridges,
+        bridge_axioms=[formula for _, formula in best_bridges],
+        bridge_logic_payloads=[logic for logic, _ in best_bridges],
         unified_attempts=unified_attempts,
     )
 
 
-def _parse_unified_output(raw: str, expected_indices: set[int]) -> tuple[dict[int, str], list[str]]:
-    """Parse unified repair output: '[idx] expression' lines + '[BRIDGE] expression' lines."""
-    raw = _extract_expression(raw)
-    repairs: dict[int, str] = {}
-    bridges: list[str] = []
-    for line in raw.strip().split('\n'):
-        line = line.strip()
-        if not line:
+def _parse_unified_output(
+    raw: str,
+    expected_indices: set[int],
+) -> tuple[dict[int, Any], list[Any]]:
+    payload = _extract_json_payload(raw)
+    if payload is None:
+        return {}, []
+
+    repairs: dict[int, Any] = {}
+    for item in payload.get("repairs", []) or []:
+        if not isinstance(item, dict):
             continue
-        if line.upper().startswith("[BRIDGE]"):
-            expr = line[len("[BRIDGE]"):].strip()
-            if expr:
-                bridges.append(expr)
-            continue
-        m = re.match(r'^\[(\d+)\]\s*(.+)$', line)
-        if m:
-            idx = int(m.group(1))
-            expr = m.group(2).strip()
-            if idx in expected_indices and expr:
-                repairs[idx] = expr
+        idx = item.get("sentence_index")
+        logic = item.get("logic")
+        if isinstance(idx, int) and idx in expected_indices and isinstance(logic, (dict, str)):
+            repairs[idx] = logic
+
+    bridges: list[Any] = []
+    for item in payload.get("bridges", []) or []:
+        if isinstance(item, (dict, str)):
+            bridges.append(item)
     return repairs, bridges
 
 
 def _apply_guards(
-    expr_str: str,
+    logic_obj: Any,
     mismatch: Mismatch,
-    namespace: dict[str, Any],
+    symbol_table: SymbolTable | None,
     model: Any = None,
     solver: Any = None,
 ) -> tuple[bool, z3.ExprRef | None, bool, str | None]:
-    """Apply guards to a repair expression.
+    """Apply guards to a repair replacement logic object.
 
     Returns (passed, formula, local_validated, error_msg).
 
     Only Guard 3 (local acceptance) is applied: the repaired formula must
     evaluate to the expected truth value on the mismatch witness model.
     """
-    formula, error = _eval_expression(expr_str, namespace)
-    if error is not None or formula is None:
-        return False, None, False, error
+    if symbol_table is None:
+        return False, None, False, "No symbol table available for repair compilation."
+    try:
+        formula = compile_sentence_logic(logic_obj, symbol_table, dict(symbol_table.variables))
+    except Exception as exc:
+        return False, None, False, f"Repair logic did not compile: {exc}"
 
     # Guard 3: Local acceptance check (P0.4)
     local_validated = False
     if model is not None and solver is not None:
-        new_fol_truth = _evaluator.evaluate(model, formula, namespace=namespace)
+        new_fol_truth = _evaluator.evaluate(model, formula, namespace=symbol_table.namespace())
         if new_fol_truth is None:
             return False, formula, False, (
                 "Local validation inconclusive: repaired formula could not be "
@@ -709,6 +768,8 @@ def _apply_guards(
 async def _repair_one(
     mismatch: Mismatch,
     witness_desc: str,
+    dsl_payload: dict[str, Any],
+    symbol_table: SymbolTable | None,
     raw_code: str,
     namespace: dict[str, Any],
     llm: LLMClient,
@@ -719,11 +780,19 @@ async def _repair_one(
     world_assumption: str = "owa",
 ) -> RepairEntry:
     """Ask LLM to repair one mismatched formula, with retry on eval or local-check failure."""
-    messages = _build_messages(mismatch, witness_desc, raw_code, prompt_engine, world_assumption, namespace)
+    messages = _build_messages(
+        mismatch,
+        witness_desc,
+        dsl_payload,
+        raw_code,
+        prompt_engine,
+        world_assumption,
+        namespace,
+    )
     last_error: str | None = None
     raw_output = ""
     attempts: list[RepairAttempt] = []
-    seen_exprs: set[str] = set()
+    seen_logic_keys: set[str] = set()
 
     for attempt in range(max_retries + 1):
         if attempt > 0:
@@ -734,10 +803,10 @@ async def _repair_one(
                     "content": (
                         f"Error: {last_error}\n\n"
                         "Carefully re-read the grounded formula and the boundary witness world above. "
-                        "Identify which specific predicate or condition in your formula "
+                        "Identify which specific predicate or condition in the logic object "
                         "causes it to evaluate differently from the grounded formula. "
-                        "Then output ONLY a corrected Z3-Python expression. "
-                        "No imports, no assignments, no prose."
+                        "Then output ONLY a corrected JSON repair payload. "
+                        "No prose."
                     ),
                 },
             ]
@@ -748,30 +817,32 @@ async def _repair_one(
         )
         raw_output = await llm.complete_with_retry(messages)
         attempt_record.raw_output = raw_output
-        expr_str = _extract_expression(raw_output)
-        # Strip [idx] prefix produced by unified prompt template
-        idx_prefix = re.match(r'^\[(\d+)\]\s*(.+)$', expr_str.strip(), re.DOTALL)
-        if idx_prefix:
-            expr_str = idx_prefix.group(2).strip()
-        attempt_record.extracted_expression = expr_str
+        parsed_repairs, _ = _parse_unified_output(raw_output, {mismatch.sentence_index})
+        logic_obj = parsed_repairs.get(mismatch.sentence_index)
+        attempt_record.extracted_expression = json.dumps(logic_obj, ensure_ascii=False) if logic_obj else ""
+        if logic_obj is None:
+            last_error = "Repair output did not contain a valid JSON logic replacement."
+            attempt_record.eval_error = last_error
+            attempts.append(attempt_record)
+            continue
 
-        if expr_str in seen_exprs:
+        logic_key = json.dumps(logic_obj, sort_keys=True, ensure_ascii=False)
+        if logic_key in seen_logic_keys:
             last_error = (
-                "You proposed the same formula as a previous attempt. "
-                "Try a fundamentally different structural approach — "
-                "e.g., change which predicates appear in the antecedent vs. consequent, "
-                "or restructure the quantifier scope."
+                "You proposed the same repair logic as a previous attempt. "
+                "Try a different structural repair."
             )
             attempt_record.eval_error = "duplicate_expression"
             attempts.append(attempt_record)
             continue
-        seen_exprs.add(expr_str)
+        seen_logic_keys.add(logic_key)
 
         passed, formula, local_validated, guard_error = _apply_guards(
-            expr_str, mismatch, namespace, model, solver,
+            logic_obj, mismatch, symbol_table, model, solver,
         )
 
         if passed and formula is not None:
+            canonical_logic = canonicalize_logic_obj(logic_obj)
             attempt_record.accepted = True
             attempts.append(attempt_record)
             return RepairEntry(
@@ -781,9 +852,10 @@ async def _repair_one(
                 grounded_formula=mismatch.grounded_formula,
                 fol_truth_before=mismatch.fol_truth,
                 grounded_truth_expected=mismatch.grounded_truth,
-                repaired_expr_str=expr_str,
+                repaired_expr_str=json.dumps(canonical_logic, ensure_ascii=False),
                 repaired_formula=formula,
                 success=True,
+                repaired_logic=canonical_logic,
                 witness_index=mismatch.witness_index,
                 witness_side=mismatch.witness_side,
                 local_validated=local_validated,
@@ -808,6 +880,7 @@ async def _repair_one(
         repaired_expr_str=raw_output,
         repaired_formula=None,
         success=False,
+        repaired_logic=None,
         witness_index=mismatch.witness_index,
         witness_side=mismatch.witness_side,
         local_validated=False,
@@ -819,6 +892,7 @@ async def _repair_one(
 def _build_messages(
     mismatch: Mismatch,
     witness_desc: str,
+    dsl_payload: dict[str, Any],
     raw_code: str,
     prompt_engine: PromptEngine,
     world_assumption: str = "owa",
@@ -849,10 +923,12 @@ def _build_messages(
     }]
 
     function_value_helpers = _build_function_value_helpers(namespace) if namespace else []
+    compact_dsl_json = _dsl_payload_for_prompt(dsl_payload)
 
     user_content = prompt_engine.render(
         "phase5_unified_repair.j2",
         mismatches=mismatch_data,
+        current_dsl=compact_dsl_json,
         original_code=raw_code,
         witness_desc=witness_desc,
         world_assumption=world_assumption,
@@ -875,6 +951,11 @@ def _snapshot_messages(messages: list[dict]) -> list[dict[str, str]]:
     ]
 
 
+def _dsl_payload_for_prompt(dsl_payload: dict[str, Any]) -> str:
+    compact = to_compact_dsl_payload_safe(dsl_payload)
+    return json.dumps(compact, ensure_ascii=False, indent=2)
+
+
 def _extract_expression(raw: str) -> str:
     """Strip markdown fences and single backticks if present."""
     raw = re.sub(r'^```(?:python)?\s*\n', '', raw.strip(), flags=re.MULTILINE)
@@ -883,6 +964,23 @@ def _extract_expression(raw: str) -> str:
     if raw.startswith('`') and raw.endswith('`') and len(raw) > 1:
         raw = raw[1:-1].strip()
     return raw
+
+
+def _extract_json_payload(raw: str) -> dict[str, Any] | None:
+    text = _extract_expression(raw)
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(text[start:end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def _contains_quantifier(formula: z3.ExprRef) -> bool:
@@ -895,49 +993,3 @@ def _contains_quantifier(formula: z3.ExprRef) -> bool:
     if z3.is_app(formula):
         return any(_contains_quantifier(c) for c in formula.children())
     return False
-
-
-def _eval_expression(
-    expr_str: str,
-    namespace: dict[str, Any],
-) -> tuple[z3.ExprRef | None, str | None]:
-    """
-    Evaluate a Z3-Python expression string inside the Phase 1 namespace.
-
-    Returns (formula, None) on success, or (None, error_str) on failure.
-    """
-    if not expr_str:
-        return None, "Empty expression"
-
-    try:
-        eval_ns = dict(namespace)
-        import z3 as _z3
-        for name in dir(_z3):
-            if not name.startswith("_") and name not in eval_ns:
-                eval_ns[name] = getattr(_z3, name)
-
-        # Inject _is helpers for booleanized functions so that
-        # f_is(entity, value) expressions evaluate correctly even if the
-        # LLM copies them verbatim from the grounded formula.
-        for name, obj in namespace.items():
-            if (isinstance(obj, _z3.FuncDeclRef)
-                    and obj.range().kind() != _z3.Z3_BOOL_SORT):
-                is_name = f"{name}_is"
-                if is_name not in eval_ns:
-                    func = obj
-                    def _make_is(f):
-                        def _helper(*args):
-                            return f(*args[:-1]) == args[-1]
-                        return _helper
-                    eval_ns[is_name] = _make_is(func)
-
-        result = eval(expr_str, eval_ns)  # noqa: S307
-
-        if not isinstance(result, _z3.ExprRef):
-            return None, f"Expression did not evaluate to a z3.ExprRef (got {type(result).__name__})"
-
-        return result, None
-    except SyntaxError as e:
-        return None, f"Syntax error: {e}"
-    except Exception as e:
-        return None, f"Evaluation error: {e}"

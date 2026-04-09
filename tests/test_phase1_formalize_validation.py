@@ -1,6 +1,12 @@
 import z3
+import pytest
+
+import cgbv.core.phase1_formalize as phase1_formalize
+from cgbv.core.logic_compiler import compile_sentence_logic, compile_theory_dsl
 
 from cgbv.core.phase1_formalize import (
+    Phase1Result,
+    _run_bridge_check,
     _check_model_vacuousness,
     _validate_output,
     check_z3_sort_consistency,
@@ -194,3 +200,78 @@ def test_vacuous_check_detects_all_rules_no_grounding() -> None:
 
     assert vacuous is True
     assert set(always_false) == {"is_student", "studies_hard", "passes_exams"}
+
+
+@pytest.mark.anyio
+async def test_phase15_bridge_writeback_is_canonical(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "sorts": [{"name": "Entity", "type": "DeclareSort"}],
+        "functions": [
+            {"name": "is_student", "domain": ["Entity"], "range": "BoolSort"},
+            {"name": "studies", "domain": ["Entity"], "range": "BoolSort"},
+        ],
+        "constants": {"entities": {"sort": "Entity", "members": ["alice"]}},
+        "variables": [{"name": "x", "sort": "Entity"}],
+        "background_constraints": [],
+        "sentences": [{"nl": "All students study.", "logic": "forall x:Entity. implies(is_student(x), studies(x))"}],
+        "query": {"nl": "Alice studies.", "logic": "studies(alice)"},
+    }
+    compiled = compile_theory_dsl(payload, ["All students study."], "Alice studies.")
+
+    result = Phase1Result(
+        verdict="Not Entailed",
+        verdict_pre_bridge="Not Entailed",
+        premises=list(compiled.premises),
+        q=compiled.q,
+        background_constraints=[],
+        bound_var_names=set(compiled.bound_var_names),
+        model_info=None,
+        model_info_q=None,
+        namespace=compiled.namespace,
+        raw_code=compiled.raw_code,
+        dsl_payload=compiled.payload,
+        symbol_table=compiled.symbol_table,
+    )
+
+    legacy_bridge_logic = {
+        "kind": "rule",
+        "forall": [{"name": "x", "sort": "Entity"}],
+        "implies": {
+            "antecedent": {"atom": "studies(x)"},
+            "consequent": {"atom": "is_student(x)"},
+        },
+    }
+    bridge_formula = compile_sentence_logic(
+        legacy_bridge_logic,
+        compiled.symbol_table,
+        dict(compiled.symbol_table.variables),
+    )
+
+    monkeypatch.setattr(phase1_formalize, "_find_disconnected_premises", lambda premises, q: [0])
+    monkeypatch.setattr(phase1_formalize, "_get_connected_predicates", lambda idx, premises, q: set())
+
+    async def _fake_repair_bridge_premise(**kwargs):
+        return bridge_formula, legacy_bridge_logic
+
+    monkeypatch.setattr(phase1_formalize, "_repair_bridge_premise", _fake_repair_bridge_premise)
+
+    class _DummySolver:
+        def check_entailment(self, premises, q):
+            return "Not Entailed", None
+
+    updated = await _run_bridge_check(
+        result=result,
+        premises_nl=["All students study."],
+        conclusion_nl="Alice studies.",
+        llm=None,  # patched out by fake repair function
+        solver=_DummySolver(),
+        prompt_engine=None,  # patched out by fake repair function
+        task_type="entailment",
+        bridge_retries=1,
+    )
+
+    assert updated.dsl_payload["background_constraints"]
+    appended = updated.dsl_payload["background_constraints"][-1]
+    assert isinstance(appended, dict)
+    assert appended.get("op") == "all"
+    assert "kind" not in appended
